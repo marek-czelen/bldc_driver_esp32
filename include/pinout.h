@@ -116,10 +116,10 @@
 #define PIN_HALL_SENSOR_C       19  // GPIO19
 
 // ============================================================================
-// Wyjście prędkości
+// Wejście czujnika prędkości
 // ============================================================================
 
-/** @brief Wyjście sygnału prędkości */
+/** @brief Wejście czujnika prędkości (aktywne przy P07<=1, silnik przekładniowy) */
 #define PIN_SPEED               21  // GPIO21
 
 // ============================================================================

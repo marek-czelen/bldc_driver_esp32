@@ -66,7 +66,9 @@ typedef struct {
     float           fet_temperature;  ///< Temperatura FET [°C]
     float           motor_temperature;///< Temperatura silnika [°C]
     hall_state_t    hall_state;     ///< Aktualny stan czujników Halla
-    uint32_t        rpm;            ///< Obroty silnika [RPM]
+    uint32_t        rpm;            ///< Obroty silnika [RPM] (mechaniczne koła)
+    volatile uint32_t hall_period_us; ///< Czas między przejściami Halla [µs] (z ISR)
+    uint16_t        wheeltime_ms;   ///< Czas obrotu koła [ms] (do wyświetlacza)
     bool            brake_active;   ///< Hamulec aktywny
     bool            pas_active;     ///< PAS aktywny
     bool            fault;          ///< Flaga błędu

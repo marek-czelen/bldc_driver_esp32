@@ -49,6 +49,15 @@ volatile bool g_motor_enabled = false;
 volatile bool g_brake_isr = false;
 volatile motor_direction_t g_direction_isr = DIRECTION_CW;
 
+// Pomiar RPM z przejść Halla (aktualizowane w ISR timera)
+volatile uint8_t g_hall_prev_isr = 0;         ///< Poprzedni stan Halla w ISR
+volatile uint32_t g_hall_last_change_us = 0;  ///< micros() ostatniego przejścia
+volatile uint32_t g_hall_period_us = 0;       ///< Okres między przejściami Halla [µs]
+
+// Pomiar RPM z pinu SPEED (GPIO ISR, dla silników przekładniowych, P07==1)
+volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
+volatile uint32_t g_speed_period_us = 0;      ///< Okres między impulsami SPEED [µs]
+
 // ============================================================================
 // Prototypy funkcji
 // ============================================================================
@@ -61,6 +70,7 @@ void readAnalogInputs();
 void readHallSensors();
 void readDigitalInputs();
 void printDiagnostics();
+void printDisplayConfig();
 void blockCommutate(uint8_t hallState, uint16_t duty);
 void processSerialCommands();
 
@@ -92,9 +102,28 @@ static const unsigned long AUTO_STATUS_INTERVAL_MS = 1000;
 // Bufor na komendy numeryczne
 static String serialBuffer = "";
 
-// Wyświetlacz S866
+// Wyświetlacz S866 (zawsze aktywny na Serial2)
 static s866_display_t g_display;
-static bool g_displayEnabled = false;
+
+// ============================================================================
+// ISR czujnika prędkości (GPIO, pin SPEED)
+// ============================================================================
+
+/**
+ * @brief ISR przerwania GPIO na pinie SPEED (FALLING edge).
+ *
+ * Dla silników przekładniowych (P07==1): jeden magnes na kole generuje
+ * jeden impuls na obrót. Mierzymy czas między impulsami.
+ *
+ * @note Używany tylko gdy P07 <= 1 (czujnik zewnętrzny).
+ */
+void IRAM_ATTR onSpeedPulse() {
+    uint32_t now_us = (uint32_t)esp_timer_get_time();
+    if (g_speed_last_pulse_us > 0) {
+        g_speed_period_us = now_us - g_speed_last_pulse_us;
+    }
+    g_speed_last_pulse_us = now_us;
+}
 
 // ============================================================================
 // Setup
@@ -126,6 +155,10 @@ void setup() {
     initGPIO();
     Serial.println("[OK] GPIO zainicjalizowane");
 
+    // Przerwanie na pinie SPEED (czujnik zewnętrzny — aktywne przy P07<=1)
+    attachInterrupt(digitalPinToInterrupt(PIN_SPEED), onSpeedPulse, FALLING);
+    Serial.println("[OK] Przerwanie SPEED (GPIO21) gotowe");
+
     // Inicjalizacja PWM
     initPWM();
     Serial.println("[OK] PWM zainicjalizowane");
@@ -138,6 +171,12 @@ void setup() {
     initCommutationTimer();
     Serial.println("[OK] Timer komutacji uruchomiony (20 kHz)");
 
+    // Inicjalizacja wyświetlacza S866 na Serial2 (GPIO4/GPIO16)
+    memset(&g_display, 0, sizeof(g_display));
+    g_display.last_valid_ms = millis();
+    s866_init();
+    Serial.println("[OK] Wyświetlacz S866 uruchomiony (Serial2: GPIO4/GPIO16, 9600 baud)");
+
     Serial.println();
     Serial.println("Komendy Serial:");
     Serial.println("  e     - włącz tryb BLOCK");
@@ -145,7 +184,7 @@ void setup() {
     Serial.println("  r     - odwróć kierunek");
     Serial.println("  +/-   - duty +/- 5%");
     Serial.println("  0-100 - duty w % (Enter)");
-    Serial.println("  X     - włącz/wyłącz wyświetlacz S866");
+    Serial.println("  P     - pokaż parametry wyświetlacza P01-P20");
     Serial.println("  s     - pokaż status");
     Serial.println("  a     - auto-status co 1s ON/OFF");
     Serial.println("  h     - pomoc");
@@ -193,11 +232,12 @@ void loop() {
         }
 
         // Wyświetlacz S866: assist level limituje max duty
-        if (g_displayEnabled && g_display.connected) {
+        // Raw assist_level: 0, 3, 6, 9, 12, 15 (wyświetlacz koduje poziomy 0-5 jako *3)
+        if (g_display.connected) {
             uint16_t maxDuty = 0;
             if (g_display.rx.assist_level > 0) {
-                // Poziomy 1-5 → 20/40/60/80/100% max duty (>5 = 100%)
-                maxDuty = (uint16_t)((uint32_t)g_display.rx.assist_level * PWM_MAX_DUTY / 5);
+                // Raw 3=20%, 6=40%, 9=60%, 12=80%, 15=100%
+                maxDuty = (uint16_t)((uint32_t)g_display.rx.assist_level * PWM_MAX_DUTY / 15);
                 if (maxDuty > PWM_MAX_DUTY) maxDuty = PWM_MAX_DUTY;
             }
             if (g_bldc_state.duty_cycle > maxDuty) {
@@ -213,8 +253,8 @@ void loop() {
     g_brake_isr = g_bldc_state.brake_active;
     g_direction_isr = g_bldc_state.direction;
 
-    // Obsługa wyświetlacza S866 (Serial2 — niezależny od USB)
-    if (g_displayEnabled) {
+    // Obsługa wyświetlacza S866 (Serial2 — zawsze aktywny)
+    {
         // Aktualizuj dane TX dla wyświetlacza
         g_display.tx.error = g_bldc_state.fault ? 1 : 0;
         g_display.tx.brake_active = g_bldc_state.brake_active ? 1 : 0;
@@ -225,22 +265,53 @@ void loop() {
         if (g_bldc_state.phase_current[2] > maxI) maxI = g_bldc_state.phase_current[2];
         g_display.tx.current_x10 = (uint16_t)(maxI * 10.0f);
 
-        // Czas obrotu koła [ms] — wymaga pomiaru RPM (na razie 0 = stoi)
-        g_display.tx.wheeltime_ms = 0;
-        if (g_bldc_state.rpm > 0) {
-            // wheeltime = 60000 / RPM (ms na obrót)
-            g_display.tx.wheeltime_ms = (uint16_t)(60000UL / g_bldc_state.rpm);
+        // Wheeltime [ms] — źródło zależy od P07:
+        //   P07 > 1  → silnik direct-drive, P07 = liczba impulsów Halla na obrót koła
+        //              (= 6 transitions/erev × pole_pairs, np. 6×15=90)
+        //              wheeltime = hall_period_us × P07 / 1000
+        //              NIE mnożymy dodatkowo ×6, bo P07 już to zawiera!
+        //   P07 == 1 → silnik przekładniowy, użyj zewnętrznego czujnika SPEED
+        //              wheeltime = speed_period_us / 1000 (1 impuls na obrót)
+        //   P07 == 0 → brak konfiguracji, użyj Halli z domyślnym P07=1 (SPEED)
+        uint8_t p07 = g_display.config.p07_speed_magnets;
+        uint32_t wt_us = 0;
+
+        if (p07 <= 1) {
+            // P07==0 lub P07==1: czujnik zewnętrzny SPEED (1 magnes na koło)
+            uint32_t sp = g_speed_period_us;  // volatile → local copy
+            uint32_t last = g_speed_last_pulse_us;
+            uint32_t now_us = (uint32_t)esp_timer_get_time();
+            // Timeout: jeśli >3s od ostatniego impulsu → koło stoi
+            if (sp > 0 && sp < 10000000 && last > 0 && (now_us - last) < 3000000) {
+                wt_us = sp;  // 1 impuls = 1 obrót koła
+            }
+        } else {
+            // P07 > 1: direct-drive hub, P07 = hall transitions per wheel revolution
+            // P07 = 6 × pole_pairs (np. 90 = 6×15 par biegunów)
+            uint32_t hp = g_hall_period_us;  // volatile → local copy
+            uint32_t last = g_hall_last_change_us;
+            uint32_t now_us = (uint32_t)esp_timer_get_time();
+            // Timeout: jeśli >2s od ostatniego przejścia Halla → silnik stoi
+            if (hp > 0 && hp < 2000000 && last > 0 && (now_us - last) < 2000000) {
+                wt_us = (uint32_t)hp * (uint32_t)p07;  // bez ×6! P07 już zawiera 6×pole_pairs
+            }
+        }
+
+        if (wt_us > 0) {
+            uint32_t wt_ms = wt_us / 1000UL;
+            if (wt_ms > 65000) wt_ms = 65000;
+            if (wt_ms == 0) wt_ms = 1;  // minimum 1 ms
+            g_display.tx.wheeltime_ms = (uint16_t)wt_ms;
+            g_bldc_state.wheeltime_ms = (uint16_t)wt_ms;
+            g_bldc_state.rpm = (wt_ms > 0) ? (60000UL / wt_ms) : 0;
+        } else {
+            g_display.tx.wheeltime_ms = 0;
+            g_bldc_state.wheeltime_ms = 0;
+            g_bldc_state.rpm = 0;
         }
 
         // Obsługa protokołu wyswietlacza
         s866_service(&g_display);
-
-        // Auto-powrót jeśli wyświetlacz się rozłączył
-        if (!g_display.connected && (millis() - g_display.last_valid_ms > S866_TIMEOUT_MS * 2)) {
-            g_displayEnabled = false;
-            s866_deinit();
-            Serial.println("[S866] Wyświetlacz rozłączony — wyłączam Serial2");
-        }
     }
 
     // Obsługa komend USB Serial (zawsze aktywna)
@@ -317,9 +388,8 @@ void initGPIO() {
     // --- Hamulec ---
     pinMode(PIN_BRAKE, INPUT_PULLUP);
 
-    // --- Prędkość ---
-    pinMode(PIN_SPEED, OUTPUT);
-    digitalWrite(PIN_SPEED, LOW);
+    // --- Prędkość (wejście czujnika zewnętrznego — aktywne przy P07==1) ---
+    pinMode(PIN_SPEED, INPUT_PULLUP);
 
     // --- UART Enable ---
     pinMode(PIN_UART_EN, OUTPUT);
@@ -560,7 +630,7 @@ void printDiagnostics() {
         thrPct = (int)((uint32_t)(thr - THROTTLE_DEAD_ZONE) * 100 / (THROTTLE_MAX_RAW - THROTTLE_DEAD_ZONE));
         if (thrPct > 100) thrPct = 100;
     }
-    Serial.printf("%s %s D:%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) %s%s%s",
+    Serial.printf("%s %s D:%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u %s%s%s",
         modeNames[g_bldc_state.mode],
         g_bldc_state.direction == DIRECTION_CW ? "CW" : "CCW",
         dutyPct,
@@ -574,21 +644,20 @@ void printDiagnostics() {
         (int)g_bldc_state.motor_temperature,
         thrPct,
         g_bldc_state.throttle_raw,
+        (unsigned long)g_bldc_state.rpm,
+        g_bldc_state.wheeltime_ms,
         g_bldc_state.brake_active ? "BRK " : "",
         g_bldc_state.pas_active ? "PAS " : "",
         g_bldc_state.fault ? "FAULT " : "");
 
     // Informacje z wyświetlacza S866
-    Serial.print(g_displayEnabled ? "DISP:EN " : "DISP:OFF ");
-    if (g_displayEnabled) {
-        if (g_display.connected) {
-            Serial.printf("L%d %s%s",
-                g_display.rx.assist_level,
-                g_display.rx.headlight ? "HL " : "",
-                g_display.rx.cruise_control ? "CC " : "");
-        } else {
-            Serial.print("L-- ");
-        }
+    if (g_display.connected) {
+        Serial.printf("DISP:OK L%d %s%s",
+            g_display.rx.assist_level / 3,
+            g_display.rx.headlight ? "HL " : "",
+            g_display.rx.cruise_control ? "CC " : "");
+    } else {
+        Serial.print("DISP:-- ");
     }
     Serial.println();
 }
@@ -622,6 +691,22 @@ void printDiagnostics() {
  * @warning ledcWrite() jest bezpieczne z ISR (operuje na rejestrach LEDC).
  */
 void IRAM_ATTR onCommutationTimer() {
+    // Odczyt Halli ZAWSZE — pomiar prędkości nawet gdy silnik wyłączony
+    uint8_t ha = (GPIO.in >> PIN_HALL_SENSOR_A) & 1;
+    uint8_t hb = (GPIO.in >> PIN_HALL_SENSOR_B) & 1;
+    uint8_t hc = (GPIO.in >> PIN_HALL_SENSOR_C) & 1;
+    uint8_t hall = (hc << 2) | (hb << 1) | ha;
+
+    // Pomiar czasu między przejściami Halla → RPM (niezależnie od stanu silnika)
+    if (hall != g_hall_prev_isr) {
+        uint32_t now_us = (uint32_t)esp_timer_get_time();
+        if (g_hall_last_change_us > 0) {
+            g_hall_period_us = now_us - g_hall_last_change_us;
+        }
+        g_hall_last_change_us = now_us;
+        g_hall_prev_isr = hall;
+    }
+
     if (g_brake_isr) {
         // Hamulec - natychmiast wyłącz
         ledcWrite(PWM_CHANNEL_A_HIGH, 0);
@@ -642,12 +727,6 @@ void IRAM_ATTR onCommutationTimer() {
         ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
         return;
     }
-
-    // Odczyt Halli bezpośrednio w ISR (szybkie GPIO read)
-    uint8_t ha = (GPIO.in >> PIN_HALL_SENSOR_A) & 1;
-    uint8_t hb = (GPIO.in >> PIN_HALL_SENSOR_B) & 1;
-    uint8_t hc = (GPIO.in >> PIN_HALL_SENSOR_C) & 1;
-    uint8_t hall = (hc << 2) | (hb << 1) | ha;
 
     uint16_t d = g_duty_isr;
 
@@ -934,11 +1013,55 @@ void printHelp() {
     Serial.println("r         Odwróć kierunek (CW/CCW) - tylko gdy wyłączony");
     Serial.println("+/-       Zmień duty o ±5%");
     Serial.println("0-100     Ustaw duty w procentach (wpisz liczbę i Enter)");
-    Serial.println("X         Włącz/wyłącz wyświetlacz S866 (9600 baud)");
+    Serial.println("P         Pokaż parametry wyświetlacza P01-P20");
     Serial.println("s         Pokaż status");
     Serial.println("a         Auto-status co 1s ON/OFF");
     Serial.println("h         Pokaż tę pomoc");
     Serial.println("===========================");
+    Serial.println();
+}
+
+/**
+ * @brief Wypisuje parametry konfiguracyjne wyświetlacza P01-P20.
+ */
+void printDisplayConfig() {
+    Serial.println();
+    if (!g_display.connected) {
+        Serial.println("[S866] Wyświetlacz nie podłączony — brak parametrów");
+        return;
+    }
+    const s866_config_t& c = g_display.config;
+    Serial.println("========== PARAMETRY WYŚWIETLACZA S866 ==========");
+    Serial.println("--- Parametry lokalne wyświetlacza (nie w ramce) ---");
+    Serial.printf("P01  Jasność podświetlenia:   [local]\n");
+    Serial.printf("P02  Jednostki prędkości:     [local]\n");
+    Serial.printf("P03  Napięcie systemu:        [local]\n");
+    Serial.printf("P04  Auto-wyłączenie:         [local]\n");
+    Serial.println("--- Parametry z ramki RX ---");
+    Serial.printf("P05  Poziomy wspomagania:     %d\n",        c.p05_assist_levels);
+    Serial.printf("P06  Rozmiar koła:            %d.%d\"\n",   c.p06_wheel_size_x10 / 10, c.p06_wheel_size_x10 % 10);
+    Serial.printf("P07  Pole pairs / magnesy:    %d\n",        c.p07_speed_magnets);
+    Serial.printf("P08  Limit prędkości:         %d km/h\n",   c.p08_speed_limit);
+    Serial.printf("P09  Tryb startu:             %s\n",       c.p09_start_mode ? "po pedałowaniu" : "od zera");
+    Serial.printf("P10  Tryb jazdy:              %d\n",        c.p10_drive_mode);
+    Serial.printf("P11  Czułość PAS:             %d\n",        c.p11_pas_sensitivity);
+    Serial.printf("P12  Intensywność startu PAS: %d\n",        c.p12_pas_start_strength);
+    Serial.printf("P13  Magnesy PAS:             %d\n",        c.p13_pas_magnets);
+    Serial.printf("P14  Limit prądu:             %d A\n",      c.p14_current_limit_a);
+    Serial.printf("P15  Podna pięcie:            %.1f V\n",    c.p15_undervoltage_x10 / 10.0f);
+    Serial.println("--- Parametry lokalne wyświetlacza (nie w ramce) ---");
+    Serial.printf("P16  Tryb komunikacji:        [local]\n");
+    Serial.printf("P17  Tempomat:                %s\n",       c.p17_cruise_control ? "ON" : "OFF");
+    Serial.printf("P18  Tryb gazu:               [local]\n");
+    Serial.printf("P19  Power Assist:            [local]\n");
+    Serial.printf("P20  Protokół:                [local]\n");
+    Serial.println("=================================================");
+    uint8_t p07 = g_display.config.p07_speed_magnets;
+    if (p07 <= 1) {
+        Serial.println("Tryb prędkości: czujnik SPEED (silnik przekładniowy)");
+    } else {
+        Serial.printf("Tryb prędkości: Hall × %d pole_pairs (direct-drive)\n", p07);
+    }
     Serial.println();
 }
 
@@ -961,6 +1084,7 @@ void printHelp() {
  * | r      | Odwróć kierunek (tylko gdy off) |
  * | +/-    | Duty ±5% |
  * | 0-100  | Ustaw duty w % (Enter) |
+ * | P      | Pokaż parametry wyświetlacza P01-P20 |
  * | s      | Jednorazowy status |
  * | a      | Toggle auto-status co 1 s |
  * | h      | Pomoc |
@@ -1028,20 +1152,8 @@ void processSerialCommands() {
                 Serial.printf("[CMD] Auto-status: %s\n", g_autoStatus ? "ON" : "OFF");
                 serialBuffer = "";
                 continue;
-            case 'X':
-                if (!g_displayEnabled) {
-                    g_displayEnabled = true;
-                    memset(&g_display, 0, sizeof(g_display));
-                    g_display.last_valid_ms = millis();  // grace period na pierwszą ramkę
-                    g_bldc_state.mode = DRIVE_MODE_BLOCK;
-                    g_bldc_state.fault = false;
-                    Serial.println("[CMD] Wyświetlacz S866 ON (Serial2: GPIO4/GPIO16, 9600 baud)");
-                    s866_init();
-                } else {
-                    g_displayEnabled = false;
-                    s866_deinit();
-                    Serial.println("[CMD] Wyświetlacz S866 OFF");
-                }
+            case 'P':
+                printDisplayConfig();
                 serialBuffer = "";
                 continue;
             default:

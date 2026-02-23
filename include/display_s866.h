@@ -96,6 +96,37 @@ typedef struct {
 } s866_rx_params_t;
 
 /**
+ * @brief Kopia parametrów konfiguracyjnych wyświetlacza P01-P20.
+ *
+ * Parametry P01-P20 to ustawienia z menu konfiguracyjnego wyświetlacza S866.
+ * Kontroler przechowuje ich kopię, aby móc się nimi posługiwać
+ * (np. rozmiar koła do przeliczenia prędkości, limit prądu itp.).
+ * Aktualizowane po każdej poprawnie odebranej ramce RX.
+ */
+typedef struct {
+    uint8_t  p01_backlight;         ///< P01: Jasność podświetlenia 1-3
+    uint8_t  p02_units;             ///< P02: 0=km/h, 1=mph
+    uint8_t  p03_voltage;           ///< P03: Napięcie systemu (24/36/48/52/60 V)
+    uint8_t  p04_auto_off_min;      ///< P04: Czas auto-wyłączenia 0-60 min
+    uint8_t  p05_assist_levels;     ///< P05: Liczba poziomów wspomagania (3 lub 5)
+    uint16_t p06_wheel_size_x10;    ///< P06: Rozmiar koła ×10 [cale] (np. 260=26.0")
+    uint8_t  p07_speed_magnets;     ///< P07: Liczba magnesów czujnika prędkości 1-100
+    uint8_t  p08_speed_limit;       ///< P08: Limit prędkości (0=brak)
+    uint8_t  p09_start_mode;        ///< P09: 0=start od zera, 1=start po pedałowaniu
+    uint8_t  p10_drive_mode;        ///< P10: 0=PAS+gaz, 1=tylko gaz, 2=tylko PAS
+    uint8_t  p11_pas_sensitivity;   ///< P11: Czułość PAS 1-24
+    uint8_t  p12_pas_start_strength;///< P12: Intensywność startu PAS 0-5
+    uint8_t  p13_pas_magnets;       ///< P13: Liczba magnesów PAS 1-100
+    uint8_t  p14_current_limit_a;   ///< P14: Limit prądu sterownika [A]
+    uint16_t p15_undervoltage_x10;  ///< P15: Napięcie odcięcia baterii ×10 [V]
+    uint8_t  p16_comm_mode;         ///< P16: Tryb komunikacji / ODO reset
+    uint8_t  p17_cruise_control;    ///< P17: Tempomat 0=off, 1=on
+    uint8_t  p18_throttle_mode;     ///< P18: Definicja gazu
+    uint8_t  p19_power_assist;      ///< P19: Power Assist Ratio
+    uint8_t  p20_protocol;          ///< P20: Protokół komunikacji
+} s866_config_t;
+
+/**
  * @brief Parametry wysyłane do wyświetlacza (ramka TX).
  */
 typedef struct {
@@ -113,6 +144,7 @@ typedef struct {
     uint8_t          rx_count;                    ///< Liczba odebranych bajtów
     s866_rx_params_t rx;                          ///< Sparsowane parametry RX
     s866_tx_params_t tx;                          ///< Parametry do wysłania TX
+    s866_config_t    config;                      ///< Kopia parametrów P01-P20
     bool             connected;                   ///< Wyświetlacz podłączony?
     unsigned long    last_valid_ms;               ///< Czas ostatniej poprawnej ramki
     unsigned long    last_byte_ms;                ///< Czas ostatniego odebranego bajtu

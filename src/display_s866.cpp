@@ -63,6 +63,23 @@ static void s866_parse_rx_frame(s866_display_t* ctx) {
     ctx->rx.voltage_min_x10     = ((uint16_t)f[14] << 8) | f[15];
     ctx->rx.num_pas_magnets     = f[18] & 0x0F;
     ctx->rx.cruise_control      = (f[18] >> 6) & 0x01;
+
+    // Aktualizacja kopii parametrów konfiguracyjnych P01-P20
+    // Mapowanie z pól ramki RX na parametry P
+    // UWAGA: P01-P04, P16, P18-P20 nie są transmitowane w ramce —
+    //        to ustawienia lokalne wyświetlacza.
+    ctx->config.p05_assist_levels      = 5;  // protokół 2 zawsze 5 poziomów
+    ctx->config.p06_wheel_size_x10     = ctx->rx.wheel_size_inch_x10;  // f[7-8]
+    ctx->config.p07_speed_magnets      = ctx->rx.gear_ratio;           // f[6] = P07
+    ctx->config.p08_speed_limit        = ctx->rx.speed_max_limit;      // f[12]
+    ctx->config.p09_start_mode         = ctx->rx.zero_start;           // f[5] bit6
+    ctx->config.p10_drive_mode         = ctx->rx.throttle_mode;        // f[3] = P10
+    ctx->config.p11_pas_sensitivity    = ctx->rx.start_delay_pas;      // f[9]
+    ctx->config.p12_pas_start_strength = ctx->rx.boost_power;          // f[10]
+    ctx->config.p13_pas_magnets        = ctx->rx.num_pas_magnets;      // f[18] bits 0-3
+    ctx->config.p14_current_limit_a    = ctx->rx.current_limit_a;      // f[13]
+    ctx->config.p15_undervoltage_x10   = ctx->rx.voltage_min_x10;      // f[14-15]
+    ctx->config.p17_cruise_control     = ctx->rx.cruise_control;       // f[18] bit6
 }
 
 /**
