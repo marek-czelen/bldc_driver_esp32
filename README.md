@@ -14,11 +14,16 @@ Planowane rozszerzenia: sterowanie sinusoidalne, FOC.
 4. [Architektura oprogramowania](#architektura-oprogramowania)
 5. [Komutacja blokowa — zasada działania](#komutacja-blokowa--zasada-działania)
 6. [Timer sprzętowy i ISR](#timer-sprzętowy-i-isr)
-7. [Przepustnica](#przepustnica)
-8. [Sterowanie przez UART/Serial](#sterowanie-przez-uartserial)
-9. [Kalibracja prądów](#kalibracja-prądów)
-10. [Znane problemy i uwagi](#znane-problemy-i-uwagi)
-11. [Rozbudowa projektu](#rozbudowa-projektu)
+7. [Wyświetlacz S866 — protokół 2](#wyświetlacz-s866--protokół-2)
+8. [Pomiar prędkości](#pomiar-prędkości)
+9. [Obliczanie mocy](#obliczanie-mocy)
+10. [Hamowanie regeneracyjne](#hamowanie-regeneracyjne)
+11. [Przepustnica i poziomy wspomagania](#przepustnica-i-poziomy-wspomagania)
+12. [Rampa rozpędzania](#rampa-rozpędzania)
+13. [Sterowanie przez UART/Serial](#sterowanie-przez-uartserial)
+14. [Kalibracja prądów](#kalibracja-prądów)
+15. [Znane problemy i uwagi](#znane-problemy-i-uwagi)
+16. [Rozbudowa projektu](#rozbudowa-projektu)
 
 ---
 
@@ -32,6 +37,8 @@ Planowane rozszerzenia: sterowanie sinusoidalne, FOC.
 | Pomiar prądu      | INA180A2 × 3               | Gain = 50 V/V, shunt = 2 mΩ |
 | Shunty            | 2 mΩ (low-side)            | Jeden na każdą fazę |
 | Czujniki Halla    | 3 × czujnik cyfrowy        | Wbudowane w silnik |
+| Level shifter     | TXB0102DCU                 | 3.3V ↔ 5V, enable GPIO17 |
+| Wyświetlacz       | S866 (protokół 2)          | Serial2: GPIO4(TX)/GPIO16(RX), 9600 baud |
 | Napięcie baterii  | Dzielnik 1 MΩ / 33 kΩ      | Mierzone na GPIO36 (VP) |
 | Przepustnica      | Potencjometr/czujnik 0–3.3 V | GPIO2, ADC zakres 400–2600 |
 | Temperatura silnika | Termistor / czujnik analogowy | GPIO15, ADC |
@@ -91,15 +98,15 @@ Wszystkie definicje pinów znajdują się w `include/pinout.h`.
 
 ### Pozostałe
 
-| GPIO | Funkcja         |
-|------|-----------------|
-| 1    | UART0 TX        |
-| 3    | UART0 RX        |
-| 17   | UART Enable     |
-| 21   | Wyjście prędkości |
-| 0    | EXT1 (boot pin!) |
-| 4    | EXT2            |
-| 16   | EXT3            |
+| GPIO | Funkcja              |
+|------|----------------------|
+| 1    | UART0 TX (debug)     |
+| 3    | UART0 RX (debug)     |
+| 4    | UART2 TX (S866 wyświetlacz) |
+| 16   | UART2 RX (S866 wyświetlacz) |
+| 17   | UART Enable (TXB0102DCU) |
+| 21   | Wejście prędkości (czujnik ext. przy P07≤1) |
+| 0    | EXT1 (boot pin!)     |
 
 ---
 
@@ -162,8 +169,10 @@ platformio.ini      — konfiguracja PlatformIO (platforma, prędkość, partycj
 include/
   pinout.h          — wszystkie definicje GPIO, kanały LEDC, stałe PWM
   bldc_types.h      — typy danych, struktury, enumeracje
+  display_s866.h    — definicje protokołu wyświetlacza S866, struktury ramek
 src/
-  main.cpp          — cała logika aplikacji
+  main.cpp          — cała logika aplikacji (komutacja, regen, pomiar prędkości/mocy)
+  display_s866.cpp  — implementacja protokołu S866 (parsowanie RX, wysyłanie TX)
 ```
 
 ### Globalna struktura stanu
@@ -177,8 +186,11 @@ src/
 - prądy fazowe A, B, C (`phase_current[3]`)
 - temperatura silnika i FET
 - stan Halla (`hall_state`)
-- prędkość obrotowa w RPM (do implementacji)
-- flagi: `brake_active`, `pas_active`, `fault`
+- prędkość obrotowa (`rpm`) i czas obrotu koła (`wheeltime_ms`)
+- okres między przejściami Halla (`hall_period_us`)
+- moc pobierana (`power_watts`) i oddawana (`regen_power_watts`)
+- docelowe duty z przepustnicy (`duty_target`) i czas rampy (`ramp_time_ms`)
+- flagi: `brake_active`, `pas_active`, `regen_enabled`, `regen_active`, `fault`
 
 ### Przepływ wykonania
 
@@ -193,16 +205,22 @@ setup()
 loop() [~wolna pętla, ~kilka kHz]
   ├── readAnalogInputs()   — ADC: VBAT, prądy, przepustnica, temp
   ├── readHallSensors()    — stan 3 czujników Halla
-  ├── readDigitalInputs()  — hamulec, PAS
-  ├── obliczenie duty z przepustnicy (jeśli BLOCK mode)
+  ├── readDigitalInputs()  — hamulec (hw + symulacja), PAS
+  ├── obliczenie duty_target z przepustnicy (proporcjonalnie do assist level)
+  ├── rampa rozpędzania (duty_target → duty_cycle, max Δ z ramp_time_ms)
   ├── aktualizacja zmiennych volatile dla ISR
+  ├── obliczanie mocy (P = Vbat × Imax)
+  ├── logika regen (hamulec + warunki → aktywacja)
+  ├── obsługa wyświetlacza S866 (wheeltime, TX, service)
   ├── processSerialCommands() — obsługa komend UART
   └── auto-status co 1s (jeśli włączony)
 
 onCommutationTimer() [ISR, 20 kHz = co 50 µs]
-  ├── sprawdzenie hamulca → wyłącz wszystko
+  ├── odczyt Halli z GPIO.in (ZAWSZE — pomiar prędkości)
+  ├── pomiar czasu między przejściami Halla → hall_period_us
+  ├── hamulec aktywny + regen → regenCommutateISR()
+  ├── hamulec aktywny bez regen → allMosfetsOff() (coast)
   ├── sprawdzenie g_motor_enabled
-  ├── odczyt Halli bezpośrednio z rejestrów GPIO.in
   └── ustawienie 6 kanałów LEDC zgodnie z tabelą komutacji
 ```
 
@@ -276,18 +294,262 @@ To jest szybsze i bezpieczniejsze w ISR niż `digitalRead()`.
 
 ---
 
-## Przepustnica
+## Wyświetlacz S866 — protokół 2
+
+Sterownik komunikuje się z wyświetlaczem S866 przez **Serial2** (UART2):
+- **TX:** GPIO4, **RX:** GPIO16, **9600 baud**, 8N1
+- Level shifter **TXB0102DCU** (3.3V ↔ 5V), włączany przez GPIO17 (UART_EN)
+- Wyświetlacz jest **zawsze aktywny** (nie wymaga komendy do uruchomienia)
+
+### Ramka RX (wyświetlacz → sterownik): 20 bajtów
+
+| Bajt | Pole | Opis |
+|------|------|------|
+| 0    | Header | Zawsze 0x0C |
+| 1-14 | Parametry | Dane konfiguracyjne i sterujące |
+| 15-18 | Rezerwa | |
+| 19   | Checksum | XOR bajtów 0-18 |
+
+Kluczowe parametry z RX:
+- **assist_level:** poziom wspomagania (raw: 0, 3, 6, 9, 12, 15 → wyświetlacz: 0-5)
+- **headlight:** światło ON/OFF
+- **cruise_control:** tempomat ON/OFF
+
+### Ramka TX (sterownik → wyświetlacz): 14 bajtów
+
+Wysyłane dane:
+- **error:** kod błędu (0 = OK)
+- **brake_active:** hamulec aktywny
+- **current_x10:** prąd ×10 [0.1 A]
+- **wheeltime_ms:** czas obrotu koła [ms] (wyświetlacz przelicza na km/h)
+
+### Konfiguracja P01-P20
+
+Wyświetlacz S866 ma parametry konfiguracyjne P01-P20. Niektóre są przesyłane w ramce RX, inne są lokalne na wyświetlaczu:
+
+| Parametr | Opis | Źródło |
+|----------|------|--------|
+| P01-P04  | Jasność, jednostki, napięcie, auto-off | Lokalne |
+| P05      | Poziomy wspomagania (3/5/9) | Ramka RX |
+| P06      | Rozmiar koła (×10, np. 260=26") | Ramka RX |
+| **P07**  | **Liczba impulsów Halla na obrót koła** | Ramka RX |
+| P08      | Limit prędkości [km/h] | Ramka RX |
+| P09      | Tryb startu (0=od zera, 1=po pedałowaniu) | Ramka RX |
+| P10      | Tryb jazdy | Ramka RX |
+| P11-P13  | PAS: czułość, start, magnesy | Ramka RX |
+| P14      | Limit prądu [A] | Ramka RX |
+| P15      | Podnapięcie (×10) [V] | Ramka RX |
+| P16-P20  | Komunikacja, tempomat, gaz, power assist, protokół | Lokalne/Ramka |
+
+> **P07 — kluczowy parametr:**
+> - P07 > 1: silnik direct-drive (np. P07=90 = 6 przejść Halla × 15 par biegunów)
+> - P07 ≤ 1: silnik przekładniowy — użyj czujnika SPEED (GPIO21)
+
+### Poziomy wspomagania
+
+Wyświetlacz wysyła `assist_level` jako wartości surowe: 0, 3, 6, 9, 12, 15.
+- Podział przez 3 → numer poziomu 0-5 na wyświetlaczu
+- Podział przez 15 → współczynnik max duty (0%, 20%, 40%, 60%, 80%, 100%)
+
+---
+
+## Pomiar prędkości
+
+Dwa tryby pomiaru zależne od parametru P07 z wyświetlacza:
+
+### Tryb 1: Direct-drive (P07 > 1)
+
+Mierzone w ISR timera komutacji (20 kHz) — czas między przejściami stanów Halla:
+
+```
+wheeltime_ms = hall_period_us × P07 / 1000
+```
+
+Gdzie P07 = 6 × pole_pairs (np. 90 dla silnika 15-biegunowego). ISR mierzy `hall_period_us` **zawsze**, nawet gdy silnik nie jest napędzany (wykrywa toczenie koła).
+
+### Tryb 2: Silnik przekładniowy (P07 ≤ 1)
+
+Zewnętrzny czujnik prędkości na GPIO21 (INPUT_PULLUP, zbocze opadające):
+
+```
+wheeltime_ms = speed_period_us / 1000
+```
+
+Jeden magnes na kole = jeden impuls na obrót.
+
+### Timeout
+
+- Direct-drive: timeout 2 s od ostatniego przejścia Halla → RPM = 0
+- Czujnik SPEED: timeout 3 s od ostatniego impulsu → RPM = 0
+
+### Obliczanie RPM
+
+```
+RPM = 60000 / wheeltime_ms
+```
+
+---
+
+## Obliczanie mocy
+
+Moc jest obliczana w `loop()` jako:
+
+```
+P [W] = V_bat [V] × I_max [A]
+```
+
+Gdzie `I_max` = maksimum z prądów trzech faz (Ia, Ib, Ic).
+
+### Tryby pracy
+
+| Stan | `power_watts` | `regen_power_watts` |
+|------|---------------|---------------------|
+| Motoring (silnik napędzany) | P = Vbat × Imax | 0 |
+| Regen (hamowanie regeneracyjne) | 0 | P = Vbat × Imax |
+| Wyłączony / coast | 0 | 0 |
+
+Moc jest wyświetlana w statusie jako `P:XX.XW`, a regen jako `RGN:XX.XW`.
+
+---
+
+## Hamowanie regeneracyjne
+
+### Zasada działania
+
+Hamowanie rekuperacyjne wykorzystuje silnik BLDC jako generator — energia kinetyczna jest zamieniana na prąd ładujący baterię. Implementacja bazuje na **low-side boost chopper**:
+
+1. **PWM ON** (LS ON): uzwojenie silnika jest zwarte przez GND → prąd narasta napędzany przez back-EMF, energia gromadzi się w indukcyjności uzwojenia
+2. **PWM OFF** (LS OFF): prąd indukcyjny nie może się zatrzymać → napięcie rośnie → prąd płynie przez body diodę high-side FET do V+ → **bateria jest ładowana**
+
+### Tabela komutacji regen (CW)
+
+Transformacja motoring → regen:
+- Faza źródłowa (dawniej HS_PWM) → **LS_PWM** (regen)
+- Faza sink (dawniej LS_ON) → **LS_ON** (bez zmian)
+- Faza float → **float** (bez zmian)
+
+| Hall [CBA] | Motoring | Regen |
+|---|---|---|
+| 1 (001) | A=HS_PWM, B=LS_ON | A=**LS_PWM**, B=LS_ON, C=float |
+| 3 (011) | A=HS_PWM, C=LS_ON | A=**LS_PWM**, B=float, C=LS_ON |
+| 2 (010) | B=HS_PWM, C=LS_ON | A=float, B=**LS_PWM**, C=LS_ON |
+| 6 (110) | B=HS_PWM, A=LS_ON | A=LS_ON, B=**LS_PWM**, C=float |
+| 4 (100) | C=HS_PWM, A=LS_ON | A=LS_ON, B=float, C=**LS_PWM** |
+| 5 (101) | C=HS_PWM, B=LS_ON | A=float, B=LS_ON, C=**LS_PWM** |
+
+### Sterowanie duty regen
+
+IR2103 LIN jest odwrócony, więc:
+```cpp
+ledcWrite(LOW_channel, PWM_MAX_DUTY - regen_duty);
+```
+
+| duty | Efekt |
+|------|-------|
+| 0 | Brak hamowania (coast) |
+| 50% | Umiarkowane hamowanie |
+| 80% | Mocne hamowanie (REGEN_MAX_DUTY limit) |
+| 100% | ⚠️ Zabronione! Brak fazy OFF = brak transferu do baterii |
+
+### Aktywacja
+
+Regen jest włączany komendą `R` (toggle). Gdy aktywny, hamowanie regeneracyjne następuje automatycznie przy naciśnięciu hamulca, pod warunkiem:
+- **Vbat < 42V** (VBAT_REGEN_CUTOFF) — ochrona przed przepięciem
+- **RPM > 50** (REGEN_MIN_RPM) — poniżej back-EMF za niskie
+
+Jeśli warunki nie są spełnione → coast (allMosfetsOff).
+
+### Zabezpieczenia
+
+- **Przepięcie:** monitor Vbat — regen wyłączany powyżej 42V
+- **Duty max 80%:** REGEN_MAX_DUTY — gwarantuje fazę OFF na transfer energii
+- **Min RPM:** regen nieefektywny przy niskich obrotach (tylko grzeje)
+- **Shoot-through:** w trybie regen WSZYSTKIE high-side FET OFF
+
+> **Uwaga:** INA180A2 jest jednokierunkowy. W trybie regen poprawnie mierzy prąd na fazie z LS_PWM (kierunek drain→source). Na fazie sink (prąd source→drain) widzi ~0V.
+
+---
+
+## Przepustnica i poziomy wspomagania
+
+### Sprzęt
 
 - **Pin:** GPIO2 (ADC2_CH2)
 - **Martwa strefa:** wartości ADC < 400 → duty = 0
-- **Zakres roboczy:** 400–2600 ADC → 0–100% duty
-- **Mapowanie:** `map(thr, 400, 2600, 0, PWM_MAX_DUTY)`
+- **Zakres roboczy:** 400–2600 ADC
 
 > Zakres 400–2600 został skalibrowany empirycznie dla konkretnej przepustnicy.  
 > Jeśli przepustnica ma inny zakres, zmień `THROTTLE_DEAD_ZONE`, `THROTTLE_MIN_RAW`, `THROTTLE_MAX_RAW` w `main.cpp`.
 
-Przepustnica jest odczytywana tylko gdy `mode == DRIVE_MODE_BLOCK`.  
-Komendy UART (`+`, `-`, liczba%) również ustawiają `duty_cycle`, ale przepustnica nadpisuje tę wartość w każdej iteracji `loop()`.
+### Mapowanie proporcjonalne (wspólny algorytm BLOCK / SINUS / FOC)
+
+Przepustnica działa **proporcjonalnie** do aktualnego poziomu wspomagania z wyświetlacza S866. Zmiana poziomu zmienia zakres wyjściowy gazu, a nie obcina go — pełen zakres przepustnicy zawsze daje gładkie sterowanie od 0 do maxDuty.
+
+Algorytm (dwie funkcje wyekstrahowane do ponownego użycia we wszystkich trybach):
+
+1. **`getAssistMaxDuty()`** — oblicza maksymalne duty z poziomu wspomagania:
+
+| Wyświetlacz | Assist level | maxDuty |
+|---|---|---|
+| Nie podłączony | — | 100% (standalone) |
+| Podłączony | 0 | 0% (silnik wyłączony) |
+| Podłączony | 1 (raw=3) | 20% |
+| Podłączony | 2 (raw=6) | 40% |
+| Podłączony | 3 (raw=9) | 60% |
+| Podłączony | 4 (raw=12) | 80% |
+| Podłączony | 5 (raw=15) | 100% |
+
+2. **`mapThrottleToDuty(raw, maxDuty)`** — mapuje pełen zakres ADC przepustnicy na 0–maxDuty:
+
+```
+duty_target = map(throttle_raw, 400, 2600, 0, maxDuty)
+```
+
+Przykład: przy assist level 3 (maxDuty=60%) pełen gaz daje 60%, połowa gazu daje 30%.  
+Przy starym podejściu (clamp): pełen gaz dałby 60%, ale połowa gazu — 50% (powyżej progu = obcięte), co dawało słabą rozdzielczość na niższych poziomach.
+
+Przepustnica jest odczytywana tylko w aktywnym trybie sterowania (BLOCK).  
+Komendy UART (`+`, `-`, liczba%) również ustawiają `duty_target`, ale przepustnica nadpisuje tę wartość w każdej iteracji `loop()`.
+
+---
+
+## Rampa rozpędzania
+
+Silnik nigdy nie otrzyma natychmiastowego skoku duty z 0% do 100%. Zaimplementowana rampa ogranicza szybkość narastania `duty_cycle` w czasie.
+
+### Zasada działania
+
+```
+Przepustnica → duty_target (docelowe)
+                    │
+              ┌─────┴─────┐
+              │   RAMPA   │
+              └─────┬─────┘
+                    │
+              duty_cycle (rzeczywiste) → ISR → silnik
+```
+
+- **Wzrost (rozpędzanie):** duty_cycle narasta płynnie, ograniczone czasem rampy
+- **Spadek (zwalnianie):** **natychmiastowy** — puszczenie gazu od razu zmniejsza moc (bezpieczeństwo)
+
+### Parametry
+
+| Parametr | Wartość | Opis |
+|---|---|---|
+| `ramp_time_ms` | 1200 ms (domyślnie) | Czas przejścia 0→100% duty |
+| Krok rampy | obliczany z dt | `max_step = PWM_MAX_DUTY × dt_us / (ramp_time_ms × 1000)` |
+| `ramp_time_ms = 0` | — | Rampa wyłączona (natychmiastowy skok) |
+
+Rampa jest oparta na rzeczywistym czasie (`micros()`), więc działa poprawnie niezależnie od szybkości `loop()`.
+
+Przy komendzie `d` (disable) rampa jest resetowana do 0.
+
+### Status
+
+Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
+- `D:35/80%` — rampa w trakcie narastania (35% aktualnie, docelowo 80%)
+- `D:80/80%` — rampa osiągnęła cel
+- `D:0/0%` — silnik wyłączony
 
 ---
 
@@ -306,6 +568,9 @@ Komendy UART (`+`, `-`, liczba%) również ustawiają `duty_cycle`, ale przepust
 | `+`             | Zwiększ duty o 5% |
 | `-`             | Zmniejsz duty o 5% |
 | `0`–`100` Enter | Ustaw duty w % (np. `25` + Enter = 25%) |
+| `R`             | Regeneracja ON/OFF (hamowanie rekuperacyjne) |
+| `b`             | Symulacja hamulca ON/OFF (toggle) |
+| `P`             | Pokaż parametry wyświetlacza P01-P20 |
 | `s`             | Wyświetl status (jednorazowo) |
 | `a`             | Toggle auto-status co 1 s |
 | `h`             | Wyświetl pomoc |
@@ -313,19 +578,26 @@ Komendy UART (`+`, `-`, liczba%) również ustawiają `duty_cycle`, ale przepust
 ### Format statusu (jedna linia)
 
 ```
-BLK CW D:45% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870)
+BLK CW D:35/80% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870) RPM:120 WT:500 P:44.6W DISP:OK L3
 ```
 
 | Pole    | Znaczenie |
-|---------|-----------|
+|---------|-----------||
 | `BLK`   | Tryb: OFF/BLK/SIN/FOC |
 | `CW`    | Kierunek: CW/CCW |
-| `D:45%` | Duty cycle PWM |
+| `D:35/80%` | Duty cycle: aktualny (po rampie) / docelowy (z przepustnicy) |
 | `V:36.1`| Napięcie baterii [V] |
 | `Ia/Ib/Ic` | Prądy fazowe A, B, C [A] |
 | `H:101` | Stan Halla [C:B:A] binarnie |
 | `T:312` | Surowa wartość ADC temperatury |
 | `Thr:45%(1870)` | Przepustnica: % i RAW ADC |
+| `RPM:120` | Obroty koła na minutę |
+| `WT:500` | Czas obrotu koła [ms] |
+| `P:44.6W` | Aktualna moc [W] (pobierana lub oddawana) |
+| `RGN:12.5W` | Moc regeneracji [W] (gdy regen aktywny) |
+| `RGN:rdy` | Regen włączony, czeka na hamulec |
+| `DISP:OK L3` | Wyświetlacz S866 podłączony, poziom wspomagania 3 |
+| `DISP:--` | Wyświetlacz nie podłączony |
 | `BRK`   | Hamulec aktywny |
 | `PAS`   | PAS aktywny |
 | `FAULT` | Błąd czujników Halla |
@@ -387,20 +659,22 @@ Aktualny offset nie jest wyświetlany w statusie. Aby go sprawdzić, można tymc
 - Regulatory PI dla prądu Id/Iq
 - Wymaga szybkiego ADC (synchronizacja z PWM) i enkoderu/resolvera
 
-### 3. Pomiar RPM
-- Liczyć przejścia stanów Halla: 6 przejść = 1 obrót elektryczny
-- `g_bldc_state.rpm` jest zarezerwowane w strukturze
-
-### 4. Zabezpieczenia
+### 3. Zabezpieczenia (rozszerzone)
 - Overcurrent: porównać `phase_current[i]` z progiem → `allMosfetsOff()` + `fault = true`
 - Overtemperature: po skalibrowanym czujniku
 - Undervoltage: sprawdzać `battery_voltage` < próg
+- TVS dioda na szynie DC jako hardwarowy clamp (regen overvoltage)
+
+### 4. Regulacja siły regen
+- Mapowanie siły hamowania z prędkości (szybciej → więcej hamowania)
+- Pętla prądowa: INA180A2 → limit prądu regen z P14
+- Konfiguracja duty regen z wyświetlacza lub komend Serial
 
 ### 5. Konfiguracja przez UART
 - Możliwość zmiany `THROTTLE_DEAD_ZONE`, `THROTTLE_MAX_RAW` bez rekompilacji
 - Zapis do NVS (Non-Volatile Storage) ESP32
 
-### 6. CAN bus / UART protokół
+### 6. CAN bus / RS485
 - Gotowy pin UART_EN (GPIO17) sugeruje planowany RS485 lub CAN
 - Zaimplementować protokół ramki np. `$CMD,VALUE\n`
 

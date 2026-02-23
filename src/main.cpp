@@ -58,6 +58,19 @@ volatile uint32_t g_hall_period_us = 0;       ///< Okres między przejściami Ha
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
 volatile uint32_t g_speed_period_us = 0;      ///< Okres między impulsami SPEED [µs]
 
+// Regeneracja — zmienne volatile dla ISR
+volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
+volatile uint16_t g_regen_duty_isr = 0;       ///< Siła hamowania regen 0-PWM_MAX_DUTY
+
+/// Limit duty regen — 80% max (musi zostać czas OFF na transfer energii do baterii)
+#define REGEN_MAX_DUTY  (PWM_MAX_DUTY * 80 / 100)
+/// Minimalne RPM poniżej którego regen jest nieefektywny (tylko grzeje)
+#define REGEN_MIN_RPM   50
+/// Napięcie odcięcia regen [V] — powyżej tego progu regen wyłączony (ochrona baterii)
+#define VBAT_REGEN_CUTOFF  42.0f
+/// Domyślne duty regen (50% — umiarkowane hamowanie)
+#define REGEN_DEFAULT_DUTY  (PWM_MAX_DUTY / 2)
+
 // ============================================================================
 // Prototypy funkcji
 // ============================================================================
@@ -73,6 +86,7 @@ void printDiagnostics();
 void printDisplayConfig();
 void blockCommutate(uint8_t hallState, uint16_t duty);
 void processSerialCommands();
+static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir);
 
 // Dzielnik napięcia VBAT: 1M (góra) / 33k (dół)
 static const float kVbatRTop = 1130000.0f;
@@ -102,8 +116,66 @@ static const unsigned long AUTO_STATUS_INTERVAL_MS = 1000;
 // Bufor na komendy numeryczne
 static String serialBuffer = "";
 
+// Symulacja hamulca komendą Serial
+static bool g_brake_simulated = false;
+
+// Rampa rozpędzania silnika
+static const uint16_t RAMP_TIME_DEFAULT_MS = 1200;  ///< Domyślny czas rampy 0→100% [ms]
+static uint16_t g_duty_ramped = 0;                   ///< Aktualny duty po rampie
+static unsigned long g_ramp_last_us = 0;             ///< Timestamp ostatniego kroku rampy [µs]
+
 // Wyświetlacz S866 (zawsze aktywny na Serial2)
 static s866_display_t g_display;
+
+// ============================================================================
+// Algorytm przepustnicy — wspólny dla BLOCK / SINUS / FOC
+// ============================================================================
+
+/**
+ * @brief Oblicza max duty na podstawie poziomu wspomagania (assist level).
+ *
+ * Algorytm wspólny dla wszystkich trybów sterowania (BLOCK, SINUS, FOC).
+ * Przepustnica mapuje zakres RAW bezpośrednio na 0–maxDuty (proporcjonalnie).
+ *
+ * @return Maksymalne duty 0–PWM_MAX_DUTY:
+ *   - Wyświetlacz podłączony, level>0: proporcjonalnie 20/40/60/80/100%
+ *   - Wyświetlacz podłączony, level=0:  0 (silnik wyłączony)
+ *   - Wyświetlacz nie podłączony:       PWM_MAX_DUTY (tryb standalone)
+ */
+static uint16_t getAssistMaxDuty() {
+    if (!g_display.connected) {
+        return PWM_MAX_DUTY;  // brak wyświetlacza → pełna moc (standalone)
+    }
+    if (g_display.rx.assist_level == 0) {
+        return 0;  // assist level 0 → silnik wyłączony
+    }
+    // Raw: 3=20%, 6=40%, 9=60%, 12=80%, 15=100%
+    uint16_t maxDuty = (uint16_t)((uint32_t)g_display.rx.assist_level * PWM_MAX_DUTY / 15);
+    if (maxDuty > PWM_MAX_DUTY) maxDuty = PWM_MAX_DUTY;
+    return maxDuty;
+}
+
+/**
+ * @brief Mapuje wartość RAW przepustnicy na duty cycle 0–maxDuty.
+ *
+ * Pełen zakres przepustnicy (THROTTLE_MIN_RAW–THROTTLE_MAX_RAW) jest mapowany
+ * proporcjonalnie na 0–maxDuty. Dzięki temu zmiana poziomu wspomagania
+ * zmienia zakres wyjściowy, a nie obcina go (lepsza rozdzielczość sterowania).
+ *
+ * @param throttle_raw Surowa wartość ADC przepustnicy.
+ * @param maxDuty      Maksymalne duty z getAssistMaxDuty().
+ * @return duty 0–maxDuty
+ */
+static uint16_t mapThrottleToDuty(uint16_t throttle_raw, uint16_t maxDuty) {
+    if (maxDuty == 0) return 0;
+    if (throttle_raw < THROTTLE_DEAD_ZONE) return 0;
+
+    uint16_t thr = throttle_raw;
+    if (thr > THROTTLE_MAX_RAW) thr = THROTTLE_MAX_RAW;
+    if (thr < THROTTLE_MIN_RAW) thr = THROTTLE_MIN_RAW;
+
+    return (uint16_t)map(thr, THROTTLE_MIN_RAW, THROTTLE_MAX_RAW, 0, maxDuty);
+}
 
 // ============================================================================
 // ISR czujnika prędkości (GPIO, pin SPEED)
@@ -150,6 +222,7 @@ void setup() {
     // Inicjalizacja stanu
     memset(&g_bldc_state, 0, sizeof(bldc_state_t));
     g_bldc_state.mode = DRIVE_MODE_DISABLED;
+    g_bldc_state.ramp_time_ms = RAMP_TIME_DEFAULT_MS;
 
     // Inicjalizacja GPIO
     initGPIO();
@@ -170,6 +243,7 @@ void setup() {
     // Timer sprzętowy do komutacji (co 50 us = 20 kHz)
     initCommutationTimer();
     Serial.println("[OK] Timer komutacji uruchomiony (20 kHz)");
+    Serial.printf("[OK] Rampa rozpędzania: %d ms (0→100%%)\n", g_bldc_state.ramp_time_ms);
 
     // Inicjalizacja wyświetlacza S866 na Serial2 (GPIO4/GPIO16)
     memset(&g_display, 0, sizeof(g_display));
@@ -184,6 +258,8 @@ void setup() {
     Serial.println("  r     - odwróć kierunek");
     Serial.println("  +/-   - duty +/- 5%");
     Serial.println("  0-100 - duty w % (Enter)");
+    Serial.println("  R     - regeneracja ON/OFF");
+    Serial.println("  b     - symulacja hamulca ON/OFF");
     Serial.println("  P     - pokaż parametry wyświetlacza P01-P20");
     Serial.println("  s     - pokaż status");
     Serial.println("  a     - auto-status co 1s ON/OFF");
@@ -220,30 +296,44 @@ void loop() {
     readHallSensors();
     readDigitalInputs();
 
-    // Przepustnica sprzętowa -> duty
+    // Przepustnica sprzętowa -> duty target (proporcjonalnie do poziomu wspomagania)
+    // Algorytm wspólny dla BLOCK / SINUS / FOC:
+    //   maxDuty = f(assist_level)    — zakres wyjściowy zależy od poziomu
+    //   duty_target = map(throttle, 0, maxDuty) — pełen zakres gazu → 0..maxDuty
     if (g_bldc_state.mode == DRIVE_MODE_BLOCK) {
-        uint16_t thr = g_bldc_state.throttle_raw;
-        if (thr < THROTTLE_DEAD_ZONE) {
-            g_bldc_state.duty_cycle = 0;
-        } else {
-            if (thr > THROTTLE_MAX_RAW) thr = THROTTLE_MAX_RAW;
-            if (thr < THROTTLE_MIN_RAW) thr = THROTTLE_MIN_RAW;
-            g_bldc_state.duty_cycle = map(thr, THROTTLE_MIN_RAW, THROTTLE_MAX_RAW, 0, PWM_MAX_DUTY);
-        }
+        uint16_t maxDuty = getAssistMaxDuty();
+        g_bldc_state.duty_target = mapThrottleToDuty(g_bldc_state.throttle_raw, maxDuty);
+    }
 
-        // Wyświetlacz S866: assist level limituje max duty
-        // Raw assist_level: 0, 3, 6, 9, 12, 15 (wyświetlacz koduje poziomy 0-5 jako *3)
-        if (g_display.connected) {
-            uint16_t maxDuty = 0;
-            if (g_display.rx.assist_level > 0) {
-                // Raw 3=20%, 6=40%, 9=60%, 12=80%, 15=100%
-                maxDuty = (uint16_t)((uint32_t)g_display.rx.assist_level * PWM_MAX_DUTY / 15);
-                if (maxDuty > PWM_MAX_DUTY) maxDuty = PWM_MAX_DUTY;
+    // Rampa rozpędzania: duty_cycle narasta płynnie w kierunku duty_target
+    // Czas rampy = ramp_time_ms dla przejścia 0→100%.
+    // Spadek (hamowanie przepustnicą) jest natychmiastowy — rampa działa tylko w górę.
+    {
+        uint16_t target = g_bldc_state.duty_target;
+        unsigned long now_us = micros();
+        unsigned long dt_us = now_us - g_ramp_last_us;
+        g_ramp_last_us = now_us;
+
+        if (target <= g_duty_ramped) {
+            // Spadek — natychmiastowy (bezpieczeństwo: szybkie zwolnienie gazu)
+            g_duty_ramped = target;
+        } else if (g_bldc_state.ramp_time_ms > 0) {
+            // Wzrost — ograniczony rampą
+            // max_step = PWM_MAX_DUTY × dt_us / (ramp_time_ms × 1000)
+            uint32_t max_step = (uint32_t)PWM_MAX_DUTY * dt_us
+                                / ((uint32_t)g_bldc_state.ramp_time_ms * 1000UL);
+            if (max_step < 1) max_step = 1;
+            uint16_t diff = target - g_duty_ramped;
+            if (diff > max_step) {
+                g_duty_ramped += (uint16_t)max_step;
+            } else {
+                g_duty_ramped = target;
             }
-            if (g_bldc_state.duty_cycle > maxDuty) {
-                g_bldc_state.duty_cycle = maxDuty;
-            }
+        } else {
+            // ramp_time_ms == 0 → rampa wyłączona
+            g_duty_ramped = target;
         }
+        g_bldc_state.duty_cycle = g_duty_ramped;
     }
 
     // Aktualizacja zmiennych ISR z głównego stanu
@@ -252,6 +342,50 @@ void loop() {
     g_motor_enabled = (g_bldc_state.mode == DRIVE_MODE_BLOCK) && (g_bldc_state.duty_cycle > 0);
     g_brake_isr = g_bldc_state.brake_active;
     g_direction_isr = g_bldc_state.direction;
+
+    // Obliczanie mocy: P = Vbat × max(Ia, Ib, Ic)
+    {
+        float maxI = g_bldc_state.phase_current[0];
+        if (g_bldc_state.phase_current[1] > maxI) maxI = g_bldc_state.phase_current[1];
+        if (g_bldc_state.phase_current[2] > maxI) maxI = g_bldc_state.phase_current[2];
+        float power = g_bldc_state.battery_voltage * maxI;
+
+        if (g_bldc_state.regen_active) {
+            // W trybie regen: prąd płynie do baterii → moc ujemna (oddawana)
+            g_bldc_state.regen_power_watts = power;
+            g_bldc_state.power_watts = 0.0f;
+        } else if (g_motor_enabled) {
+            // W trybie motoring: moc pobierana z baterii
+            g_bldc_state.power_watts = power;
+            g_bldc_state.regen_power_watts = 0.0f;
+        } else {
+            g_bldc_state.power_watts = 0.0f;
+            g_bldc_state.regen_power_watts = 0.0f;
+        }
+    }
+
+    // Regeneracja — logika aktywacji (hamulec + regen_enabled + warunki bezpieczeństwa)
+    if (g_bldc_state.brake_active && g_bldc_state.regen_enabled) {
+        bool vbat_ok = g_bldc_state.battery_voltage < VBAT_REGEN_CUTOFF;
+        bool rpm_ok = g_bldc_state.rpm > REGEN_MIN_RPM;
+
+        if (vbat_ok && rpm_ok) {
+            g_bldc_state.regen_active = true;
+            uint16_t regen_d = REGEN_DEFAULT_DUTY;
+            if (regen_d > REGEN_MAX_DUTY) regen_d = REGEN_MAX_DUTY;
+            g_regen_active_isr = true;
+            g_regen_duty_isr = regen_d;
+        } else {
+            // Warunki niespełnione — wyłącz regen (coast)
+            g_bldc_state.regen_active = false;
+            g_regen_active_isr = false;
+            g_regen_duty_isr = 0;
+        }
+    } else {
+        g_bldc_state.regen_active = false;
+        g_regen_active_isr = false;
+        g_regen_duty_isr = 0;
+    }
 
     // Obsługa wyświetlacza S866 (Serial2 — zawsze aktywny)
     {
@@ -588,7 +722,7 @@ void readHallSensors() {
  * Hamulec ma priorytet — jest też sprawdzany w ISR (g_brake_isr).
  */
 void readDigitalInputs() {
-    g_bldc_state.brake_active = (digitalRead(PIN_BRAKE) == LOW);
+    g_bldc_state.brake_active = (digitalRead(PIN_BRAKE) == LOW) || g_brake_simulated;
     g_bldc_state.pas_active = (digitalRead(PIN_PAS) == LOW);
 }
 
@@ -623,6 +757,7 @@ void readDigitalInputs() {
 void printDiagnostics() {
     const char* modeNames[] = {"OFF", "BLK", "SIN", "FOC"};
     int dutyPct = (int)((uint32_t)g_bldc_state.duty_cycle * 100 / PWM_MAX_DUTY);
+    int targetPct = (int)((uint32_t)g_bldc_state.duty_target * 100 / PWM_MAX_DUTY);
     int thrPct = 0;
     if (g_bldc_state.throttle_raw > THROTTLE_DEAD_ZONE) {
         uint16_t thr = g_bldc_state.throttle_raw;
@@ -630,10 +765,10 @@ void printDiagnostics() {
         thrPct = (int)((uint32_t)(thr - THROTTLE_DEAD_ZONE) * 100 / (THROTTLE_MAX_RAW - THROTTLE_DEAD_ZONE));
         if (thrPct > 100) thrPct = 100;
     }
-    Serial.printf("%s %s D:%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u %s%s%s",
+    Serial.printf("%s %s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
         modeNames[g_bldc_state.mode],
         g_bldc_state.direction == DIRECTION_CW ? "CW" : "CCW",
-        dutyPct,
+        dutyPct, targetPct,
         g_bldc_state.battery_voltage,
         g_bldc_state.phase_current[0],
         g_bldc_state.phase_current[1],
@@ -646,6 +781,18 @@ void printDiagnostics() {
         g_bldc_state.throttle_raw,
         (unsigned long)g_bldc_state.rpm,
         g_bldc_state.wheeltime_ms,
+        g_bldc_state.regen_active ? g_bldc_state.regen_power_watts : g_bldc_state.power_watts);
+
+    // Informacje o regeneracji
+    if (g_bldc_state.regen_enabled) {
+        if (g_bldc_state.regen_active) {
+            Serial.printf(" RGN:%.1fW", g_bldc_state.regen_power_watts);
+        } else {
+            Serial.print(" RGN:rdy");
+        }
+    }
+
+    Serial.printf(" %s%s%s",
         g_bldc_state.brake_active ? "BRK " : "",
         g_bldc_state.pas_active ? "PAS " : "",
         g_bldc_state.fault ? "FAULT " : "");
@@ -708,13 +855,17 @@ void IRAM_ATTR onCommutationTimer() {
     }
 
     if (g_brake_isr) {
-        // Hamulec - natychmiast wyłącz
-        ledcWrite(PWM_CHANNEL_A_HIGH, 0);
-        ledcWrite(PWM_CHANNEL_B_HIGH, 0);
-        ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-        ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-        ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-        ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+        // Hamulec aktywny — regen braking jeśli włączony, inaczej coast
+        if (g_regen_active_isr && g_regen_duty_isr > 0) {
+            regenCommutateISR(hall, g_regen_duty_isr, g_direction_isr);
+        } else {
+            ledcWrite(PWM_CHANNEL_A_HIGH, 0);
+            ledcWrite(PWM_CHANNEL_B_HIGH, 0);
+            ledcWrite(PWM_CHANNEL_C_HIGH, 0);
+            ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+        }
         return;
     }
 
@@ -902,6 +1053,140 @@ static inline void phaseC_Off() {
     ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
 }
 
+// ============================================================================
+// Funkcje pomocnicze regen — Low-side PWM (HS OFF, LS modulowany)
+// ============================================================================
+
+/**
+ * @brief Faza A: regen PWM (high-side OFF, low-side PWM).
+ * @param duty Siła hamowania 0–PWM_MAX_DUTY (0=brak zwarcia, MAX=pełne zwarcie).
+ *
+ * IR2103 LIN odwrócony: duty=0 → LIN=LOW → LS ON,
+ * więc LEDC duty = PWM_MAX_DUTY - regen_duty.
+ * Przy PWM OFF (LS wyłączony) prąd indukcyjny płynie przez body diodę HS do V+.
+ */
+static inline void IRAM_ATTR phaseA_RegenPWM(uint16_t duty) {
+    ledcWrite(PWM_CHANNEL_A_HIGH, 0);                          // HIN=LOW → HS OFF
+    ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY - duty);         // LS PWM (odwrócone)
+}
+
+/**
+ * @brief Faza B: regen PWM (high-side OFF, low-side PWM).
+ * @param duty Siła hamowania 0–PWM_MAX_DUTY.
+ */
+static inline void IRAM_ATTR phaseB_RegenPWM(uint16_t duty) {
+    ledcWrite(PWM_CHANNEL_B_HIGH, 0);
+    ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY - duty);
+}
+
+/**
+ * @brief Faza C: regen PWM (high-side OFF, low-side PWM).
+ * @param duty Siła hamowania 0–PWM_MAX_DUTY.
+ */
+static inline void IRAM_ATTR phaseC_RegenPWM(uint16_t duty) {
+    ledcWrite(PWM_CHANNEL_C_HIGH, 0);
+    ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY - duty);
+}
+
+// ============================================================================
+// ISR regen — komutacja regeneracyjna
+// ============================================================================
+
+/**
+ * @brief Komutacja regeneracyjna w ISR (low-side boost chopper).
+ *
+ * Zasada działania:
+ * - Faza, która w motoring miała HS_PWM (źródło) → teraz LS_PWM (regen)
+ * - Faza, która w motoring miała LS_ON (sink) → LS_ON (bez zmian)
+ * - Trzecia faza → float (bez zmian)
+ *
+ * Cykl PWM regen:
+ * 1. PWM ON (LS ON): uzwojenie zwarte przez GND, prąd narasta (L ładuje się)
+ * 2. PWM OFF (LS OFF): prąd indukcyjny płynie przez body diodę HS → Vbat (ładuje baterię)
+ *
+ * @param hall  Stan Halla [C:B:A] 1-6
+ * @param regen_duty Siła hamowania 0–PWM_MAX_DUTY
+ * @param dir   Kierunek obrotu
+ *
+ * @warning Wszystkie high-side FETy MUSZĄ być OFF! Shoot-through = uszkodzenie.
+ * @warning Nigdy duty 100% — brak fazy OFF = brak transferu do baterii (tylko ciepło).
+ */
+static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir) {
+    if (dir == DIRECTION_CW) {
+        switch (hall) {
+            case 1:  // motoring: A+ B-  →  regen: A=LS_PWM, B=LS_ON, C=float
+                phaseA_RegenPWM(regen_duty);
+                phaseB_Low();
+                phaseC_Off();
+                break;
+            case 3:  // motoring: A+ C-  →  regen: A=LS_PWM, B=float, C=LS_ON
+                phaseA_RegenPWM(regen_duty);
+                phaseB_Off();
+                phaseC_Low();
+                break;
+            case 2:  // motoring: B+ C-  →  regen: A=float, B=LS_PWM, C=LS_ON
+                phaseA_Off();
+                phaseB_RegenPWM(regen_duty);
+                phaseC_Low();
+                break;
+            case 6:  // motoring: B+ A-  →  regen: A=LS_ON, B=LS_PWM, C=float
+                phaseA_Low();
+                phaseB_RegenPWM(regen_duty);
+                phaseC_Off();
+                break;
+            case 4:  // motoring: C+ A-  →  regen: A=LS_ON, B=float, C=LS_PWM
+                phaseA_Low();
+                phaseB_Off();
+                phaseC_RegenPWM(regen_duty);
+                break;
+            case 5:  // motoring: C+ B-  →  regen: A=float, B=LS_ON, C=LS_PWM
+                phaseA_Off();
+                phaseB_Low();
+                phaseC_RegenPWM(regen_duty);
+                break;
+            default:
+                allMosfetsOff();
+                break;
+        }
+    } else {  // CCW
+        switch (hall) {
+            case 1:  // motoring CCW: B+ A-  →  regen: A=LS_ON, B=LS_PWM, C=float
+                phaseA_Low();
+                phaseB_RegenPWM(regen_duty);
+                phaseC_Off();
+                break;
+            case 3:  // motoring CCW: C+ A-  →  regen: A=LS_ON, B=float, C=LS_PWM
+                phaseA_Low();
+                phaseB_Off();
+                phaseC_RegenPWM(regen_duty);
+                break;
+            case 2:  // motoring CCW: C+ B-  →  regen: A=float, B=LS_ON, C=LS_PWM
+                phaseA_Off();
+                phaseB_Low();
+                phaseC_RegenPWM(regen_duty);
+                break;
+            case 6:  // motoring CCW: A+ B-  →  regen: A=LS_PWM, B=LS_ON, C=float
+                phaseA_RegenPWM(regen_duty);
+                phaseB_Low();
+                phaseC_Off();
+                break;
+            case 4:  // motoring CCW: A+ C-  →  regen: A=LS_PWM, B=float, C=LS_ON
+                phaseA_RegenPWM(regen_duty);
+                phaseB_Off();
+                phaseC_Low();
+                break;
+            case 5:  // motoring CCW: B+ C-  →  regen: A=float, B=LS_PWM, C=LS_ON
+                phaseA_Off();
+                phaseB_RegenPWM(regen_duty);
+                phaseC_Low();
+                break;
+            default:
+                allMosfetsOff();
+                break;
+        }
+    }
+}
+
 /**
  * @brief Komutacja blokowa 6-step (backup path — wywoływana z loop()).
  *
@@ -1013,6 +1298,8 @@ void printHelp() {
     Serial.println("r         Odwróć kierunek (CW/CCW) - tylko gdy wyłączony");
     Serial.println("+/-       Zmień duty o ±5%");
     Serial.println("0-100     Ustaw duty w procentach (wpisz liczbę i Enter)");
+    Serial.println("R         Regeneracja ON/OFF (hamowanie rekuperacyjne)");
+    Serial.println("b         Symulacja hamulca ON/OFF");
     Serial.println("P         Pokaż parametry wyświetlacza P01-P20");
     Serial.println("s         Pokaż status");
     Serial.println("a         Auto-status co 1s ON/OFF");
@@ -1084,6 +1371,8 @@ void printDisplayConfig() {
  * | r      | Odwróć kierunek (tylko gdy off) |
  * | +/-    | Duty ±5% |
  * | 0-100  | Ustaw duty w % (Enter) |
+ * | R      | Regeneracja ON/OFF |
+ * | b      | Symulacja hamulca ON/OFF |
  * | P      | Pokaż parametry wyświetlacza P01-P20 |
  * | s      | Jednorazowy status |
  * | a      | Toggle auto-status co 1 s |
@@ -1105,6 +1394,8 @@ void processSerialCommands() {
             case 'd':
                 g_bldc_state.mode = DRIVE_MODE_DISABLED;
                 g_bldc_state.duty_cycle = 0;
+                g_bldc_state.duty_target = 0;
+                g_duty_ramped = 0;
                 allMosfetsOff();
                 Serial.println("[CMD] Silnik OFF");
                 serialBuffer = "";
@@ -1154,6 +1445,24 @@ void processSerialCommands() {
                 continue;
             case 'P':
                 printDisplayConfig();
+                serialBuffer = "";
+                continue;
+            case 'R':
+                g_bldc_state.regen_enabled = !g_bldc_state.regen_enabled;
+                if (!g_bldc_state.regen_enabled) {
+                    g_bldc_state.regen_active = false;
+                    g_regen_active_isr = false;
+                    g_regen_duty_isr = 0;
+                }
+                Serial.printf("[CMD] Regeneracja: %s (Vmax=%.0fV, RPMmin=%d)\n",
+                    g_bldc_state.regen_enabled ? "ON" : "OFF",
+                    VBAT_REGEN_CUTOFF, REGEN_MIN_RPM);
+                serialBuffer = "";
+                continue;
+            case 'b':
+                g_brake_simulated = !g_brake_simulated;
+                Serial.printf("[CMD] Symulacja hamulca: %s\n",
+                    g_brake_simulated ? "ON (hamulec wciśnięty)" : "OFF");
                 serialBuffer = "";
                 continue;
             default:

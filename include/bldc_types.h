@@ -69,8 +69,14 @@ typedef struct {
     uint32_t        rpm;            ///< Obroty silnika [RPM] (mechaniczne koła)
     volatile uint32_t hall_period_us; ///< Czas między przejściami Halla [µs] (z ISR)
     uint16_t        wheeltime_ms;   ///< Czas obrotu koła [ms] (do wyświetlacza)
+    float           power_watts;    ///< Aktualna moc pobierana z baterii [W]
+    float           regen_power_watts; ///< Moc oddawana do baterii (regeneracja) [W]
+    uint16_t        duty_target;    ///< Docelowe duty z przepustnicy (przed rampą)
+    uint16_t        ramp_time_ms;   ///< Czas rampy rozpędzania 0→100% [ms]
     bool            brake_active;   ///< Hamulec aktywny
     bool            pas_active;     ///< PAS aktywny
+    bool            regen_enabled;  ///< Tryb regeneracji włączony (komenda R)
+    bool            regen_active;   ///< Regeneracja aktualnie aktywna (hamulec + warunki OK)
     bool            fault;          ///< Flaga błędu
 } bldc_state_t;
 
