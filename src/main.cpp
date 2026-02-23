@@ -33,6 +33,7 @@
 #include <Arduino.h>
 #include "pinout.h"
 #include "bldc_types.h"
+#include "display_s866.h"
 
 // ============================================================================
 // Zmienne globalne
@@ -91,6 +92,10 @@ static const unsigned long AUTO_STATUS_INTERVAL_MS = 1000;
 // Bufor na komendy numeryczne
 static String serialBuffer = "";
 
+// Wyświetlacz S866
+static s866_display_t g_display;
+static bool g_displayEnabled = false;
+
 // ============================================================================
 // Setup
 // ============================================================================
@@ -140,6 +145,7 @@ void setup() {
     Serial.println("  r     - odwróć kierunek");
     Serial.println("  +/-   - duty +/- 5%");
     Serial.println("  0-100 - duty w % (Enter)");
+    Serial.println("  X     - włącz/wyłącz wyświetlacz S866");
     Serial.println("  s     - pokaż status");
     Serial.println("  a     - auto-status co 1s ON/OFF");
     Serial.println("  h     - pomoc");
@@ -185,6 +191,19 @@ void loop() {
             if (thr < THROTTLE_MIN_RAW) thr = THROTTLE_MIN_RAW;
             g_bldc_state.duty_cycle = map(thr, THROTTLE_MIN_RAW, THROTTLE_MAX_RAW, 0, PWM_MAX_DUTY);
         }
+
+        // Wyświetlacz S866: assist level limituje max duty
+        if (g_displayEnabled && g_display.connected) {
+            uint16_t maxDuty = 0;
+            if (g_display.rx.assist_level > 0) {
+                // Poziomy 1-5 → 20/40/60/80/100% max duty (>5 = 100%)
+                maxDuty = (uint16_t)((uint32_t)g_display.rx.assist_level * PWM_MAX_DUTY / 5);
+                if (maxDuty > PWM_MAX_DUTY) maxDuty = PWM_MAX_DUTY;
+            }
+            if (g_bldc_state.duty_cycle > maxDuty) {
+                g_bldc_state.duty_cycle = maxDuty;
+            }
+        }
     }
 
     // Aktualizacja zmiennych ISR z głównego stanu
@@ -194,7 +213,37 @@ void loop() {
     g_brake_isr = g_bldc_state.brake_active;
     g_direction_isr = g_bldc_state.direction;
 
-    // Obsługa komend z Serial
+    // Obsługa wyświetlacza S866 (Serial2 — niezależny od USB)
+    if (g_displayEnabled) {
+        // Aktualizuj dane TX dla wyświetlacza
+        g_display.tx.error = g_bldc_state.fault ? 1 : 0;
+        g_display.tx.brake_active = g_bldc_state.brake_active ? 1 : 0;
+
+        // Prąd: maksimum z 3 faz, w jednostkach 0.1A
+        float maxI = g_bldc_state.phase_current[0];
+        if (g_bldc_state.phase_current[1] > maxI) maxI = g_bldc_state.phase_current[1];
+        if (g_bldc_state.phase_current[2] > maxI) maxI = g_bldc_state.phase_current[2];
+        g_display.tx.current_x10 = (uint16_t)(maxI * 10.0f);
+
+        // Czas obrotu koła [ms] — wymaga pomiaru RPM (na razie 0 = stoi)
+        g_display.tx.wheeltime_ms = 0;
+        if (g_bldc_state.rpm > 0) {
+            // wheeltime = 60000 / RPM (ms na obrót)
+            g_display.tx.wheeltime_ms = (uint16_t)(60000UL / g_bldc_state.rpm);
+        }
+
+        // Obsługa protokołu wyswietlacza
+        s866_service(&g_display);
+
+        // Auto-powrót jeśli wyświetlacz się rozłączył
+        if (!g_display.connected && (millis() - g_display.last_valid_ms > S866_TIMEOUT_MS * 2)) {
+            g_displayEnabled = false;
+            s866_deinit();
+            Serial.println("[S866] Wyświetlacz rozłączony — wyłączam Serial2");
+        }
+    }
+
+    // Obsługa komend USB Serial (zawsze aktywna)
     processSerialCommands();
 
     // Auto-status co 1s
@@ -511,7 +560,7 @@ void printDiagnostics() {
         thrPct = (int)((uint32_t)(thr - THROTTLE_DEAD_ZONE) * 100 / (THROTTLE_MAX_RAW - THROTTLE_DEAD_ZONE));
         if (thrPct > 100) thrPct = 100;
     }
-    Serial.printf("%s %s D:%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) %s%s%s\n",
+    Serial.printf("%s %s D:%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) %s%s%s",
         modeNames[g_bldc_state.mode],
         g_bldc_state.direction == DIRECTION_CW ? "CW" : "CCW",
         dutyPct,
@@ -527,7 +576,21 @@ void printDiagnostics() {
         g_bldc_state.throttle_raw,
         g_bldc_state.brake_active ? "BRK " : "",
         g_bldc_state.pas_active ? "PAS " : "",
-        g_bldc_state.fault ? "FAULT" : "");
+        g_bldc_state.fault ? "FAULT " : "");
+
+    // Informacje z wyświetlacza S866
+    Serial.print(g_displayEnabled ? "DISP:EN " : "DISP:OFF ");
+    if (g_displayEnabled) {
+        if (g_display.connected) {
+            Serial.printf("L%d %s%s",
+                g_display.rx.assist_level,
+                g_display.rx.headlight ? "HL " : "",
+                g_display.rx.cruise_control ? "CC " : "");
+        } else {
+            Serial.print("L-- ");
+        }
+    }
+    Serial.println();
 }
 
 // ============================================================================
@@ -871,6 +934,7 @@ void printHelp() {
     Serial.println("r         Odwróć kierunek (CW/CCW) - tylko gdy wyłączony");
     Serial.println("+/-       Zmień duty o ±5%");
     Serial.println("0-100     Ustaw duty w procentach (wpisz liczbę i Enter)");
+    Serial.println("X         Włącz/wyłącz wyświetlacz S866 (9600 baud)");
     Serial.println("s         Pokaż status");
     Serial.println("a         Auto-status co 1s ON/OFF");
     Serial.println("h         Pokaż tę pomoc");
@@ -962,6 +1026,22 @@ void processSerialCommands() {
                 g_autoStatus = !g_autoStatus;
                 g_lastAutoStatusMs = millis();
                 Serial.printf("[CMD] Auto-status: %s\n", g_autoStatus ? "ON" : "OFF");
+                serialBuffer = "";
+                continue;
+            case 'X':
+                if (!g_displayEnabled) {
+                    g_displayEnabled = true;
+                    memset(&g_display, 0, sizeof(g_display));
+                    g_display.last_valid_ms = millis();  // grace period na pierwszą ramkę
+                    g_bldc_state.mode = DRIVE_MODE_BLOCK;
+                    g_bldc_state.fault = false;
+                    Serial.println("[CMD] Wyświetlacz S866 ON (Serial2: GPIO4/GPIO16, 9600 baud)");
+                    s866_init();
+                } else {
+                    g_displayEnabled = false;
+                    s866_deinit();
+                    Serial.println("[CMD] Wyświetlacz S866 OFF");
+                }
                 serialBuffer = "";
                 continue;
             default:
