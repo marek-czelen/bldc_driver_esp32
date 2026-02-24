@@ -82,6 +82,8 @@ typedef struct {
     // PAS (Pedal Assist Sensor)
     uint16_t        pas_cadence_rpm;  ///< Kadencja pedałowania [RPM] (0 = nie pedałuje)
     uint16_t        pas_duty;         ///< Duty wyliczone przez algorytm PAS
+    bool            pas_forward;      ///< Kierunek pedałowania: true=do przodu, false=do tyłu
+    float           pas_target_kmh;   ///< Prędkość docelowa z kadencji PAS [km/h]
     float           wheel_speed_kmh;  ///< Prędkość koła [km/h] (obliczona z wheeltime + P06)
 } bldc_state_t;
 

@@ -60,17 +60,27 @@ volatile uint32_t g_hall_period_us = 0;       ///< Okres między przejściami Ha
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
 volatile uint32_t g_speed_period_us = 0;      ///< Okres między impulsami SPEED [µs]
 
-// PAS (Pedal Assist Sensor) — pomiar kadencji z przerwania GPIO
-volatile uint32_t g_pas_last_pulse_us = 0;    ///< micros() ostatniego impulsu PAS
-volatile uint32_t g_pas_period_us = 0;        ///< Okres między impulsami PAS [µs]
+// PAS (Pedal Assist Sensor) — pomiar kadencji i kierunku z przerwania GPIO
+volatile uint32_t g_pas_last_pulse_us = 0;    ///< micros() ostatniej krawędzi PAS
+volatile uint32_t g_pas_period_us = 0;        ///< Pełny okres (HIGH+LOW) PAS [µs]
+volatile uint32_t g_pas_rising_us = 0;        ///< Czas ostatniego RISING edge
+volatile uint32_t g_pas_falling_us = 0;       ///< Czas ostatniego FALLING edge
+volatile uint32_t g_pas_high_time_us = 0;     ///< Czas trwania stanu HIGH [µs]
+volatile uint32_t g_pas_low_time_us = 0;      ///< Czas trwania stanu LOW [µs]
+volatile bool g_pas_forward = true;           ///< Kierunek pedałowania (asymetria duty cycle)
 
 /// Timeout PAS: jeśli >1.5s bez impulsu → kadencja = 0 (użytkownik przestał pedałować)
 #define PAS_TIMEOUT_US          1500000
-/// Minimalny okres PAS: odrzucaj impulsy szybsze niż 200 RPM × max magnesów
-/// (200 RPM × 24 magnesy = 4800 pulsów/min = 80 Hz → min 12.5ms)
-#define PAS_MIN_PERIOD_US       10000
+/// Minimalny półokres PAS: odrzucaj krawędzie szybsze niż 5ms (debounce)
+#define PAS_MIN_HALFPERIOD_US   5000
 /// Maksymalna kadencja [RPM] zanim obetniemy (ochrona przed szumem)
 #define PAS_MAX_CADENCE_RPM     150
+/// Minimalna różnica duty cycle do detekcji kierunku (5% = 0.05)
+/// Jeśli |HIGH-LOW| < 5% okresu → magnesy symetryczne, zakładamy forward
+#define PAS_DIR_MIN_ASYMMETRY   5
+/// Maksymalna kadencja (prędkość pedałowania) mapowana na pełną prędkość koła [RPM]
+/// Typowa kadencja sprawneg rowerzysty to 60-90 RPM
+#define PAS_CADENCE_MAX_RPM     80
 
 // Regeneracja — zmienne volatile dla ISR
 volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
@@ -200,8 +210,9 @@ static uint16_t mapThrottleToDuty(uint16_t throttle_raw, uint16_t maxDuty) {
  *
  * Kadencja [RPM] = 60 000 000 / (period_us × P13_magnets).
  * Timeout: jeśli > PAS_TIMEOUT_US od ostatniego impulsu → kadencja = 0.
+ * Kierunek: jeśli pedałowanie do tyłu (g_pas_forward == false) → kadencja = 0.
  *
- * @return Kadencja w RPM (0 = nie pedałuje / timeout)
+ * @return Kadencja w RPM (0 = nie pedałuje / timeout / pedałowanie wstecz)
  */
 static uint16_t calculatePasCadence() {
     uint32_t period = g_pas_period_us;       // volatile → local copy
@@ -210,6 +221,11 @@ static uint16_t calculatePasCadence() {
 
     // Timeout: brak impulsu → nie pedałuje
     if (last == 0 || period == 0 || (now_us - last) > PAS_TIMEOUT_US) {
+        return 0;
+    }
+
+    // Kierunek: pedałowanie wstecz → kadencja 0 (brak wspomagania)
+    if (!g_pas_forward) {
         return 0;
     }
 
@@ -246,25 +262,29 @@ static float calculateWheelSpeedKmh() {
 }
 
 /**
- * @brief Oblicza duty PAS na podstawie kadencji, czułości, prędkości i wspomagania.
+ * @brief Oblicza duty PAS na podstawie kadencji, prędkości koła i wspomagania.
  *
- * Algorytm łączy 3 czynniki (każdy 0.0–1.0):
+ * ## Algorytm: kadencja → prędkość docelowa → duty feedback
  *
- * 1. **Cadence Factor**: Jak szybko użytkownik pedałuje vs próg z P11 (sensitivity).
- *    P11=1 (niska czułość) → potrzebujesz wysokiej kadencji dla pełnej mocy.
- *    P11=24 (wysoka czułość) → niska kadencja daje pełną moc.
- *    Próg kadencji = map(P11, 1→24, 80→15 RPM).
- *    Factor = min(1.0, cadence/threshold).
+ * Problem: stary algorytm dawał pełne duty gdy kadencja > próg, więc koło
+ * zawsze rozpędzało się do max niezależnie od szybkości kręcenia pedałami.
  *
- * 2. **Speed Limiter**: Redukuje moc przy zbliżaniu się do limitu prędkości (P08).
- *    Od 90% limitu zaczyna ściąganie, na 100% → 0%.
- *    Factor = 1.0 poniżej 90%, liniowy spadek do 0.0 na limicie.
+ * Nowy schemat ("Cadence PAS" z ebikes.ca):
  *
- * 3. **Start Strength (P12)**: Minimalne duty na starcie pedałowania.
- *    P12=0 → brak boost, P12=5 → do 20% min duty.
- *    Przyspieszenie startu kiedy kadencja jest niska ale > 0.
+ * 1. **Kadencja → prędkość docelowa** (target speed):
+ *    target_kmh = (cadence / PAS_CADENCE_MAX_RPM) × speed_limit
+ *    Wolne pedałowanie → niska prędkość docelowa.
+ *    Szybkie pedałowanie → wyższa prędkość docelowa.
+ *    P11 (czułość) przesuwa krzywe — wyższa czułość = więcej prędkości
+ *    przy mniejszej kadencji.
  *
- * Wynik: pas_duty = cadence_factor × speed_factor × maxDuty  (min clamped by P12)
+ * 2. **Speed feedback loop** (duty modulowane prędkością koła):
+ *    - speed < target: duty = maxDuty (pełne przyspieszenie)
+ *    - speed w strefie 80-100% target: liniowy spadek duty
+ *    - speed >= target: duty = 0 (utrzymanie prędkości naturalnie)
+ *    Efekt: koło przyspiesza do prędkości docelowej i stabilizuje się.
+ *
+ * 3. **Start Strength (P12)**: minimalne duty przy bardzo niskiej kadencji.
  *
  * @param maxDuty  Maksymalne duty z poziomu wspomagania (getAssistMaxDuty)
  * @return duty PAS 0–maxDuty
@@ -275,48 +295,62 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     uint16_t cadence = g_bldc_state.pas_cadence_rpm;
     if (cadence == 0) return 0;
 
-    // --- 1. Cadence Factor (0.0 – 1.0) ---
+    // --- 1. Prędkość docelowa z kadencji ---
     // P11: czułość PAS 1-24 (domyślnie 12)
+    // Wyższa czułość = niższa kadencja potrzebna do osiągnięcia danej prędkości
     uint8_t p11 = g_display.config.p11_pas_sensitivity;
-    if (p11 == 0) p11 = 12;  // fallback
+    if (p11 == 0) p11 = 12;
     if (p11 > 24) p11 = 24;
 
-    // Próg kadencji [RPM] dla pełnej mocy:
-    //   P11=1  → 80 RPM (trzeba szybko kręcić do pełnej mocy)
-    //   P11=12 → ~47 RPM (średnia czułość)
-    //   P11=24 → 15 RPM (bardzo lekkie pedałowanie = pełna moc)
-    uint16_t cadence_threshold = (uint16_t)map((long)p11, 1, 24, 80, 15);
-    if (cadence_threshold < 10) cadence_threshold = 10;
+    // Kadencja dla pełnej prędkości (RPM):
+    //   P11=1 (niska czułość)  → 100 RPM (trzeba bardzo szybko kręcić)
+    //   P11=12 (domyślna)      → 62 RPM
+    //   P11=24 (wysoka czułość) → 25 RPM (lekkie kręcenie = pełna prędkość)
+    uint16_t cadence_for_full = (uint16_t)map((long)p11, 1, 24, 100, 25);
+    if (cadence_for_full < 15) cadence_for_full = 15;
 
-    float cadence_factor;
-    if (cadence >= cadence_threshold) {
-        cadence_factor = 1.0f;
-    } else {
-        cadence_factor = (float)cadence / (float)cadence_threshold;
-    }
-
-    // --- 2. Speed Limiter (0.0 – 1.0) ---
-    float speed_factor = 1.0f;
+    // Limit prędkości [km/h] (P08, fallback 25 km/h)
     uint8_t speed_limit_kmh = g_display.config.p08_speed_limit;
-    if (speed_limit_kmh > 0) {
-        float speed_kmh = g_bldc_state.wheel_speed_kmh;
-        float limit_90pct = (float)speed_limit_kmh * 0.9f;
-        if (speed_kmh >= (float)speed_limit_kmh) {
-            speed_factor = 0.0f;
-        } else if (speed_kmh > limit_90pct) {
-            speed_factor = ((float)speed_limit_kmh - speed_kmh)
-                         / ((float)speed_limit_kmh - limit_90pct);
+    if (speed_limit_kmh == 0) speed_limit_kmh = 25;
+
+    // Target speed = (cadence / cadence_for_full) × speed_limit
+    // Nie ograniczamy do 1.0 — jeśli ktoś kręci szybciej niż cadence_for_full,
+    // target może przekroczyć speed_limit, ale speed feedback i tak uzetnie.
+    float cadence_ratio = (float)cadence / (float)cadence_for_full;
+    if (cadence_ratio > 1.0f) cadence_ratio = 1.0f;
+    float target_kmh = cadence_ratio * (float)speed_limit_kmh;
+    g_bldc_state.pas_target_kmh = target_kmh;
+
+    // --- 2. Speed feedback: modulacja duty na podstawie aktualnej prędkości ---
+    float speed_kmh = g_bldc_state.wheel_speed_kmh;
+    float speed_factor;
+
+    if (target_kmh <= 0.5f) {
+        // Bardzo niska prędkość docelowa — użyj liniowego skalowania kadencji
+        speed_factor = cadence_ratio;
+    } else if (speed_kmh >= target_kmh) {
+        // Osiągnięta lub przekroczona prędkość docelowa → wyłącz moc
+        speed_factor = 0.0f;
+    } else {
+        // Strefa ramp-down: 80% do 100% prędkości docelowej
+        float ramp_start = target_kmh * 0.8f;
+        if (speed_kmh <= ramp_start) {
+            speed_factor = 1.0f;  // pełne przyspieszenie
+        } else {
+            // Liniowy spadek od 1.0 (80% target) do 0.0 (100% target)
+            speed_factor = (target_kmh - speed_kmh) / (target_kmh - ramp_start);
         }
     }
 
     // --- 3. Oblicz duty PAS ---
-    float pas_duty_f = cadence_factor * speed_factor * (float)maxDuty;
+    float pas_duty_f = speed_factor * (float)maxDuty;
 
     // --- 4. Start Strength (P12) — minimalne duty na starcie ---
     // P12=0 → 0%, P12=1 → 4%, ..., P12=5 → 20% maxDuty
+    // Aktywne tylko przy niskiej prędkości (start z miejsca)
     uint8_t p12 = g_display.config.p12_pas_start_strength;
     if (p12 > 5) p12 = 5;
-    if (p12 > 0 && cadence > 0) {
+    if (p12 > 0 && cadence > 0 && speed_kmh < 5.0f) {
         float min_duty_f = (float)p12 * (float)maxDuty / 25.0f;
         if (pas_duty_f < min_duty_f) {
             pas_duty_f = min_duty_f;
@@ -349,26 +383,62 @@ void IRAM_ATTR onSpeedPulse() {
 }
 
 /**
- * @brief ISR przerwania GPIO na pinie PAS (FALLING edge).
+ * @brief ISR przerwania GPIO na pinie PAS (oba zbocza — CHANGE).
  *
- * Czujnik PAS (Hall sensor) generuje impulsy w czasie pedałowania.
- * Liczba impulsów na obrót korby = P13 (magnesy PAS).
- * Mierzymy okres między impulsami, z tego obliczamy kadencję.
+ * Detekcja kierunku pedałowania:
+ * Większość czujników PAS ma asymetryczny dysk magnesów — magnesy N i S
+ * mają różną szerokość. Efekt: sygnał z Halla ma różne czasy HIGH i LOW.
+ * Przy pedałowaniu DO PRZODU: HIGH > LOW (lub odwrotnie, zależy od montażu).
+ * Przy pedałowaniu DO TYŁU: proporcje się odwracają.
  *
- * Filtr: ignoruj impulsy szybsze niż PAS_MIN_PERIOD_US (debounce + szum).
+ * Mierzymy oba półokresy (HIGH time i LOW time) i porównujemy:
+ *   HIGH > LOW → forward (pedałowanie do przodu)
+ *   LOW > HIGH → backward (wstecz)
+ *
+ * Jeśli magnesy są symetryczne (różnica < PAS_DIR_MIN_ASYMMETRY%),
+ * zakładamy forward — nie można jednoznacznie określić kierunku.
  */
 void IRAM_ATTR onPasPulse() {
     uint32_t now_us = (uint32_t)esp_timer_get_time();
-    if (g_pas_last_pulse_us > 0) {
-        uint32_t period = now_us - g_pas_last_pulse_us;
-        if (period >= PAS_MIN_PERIOD_US) {
-            g_pas_period_us = period;
-            g_pas_last_pulse_us = now_us;
+    bool pin_high = (GPIO.in >> PIN_PAS) & 1;  // szybki odczyt GPIO
+
+    if (pin_high) {
+        // RISING edge — koniec okresu LOW
+        if (g_pas_falling_us > 0) {
+            uint32_t low_time = now_us - g_pas_falling_us;
+            if (low_time >= PAS_MIN_HALFPERIOD_US) {
+                g_pas_low_time_us = low_time;
+            }
         }
-        // Impulsy szybsze niż PAS_MIN_PERIOD_US → ignoruj (szum/bouncing)
+        g_pas_rising_us = now_us;
     } else {
-        g_pas_last_pulse_us = now_us;
+        // FALLING edge — koniec okresu HIGH
+        if (g_pas_rising_us > 0) {
+            uint32_t high_time = now_us - g_pas_rising_us;
+            if (high_time >= PAS_MIN_HALFPERIOD_US) {
+                g_pas_high_time_us = high_time;
+            }
+        }
+        g_pas_falling_us = now_us;
+
+        // Oba półokresy zmierzone → oblicz okres i kierunek
+        if (g_pas_high_time_us > 0 && g_pas_low_time_us > 0) {
+            uint32_t period = g_pas_high_time_us + g_pas_low_time_us;
+            g_pas_period_us = period;
+
+            // Detekcja kierunku: porównaj HIGH vs LOW time
+            // Asymetria musi przekraczać próg (symetryczne magnesy → forward)
+            uint32_t diff = (g_pas_high_time_us > g_pas_low_time_us)
+                          ? (g_pas_high_time_us - g_pas_low_time_us)
+                          : (g_pas_low_time_us - g_pas_high_time_us);
+            uint32_t threshold = period * PAS_DIR_MIN_ASYMMETRY / 100;
+            if (diff > threshold) {
+                g_pas_forward = (g_pas_high_time_us > g_pas_low_time_us);
+            }
+            // Jeśli diff <= threshold: magnesy symetryczne, nie zmieniaj g_pas_forward
+        }
     }
+    g_pas_last_pulse_us = now_us;
 }
 
 // ============================================================================
@@ -410,8 +480,8 @@ void setup() {
     // Przerwanie na pinie SPEED (czujnik zewnętrzny — aktywne przy P07<=1)
     attachInterrupt(digitalPinToInterrupt(PIN_SPEED), onSpeedPulse, FALLING);
 
-    // PAS (Pedal Assist Sensor) — przerwanie na FALLING edge
-    attachInterrupt(digitalPinToInterrupt(PIN_PAS), onPasPulse, FALLING);
+    // PAS (Pedal Assist Sensor) — przerwanie na obu zboczach (detekcja kierunku)
+    attachInterrupt(digitalPinToInterrupt(PIN_PAS), onPasPulse, CHANGE);
     Serial.println("[OK] Przerwanie SPEED (GPIO21) gotowe");
 
     // Inicjalizacja PWM
@@ -950,6 +1020,7 @@ void readDigitalInputs() {
     g_bldc_state.brake_active = (digitalRead(PIN_BRAKE) == LOW) || g_brake_simulated;
     // pas_active = ktoś pedałuje (kadencja > 0), ustalane w loop() przez calculatePasCadence()
     g_bldc_state.pas_active = (g_bldc_state.pas_cadence_rpm > 0);
+    g_bldc_state.pas_forward = g_pas_forward;  // volatile → state
 }
 
 // ============================================================================
@@ -1029,10 +1100,13 @@ void printDiagnostics() {
         g_bldc_state.pas_active ? "PAS " : "",
         g_bldc_state.fault ? "FAULT " : "");
 
-    // PAS: kadencja i duty
+    // PAS: kadencja, kierunek i prędkość docelowa
     if (g_bldc_state.pas_cadence_rpm > 0) {
         int pasDutyPct = (int)((uint32_t)g_bldc_state.pas_duty * 100 / PWM_MAX_DUTY);
-        Serial.printf("CAD:%u/%d%% ", g_bldc_state.pas_cadence_rpm, pasDutyPct);
+        Serial.printf("CAD:%u/%d%% T:%.0f ", g_bldc_state.pas_cadence_rpm, pasDutyPct,
+                      g_bldc_state.pas_target_kmh);
+    } else if (!g_pas_forward) {
+        Serial.print("PAS:REV ");
     }
 
     // Prędkość koła [km/h]
