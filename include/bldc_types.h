@@ -74,10 +74,15 @@ typedef struct {
     uint16_t        duty_target;    ///< Docelowe duty z przepustnicy (przed rampą)
     uint16_t        ramp_time_ms;   ///< Czas rampy rozpędzania 0→100% [ms]
     bool            brake_active;   ///< Hamulec aktywny
-    bool            pas_active;     ///< PAS aktywny
+    bool            pas_active;     ///< PAS aktywny (kadencja > 0, ktoś pedałuje)
     bool            regen_enabled;  ///< Tryb regeneracji włączony (komenda R)
     bool            regen_active;   ///< Regeneracja aktualnie aktywna (hamulec + warunki OK)
     bool            fault;          ///< Flaga błędu
+
+    // PAS (Pedal Assist Sensor)
+    uint16_t        pas_cadence_rpm;  ///< Kadencja pedałowania [RPM] (0 = nie pedałuje)
+    uint16_t        pas_duty;         ///< Duty wyliczone przez algorytm PAS
+    float           wheel_speed_kmh;  ///< Prędkość koła [km/h] (obliczona z wheeltime + P06)
 } bldc_state_t;
 
 #endif // BLDC_TYPES_H

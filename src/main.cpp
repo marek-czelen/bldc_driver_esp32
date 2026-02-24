@@ -34,6 +34,7 @@
 #include "pinout.h"
 #include "bldc_types.h"
 #include "display_s866.h"
+#include "bldc_config.h"
 
 // ============================================================================
 // Zmienne globalne
@@ -48,6 +49,7 @@ volatile uint16_t g_duty_isr = 0;
 volatile bool g_motor_enabled = false;
 volatile bool g_brake_isr = false;
 volatile motor_direction_t g_direction_isr = DIRECTION_CW;
+volatile drive_mode_t g_mode_isr = DRIVE_MODE_DISABLED;   ///< Tryb sterowania (do ISR)
 
 // Pomiar RPM z przejść Halla (aktualizowane w ISR timera)
 volatile uint8_t g_hall_prev_isr = 0;         ///< Poprzedni stan Halla w ISR
@@ -57,6 +59,18 @@ volatile uint32_t g_hall_period_us = 0;       ///< Okres między przejściami Ha
 // Pomiar RPM z pinu SPEED (GPIO ISR, dla silników przekładniowych, P07==1)
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
 volatile uint32_t g_speed_period_us = 0;      ///< Okres między impulsami SPEED [µs]
+
+// PAS (Pedal Assist Sensor) — pomiar kadencji z przerwania GPIO
+volatile uint32_t g_pas_last_pulse_us = 0;    ///< micros() ostatniego impulsu PAS
+volatile uint32_t g_pas_period_us = 0;        ///< Okres między impulsami PAS [µs]
+
+/// Timeout PAS: jeśli >1.5s bez impulsu → kadencja = 0 (użytkownik przestał pedałować)
+#define PAS_TIMEOUT_US          1500000
+/// Minimalny okres PAS: odrzucaj impulsy szybsze niż 200 RPM × max magnesów
+/// (200 RPM × 24 magnesy = 4800 pulsów/min = 80 Hz → min 12.5ms)
+#define PAS_MIN_PERIOD_US       10000
+/// Maksymalna kadencja [RPM] zanim obetniemy (ochrona przed szumem)
+#define PAS_MAX_CADENCE_RPM     150
 
 // Regeneracja — zmienne volatile dla ISR
 volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
@@ -87,6 +101,7 @@ void printDisplayConfig();
 void blockCommutate(uint8_t hallState, uint16_t duty);
 void processSerialCommands();
 static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir);
+static String executeCommand(const String& cmd);
 
 // Dzielnik napięcia VBAT: 1M (góra) / 33k (dół)
 static const float kVbatRTop = 1130000.0f;
@@ -120,7 +135,6 @@ static String serialBuffer = "";
 static bool g_brake_simulated = false;
 
 // Rampa rozpędzania silnika
-static const uint16_t RAMP_TIME_DEFAULT_MS = 1200;  ///< Domyślny czas rampy 0→100% [ms]
 static uint16_t g_duty_ramped = 0;                   ///< Aktualny duty po rampie
 static unsigned long g_ramp_last_us = 0;             ///< Timestamp ostatniego kroku rampy [µs]
 
@@ -178,6 +192,143 @@ static uint16_t mapThrottleToDuty(uint16_t throttle_raw, uint16_t maxDuty) {
 }
 
 // ============================================================================
+// Algorytm PAS (Pedal Assist Sensor)
+// ============================================================================
+
+/**
+ * @brief Oblicza kadencję pedałowania na podstawie impulsów z czujnika PAS.
+ *
+ * Kadencja [RPM] = 60 000 000 / (period_us × P13_magnets).
+ * Timeout: jeśli > PAS_TIMEOUT_US od ostatniego impulsu → kadencja = 0.
+ *
+ * @return Kadencja w RPM (0 = nie pedałuje / timeout)
+ */
+static uint16_t calculatePasCadence() {
+    uint32_t period = g_pas_period_us;       // volatile → local copy
+    uint32_t last   = g_pas_last_pulse_us;
+    uint32_t now_us = (uint32_t)esp_timer_get_time();
+
+    // Timeout: brak impulsu → nie pedałuje
+    if (last == 0 || period == 0 || (now_us - last) > PAS_TIMEOUT_US) {
+        return 0;
+    }
+
+    // Liczba magnesów PAS (z wyświetlacza P13, domyślnie 12)
+    uint8_t magnets = g_display.config.p13_pas_magnets;
+    if (magnets == 0) magnets = 12;  // fallback
+
+    // cadence_rpm = 60_000_000 / (period_us × magnets)
+    uint32_t cadence = 60000000UL / (period * (uint32_t)magnets);
+    if (cadence > PAS_MAX_CADENCE_RPM) cadence = PAS_MAX_CADENCE_RPM;
+
+    return (uint16_t)cadence;
+}
+
+/**
+ * @brief Oblicza prędkość koła [km/h] z wheeltime_ms i rozmiaru koła P06.
+ *
+ * Formuła: speed_kmh = (obwód_koła_m × 3600000) / (wheeltime_ms × 1000)
+ * obwód = P06_inch_x10 / 10 × 0.0254 × π  [m]
+ * Uproszczenie: speed_kmh = P06 × 0.028727 / wheeltime_ms  (stała = 0.0254×π×3600/10)
+ *
+ * @return Prędkość w km/h (0.0 jeśli stoi)
+ */
+static float calculateWheelSpeedKmh() {
+    uint16_t wt_ms = g_bldc_state.wheeltime_ms;
+    if (wt_ms == 0) return 0.0f;
+
+    uint16_t p06 = g_display.config.p06_wheel_size_x10;
+    if (p06 == 0) p06 = 260;  // fallback: 26" koło
+
+    // Obwód koła [m] = (P06/10) × 0.0254 × π = P06 × 0.007980
+    // v [km/h] = obwód [m] × 3600000 / (wt_ms × 1000) = P06 × 28.727 / wt_ms
+    return (float)p06 * 28.727f / (float)wt_ms;
+}
+
+/**
+ * @brief Oblicza duty PAS na podstawie kadencji, czułości, prędkości i wspomagania.
+ *
+ * Algorytm łączy 3 czynniki (każdy 0.0–1.0):
+ *
+ * 1. **Cadence Factor**: Jak szybko użytkownik pedałuje vs próg z P11 (sensitivity).
+ *    P11=1 (niska czułość) → potrzebujesz wysokiej kadencji dla pełnej mocy.
+ *    P11=24 (wysoka czułość) → niska kadencja daje pełną moc.
+ *    Próg kadencji = map(P11, 1→24, 80→15 RPM).
+ *    Factor = min(1.0, cadence/threshold).
+ *
+ * 2. **Speed Limiter**: Redukuje moc przy zbliżaniu się do limitu prędkości (P08).
+ *    Od 90% limitu zaczyna ściąganie, na 100% → 0%.
+ *    Factor = 1.0 poniżej 90%, liniowy spadek do 0.0 na limicie.
+ *
+ * 3. **Start Strength (P12)**: Minimalne duty na starcie pedałowania.
+ *    P12=0 → brak boost, P12=5 → do 20% min duty.
+ *    Przyspieszenie startu kiedy kadencja jest niska ale > 0.
+ *
+ * Wynik: pas_duty = cadence_factor × speed_factor × maxDuty  (min clamped by P12)
+ *
+ * @param maxDuty  Maksymalne duty z poziomu wspomagania (getAssistMaxDuty)
+ * @return duty PAS 0–maxDuty
+ */
+static uint16_t calculatePasDuty(uint16_t maxDuty) {
+    if (maxDuty == 0) return 0;
+
+    uint16_t cadence = g_bldc_state.pas_cadence_rpm;
+    if (cadence == 0) return 0;
+
+    // --- 1. Cadence Factor (0.0 – 1.0) ---
+    // P11: czułość PAS 1-24 (domyślnie 12)
+    uint8_t p11 = g_display.config.p11_pas_sensitivity;
+    if (p11 == 0) p11 = 12;  // fallback
+    if (p11 > 24) p11 = 24;
+
+    // Próg kadencji [RPM] dla pełnej mocy:
+    //   P11=1  → 80 RPM (trzeba szybko kręcić do pełnej mocy)
+    //   P11=12 → ~47 RPM (średnia czułość)
+    //   P11=24 → 15 RPM (bardzo lekkie pedałowanie = pełna moc)
+    uint16_t cadence_threshold = (uint16_t)map((long)p11, 1, 24, 80, 15);
+    if (cadence_threshold < 10) cadence_threshold = 10;
+
+    float cadence_factor;
+    if (cadence >= cadence_threshold) {
+        cadence_factor = 1.0f;
+    } else {
+        cadence_factor = (float)cadence / (float)cadence_threshold;
+    }
+
+    // --- 2. Speed Limiter (0.0 – 1.0) ---
+    float speed_factor = 1.0f;
+    uint8_t speed_limit_kmh = g_display.config.p08_speed_limit;
+    if (speed_limit_kmh > 0) {
+        float speed_kmh = g_bldc_state.wheel_speed_kmh;
+        float limit_90pct = (float)speed_limit_kmh * 0.9f;
+        if (speed_kmh >= (float)speed_limit_kmh) {
+            speed_factor = 0.0f;
+        } else if (speed_kmh > limit_90pct) {
+            speed_factor = ((float)speed_limit_kmh - speed_kmh)
+                         / ((float)speed_limit_kmh - limit_90pct);
+        }
+    }
+
+    // --- 3. Oblicz duty PAS ---
+    float pas_duty_f = cadence_factor * speed_factor * (float)maxDuty;
+
+    // --- 4. Start Strength (P12) — minimalne duty na starcie ---
+    // P12=0 → 0%, P12=1 → 4%, ..., P12=5 → 20% maxDuty
+    uint8_t p12 = g_display.config.p12_pas_start_strength;
+    if (p12 > 5) p12 = 5;
+    if (p12 > 0 && cadence > 0) {
+        float min_duty_f = (float)p12 * (float)maxDuty / 25.0f;
+        if (pas_duty_f < min_duty_f) {
+            pas_duty_f = min_duty_f;
+        }
+    }
+
+    uint16_t result = (uint16_t)pas_duty_f;
+    if (result > maxDuty) result = maxDuty;
+    return result;
+}
+
+// ============================================================================
 // ISR czujnika prędkości (GPIO, pin SPEED)
 // ============================================================================
 
@@ -195,6 +346,29 @@ void IRAM_ATTR onSpeedPulse() {
         g_speed_period_us = now_us - g_speed_last_pulse_us;
     }
     g_speed_last_pulse_us = now_us;
+}
+
+/**
+ * @brief ISR przerwania GPIO na pinie PAS (FALLING edge).
+ *
+ * Czujnik PAS (Hall sensor) generuje impulsy w czasie pedałowania.
+ * Liczba impulsów na obrót korby = P13 (magnesy PAS).
+ * Mierzymy okres między impulsami, z tego obliczamy kadencję.
+ *
+ * Filtr: ignoruj impulsy szybsze niż PAS_MIN_PERIOD_US (debounce + szum).
+ */
+void IRAM_ATTR onPasPulse() {
+    uint32_t now_us = (uint32_t)esp_timer_get_time();
+    if (g_pas_last_pulse_us > 0) {
+        uint32_t period = now_us - g_pas_last_pulse_us;
+        if (period >= PAS_MIN_PERIOD_US) {
+            g_pas_period_us = period;
+            g_pas_last_pulse_us = now_us;
+        }
+        // Impulsy szybsze niż PAS_MIN_PERIOD_US → ignoruj (szum/bouncing)
+    } else {
+        g_pas_last_pulse_us = now_us;
+    }
 }
 
 // ============================================================================
@@ -215,14 +389,19 @@ void setup() {
     
     Serial.println("==========================================");
     Serial.println("  BLDC Motor Driver - ESP32");
-    Serial.println("  Wersja: 0.1.0 (Hardware Test)");
+    Serial.println("  Wersja: 0.2.0");
     Serial.println("==========================================");
     Serial.println();
 
+    // Konfiguracja z NVS (EEPROM) — musi być PRZED użyciem parametrów
+    config_init();
+    controller_config_t& cfg = config_get();
+
     // Inicjalizacja stanu
     memset(&g_bldc_state, 0, sizeof(bldc_state_t));
-    g_bldc_state.mode = DRIVE_MODE_DISABLED;
-    g_bldc_state.ramp_time_ms = RAMP_TIME_DEFAULT_MS;
+    g_bldc_state.mode = DRIVE_MODE_DISABLED;  // tymczasowo — tryb docelowy ustawiony po init HW
+    g_bldc_state.ramp_time_ms = cfg.ramp_time_ms;
+    g_bldc_state.regen_enabled = (cfg.regen_enabled != 0);
 
     // Inicjalizacja GPIO
     initGPIO();
@@ -230,6 +409,9 @@ void setup() {
 
     // Przerwanie na pinie SPEED (czujnik zewnętrzny — aktywne przy P07<=1)
     attachInterrupt(digitalPinToInterrupt(PIN_SPEED), onSpeedPulse, FALLING);
+
+    // PAS (Pedal Assist Sensor) — przerwanie na FALLING edge
+    attachInterrupt(digitalPinToInterrupt(PIN_PAS), onPasPulse, FALLING);
     Serial.println("[OK] Przerwanie SPEED (GPIO21) gotowe");
 
     // Inicjalizacja PWM
@@ -251,19 +433,25 @@ void setup() {
     s866_init();
     Serial.println("[OK] Wyświetlacz S866 uruchomiony (Serial2: GPIO4/GPIO16, 9600 baud)");
 
+    // Automatyczne włączenie trybu jazdy z konfiguracji NVS
+    {
+        drive_mode_t boot_mode = (drive_mode_t)cfg.drive_mode;
+        if (boot_mode >= DRIVE_MODE_BLOCK && boot_mode <= DRIVE_MODE_FOC) {
+            g_bldc_state.mode = boot_mode;
+            g_bldc_state.fault = false;
+            const char* modeNames[] = {"OFF", "BLOCK", "SINUS", "FOC"};
+            Serial.printf("[OK] Tryb jazdy z NVS: %s\n", modeNames[boot_mode]);
+        } else {
+            Serial.println("[OK] Tryb jazdy: DISABLED (nieprawidłowy w NVS)");
+        }
+    }
+
+    Serial.printf("[OK] Rampa: %d ms | Regen: %s\n",
+                  cfg.ramp_time_ms,
+                  cfg.regen_enabled ? "ON" : "OFF");
+
     Serial.println();
-    Serial.println("Komendy Serial:");
-    Serial.println("  e     - włącz tryb BLOCK");
-    Serial.println("  d     - wyłącz silnik");
-    Serial.println("  r     - odwróć kierunek");
-    Serial.println("  +/-   - duty +/- 5%");
-    Serial.println("  0-100 - duty w % (Enter)");
-    Serial.println("  R     - regeneracja ON/OFF");
-    Serial.println("  b     - symulacja hamulca ON/OFF");
-    Serial.println("  P     - pokaż parametry wyświetlacza P01-P20");
-    Serial.println("  s     - pokaż status");
-    Serial.println("  a     - auto-status co 1s ON/OFF");
-    Serial.println("  h     - pomoc");
+    Serial.println("Komendy Serial: h=pomoc");
     Serial.println("==========================================");
     Serial.println();
 }
@@ -281,8 +469,10 @@ void setup() {
  * Przepływ:
  * 1. Odczyt ADC (napięcie, prądy, przepustnica, temp)
  * 2. Odczyt Halli i wejść cyfrowych (hamulec, PAS)
- * 3. Mapowanie przepustnicy → duty (gdy BLOCK mode)
- * 4. Zapis stanu do zmiennych volatile (dla ISR)
+ * 3. Mapowanie przepustnicy → duty (wszystkie aktywne tryby sterowania)
+ * 3a. Rampa rozpędzania (duty_cycle narasta płynnie w kierunku duty_target)
+ * 3b. Hamulec aktywny → zerowanie rampy (płynny rozruch po puszczeniu)
+ * 4. Zapis stanu do zmiennych volatile (dla ISR, w tym g_mode_isr)
  * 5. Obsługa komend Serial
  * 6. Auto-status (jeśli włączony)
  *
@@ -296,13 +486,43 @@ void loop() {
     readHallSensors();
     readDigitalInputs();
 
-    // Przepustnica sprzętowa -> duty target (proporcjonalnie do poziomu wspomagania)
+    // Przepustnica sprzętowa + PAS → duty target
     // Algorytm wspólny dla BLOCK / SINUS / FOC:
     //   maxDuty = f(assist_level)    — zakres wyjściowy zależy od poziomu
-    //   duty_target = map(throttle, 0, maxDuty) — pełen zakres gazu → 0..maxDuty
-    if (g_bldc_state.mode == DRIVE_MODE_BLOCK) {
+    //   throttle_duty = map(throttle, 0, maxDuty)
+    //   pas_duty = f(kadencja, P11_czułość, P12_start, P08_speed_limit)
+    //
+    // Kombinacja PAS + Throttle zależy od P10 (drive mode z wyświetlacza):
+    //   P10=0: PAS + gaz → duty = max(throttle_duty, pas_duty)
+    //   P10=1: tylko gaz → duty = throttle_duty
+    //   P10=2: tylko PAS → duty = pas_duty
+    if (g_bldc_state.mode != DRIVE_MODE_DISABLED) {
         uint16_t maxDuty = getAssistMaxDuty();
-        g_bldc_state.duty_target = mapThrottleToDuty(g_bldc_state.throttle_raw, maxDuty);
+
+        // --- Oblicz kadencję PAS i prędkość koła ---
+        g_bldc_state.pas_cadence_rpm = calculatePasCadence();
+        g_bldc_state.wheel_speed_kmh = calculateWheelSpeedKmh();
+
+        // --- Throttle duty ---
+        uint16_t throttle_duty = mapThrottleToDuty(g_bldc_state.throttle_raw, maxDuty);
+
+        // --- PAS duty ---
+        uint16_t pas_duty = calculatePasDuty(maxDuty);
+        g_bldc_state.pas_duty = pas_duty;
+
+        // --- Kombinacja P10 ---
+        uint8_t p10 = g_display.config.p10_drive_mode;
+        switch (p10) {
+            case 1:  // Tylko gaz (throttle only)
+                g_bldc_state.duty_target = throttle_duty;
+                break;
+            case 2:  // Tylko PAS (pedal assist only)
+                g_bldc_state.duty_target = pas_duty;
+                break;
+            default: // 0 lub nierozpoznany: PAS + gaz (wyższy wygrywa)
+                g_bldc_state.duty_target = (throttle_duty > pas_duty) ? throttle_duty : pas_duty;
+                break;
+        }
     }
 
     // Rampa rozpędzania: duty_cycle narasta płynnie w kierunku duty_target
@@ -314,7 +534,10 @@ void loop() {
         unsigned long dt_us = now_us - g_ramp_last_us;
         g_ramp_last_us = now_us;
 
-        if (target <= g_duty_ramped) {
+        if (g_bldc_state.brake_active) {
+            // Hamulec → zeruj rampę (po puszczeniu hamulca silnik startuje płynnie od 0)
+            g_duty_ramped = 0;
+        } else if (target <= g_duty_ramped) {
             // Spadek — natychmiastowy (bezpieczeństwo: szybkie zwolnienie gazu)
             g_duty_ramped = target;
         } else if (g_bldc_state.ramp_time_ms > 0) {
@@ -339,9 +562,10 @@ void loop() {
     // Aktualizacja zmiennych ISR z głównego stanu
     g_hall_isr = g_bldc_state.hall_state;
     g_duty_isr = g_bldc_state.duty_cycle;
-    g_motor_enabled = (g_bldc_state.mode == DRIVE_MODE_BLOCK) && (g_bldc_state.duty_cycle > 0);
+    g_motor_enabled = (g_bldc_state.mode != DRIVE_MODE_DISABLED) && (g_bldc_state.duty_cycle > 0);
     g_brake_isr = g_bldc_state.brake_active;
     g_direction_isr = g_bldc_state.direction;
+    g_mode_isr = g_bldc_state.mode;
 
     // Obliczanie mocy: P = Vbat × max(Ia, Ib, Ic)
     {
@@ -718,12 +942,14 @@ void readHallSensors() {
 /**
  * @brief Odczytuje wejścia cyfrowe: hamulec i PAS.
  *
- * Oba piny są INPUT_PULLUP — aktywny sygnał = LOW (przycisk do GND).
- * Hamulec ma priorytet — jest też sprawdzany w ISR (g_brake_isr).
+ * Hamulec: INPUT_PULLUP — aktywny sygnał = LOW (przycisk do GND).
+ * PAS: pas_active wyznaczany z kadencji (nie z raw stanu pinu),
+ *      bo czujnik Halla generuje impulsy — stan chwilowy nic nie mówi.
  */
 void readDigitalInputs() {
     g_bldc_state.brake_active = (digitalRead(PIN_BRAKE) == LOW) || g_brake_simulated;
-    g_bldc_state.pas_active = (digitalRead(PIN_PAS) == LOW);
+    // pas_active = ktoś pedałuje (kadencja > 0), ustalane w loop() przez calculatePasCadence()
+    g_bldc_state.pas_active = (g_bldc_state.pas_cadence_rpm > 0);
 }
 
 // ============================================================================
@@ -765,6 +991,7 @@ void printDiagnostics() {
         thrPct = (int)((uint32_t)(thr - THROTTLE_DEAD_ZONE) * 100 / (THROTTLE_MAX_RAW - THROTTLE_DEAD_ZONE));
         if (thrPct > 100) thrPct = 100;
     }
+
     Serial.printf("%s %s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
         modeNames[g_bldc_state.mode],
         g_bldc_state.direction == DIRECTION_CW ? "CW" : "CCW",
@@ -792,10 +1019,26 @@ void printDiagnostics() {
         }
     }
 
+    // Informacja o aktywnej regeneracji
+    if (g_bldc_state.regen_active) {
+        Serial.print(" >>REGEN<<");
+    }
+
     Serial.printf(" %s%s%s",
         g_bldc_state.brake_active ? "BRK " : "",
         g_bldc_state.pas_active ? "PAS " : "",
         g_bldc_state.fault ? "FAULT " : "");
+
+    // PAS: kadencja i duty
+    if (g_bldc_state.pas_cadence_rpm > 0) {
+        int pasDutyPct = (int)((uint32_t)g_bldc_state.pas_duty * 100 / PWM_MAX_DUTY);
+        Serial.printf("CAD:%u/%d%% ", g_bldc_state.pas_cadence_rpm, pasDutyPct);
+    }
+
+    // Prędkość koła [km/h]
+    if (g_bldc_state.wheel_speed_kmh > 0.5f) {
+        Serial.printf("%.1fkm/h ", g_bldc_state.wheel_speed_kmh);
+    }
 
     // Informacje z wyświetlacza S866
     if (g_display.connected) {
@@ -880,6 +1123,15 @@ void IRAM_ATTR onCommutationTimer() {
     }
 
     uint16_t d = g_duty_isr;
+
+    // Dispatch trybu sterowania — obecnie zaimplementowany tylko BLOCK
+    // Aby dodać SINUS/FOC: zamień poniższy if na switch(g_mode_isr) z nowymi case'ami
+    if (g_mode_isr != DRIVE_MODE_BLOCK) {
+        // Tryb niezaimplementowany → bezpieczny stan (wszystkie FETy OFF)
+        ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
+        ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+        return;
+    }
 
     if (g_direction_isr == DIRECTION_CW) {
         switch (hall) {
@@ -1304,6 +1556,10 @@ void printHelp() {
     Serial.println("s         Pokaż status");
     Serial.println("a         Auto-status co 1s ON/OFF");
     Serial.println("h         Pokaż tę pomoc");
+    Serial.println("---------- Konfiguracja NVS ----------");
+    Serial.println("cfg:mode:N    Tryb boot (1=BLOCK 2=SIN 3=FOC)");
+    Serial.println("cfg:ramp:N    Czas rampy [ms] 0-10000");
+    Serial.println("cfg:regen:N   Regeneracja boot (0/1)");
     Serial.println("===========================");
     Serial.println();
 }
@@ -1355,13 +1611,9 @@ void printDisplayConfig() {
 /**
  * @brief Przetwarza wszystkie dostępne bajty z bufora Serial.
  *
- * Komendy jednoznakowe (e, d, r, +, -, s, a, h) są obsługiwane natychmiast.
- * Liczby (0–100) są buforowane w serialBuffer aż do naciśnięcia Enter (\n/\r),
- * po czym ustawiają duty_cycle w procentach.
- *
- * Wbudowany throttle (ADC) nadpisuje duty ustawione przez UART w każdym loop(),
- * więc komendy +/- i numeryczne działają tylko gdy przepustnica jest w pozycji 0
- * lub gdy tryb to DRIVE_MODE_DISABLED.
+ * Komendy jednoznakowe (e, d, r, +, -, s, a, h, R, b, P) są obsługiwane natychmiast
+ * (bez Enter). Pozostałe znaki buforowane do Enter — wtedy przekazywane do
+ * wspólnej executeCommand() (obsługuje też cfg:param:value i numeryczne duty).
  *
  * Komendy:
  * | Znak   | Akcja |
@@ -1377,113 +1629,178 @@ void printDisplayConfig() {
  * | s      | Jednorazowy status |
  * | a      | Toggle auto-status co 1 s |
  * | h      | Pomoc |
+ * | cfg:.. | Komendy konfiguracyjne (Enter) |
  */
 void processSerialCommands() {
     while (Serial.available()) {
         char c = Serial.read();
 
-        // Komendy jednoznakowe (natychmiast)
-        switch (c) {
-            case 'e':
-                g_bldc_state.mode = DRIVE_MODE_BLOCK;
-                g_bldc_state.fault = false;
-                Serial.printf("[CMD] BLOCK ON  duty=%d%%\n",
-                    (int)((uint32_t)g_bldc_state.duty_cycle * 100 / PWM_MAX_DUTY));
-                serialBuffer = "";
-                continue;
-            case 'd':
-                g_bldc_state.mode = DRIVE_MODE_DISABLED;
-                g_bldc_state.duty_cycle = 0;
-                g_bldc_state.duty_target = 0;
-                g_duty_ramped = 0;
-                allMosfetsOff();
-                Serial.println("[CMD] Silnik OFF");
-                serialBuffer = "";
-                continue;
-            case 'r':
-                if (g_bldc_state.mode == DRIVE_MODE_DISABLED) {
-                    g_bldc_state.direction = (g_bldc_state.direction == DIRECTION_CW)
-                        ? DIRECTION_CCW : DIRECTION_CW;
-                    Serial.printf("[CMD] Kierunek: %s\n",
-                        g_bldc_state.direction == DIRECTION_CW ? "CW" : "CCW");
-                } else {
-                    Serial.println("[CMD] Najpierw 'd' przed zmianą kierunku!");
-                }
-                serialBuffer = "";
-                continue;
-            case '+':
-                if (g_bldc_state.duty_cycle <= PWM_MAX_DUTY - DUTY_STEP)
-                    g_bldc_state.duty_cycle += DUTY_STEP;
-                else
-                    g_bldc_state.duty_cycle = PWM_MAX_DUTY;
-                Serial.printf("[CMD] Duty: %d%%\n",
-                    (int)((uint32_t)g_bldc_state.duty_cycle * 100 / PWM_MAX_DUTY));
-                serialBuffer = "";
-                continue;
-            case '-':
-                if (g_bldc_state.duty_cycle >= DUTY_STEP)
-                    g_bldc_state.duty_cycle -= DUTY_STEP;
-                else
-                    g_bldc_state.duty_cycle = 0;
-                Serial.printf("[CMD] Duty: %d%%\n",
-                    (int)((uint32_t)g_bldc_state.duty_cycle * 100 / PWM_MAX_DUTY));
-                serialBuffer = "";
-                continue;
-            case 's':
-                printDiagnostics();
-                serialBuffer = "";
-                continue;
-            case 'h':
-                printHelp();
-                serialBuffer = "";
-                continue;
-            case 'a':
-                g_autoStatus = !g_autoStatus;
-                g_lastAutoStatusMs = millis();
-                Serial.printf("[CMD] Auto-status: %s\n", g_autoStatus ? "ON" : "OFF");
-                serialBuffer = "";
-                continue;
-            case 'P':
-                printDisplayConfig();
-                serialBuffer = "";
-                continue;
-            case 'R':
-                g_bldc_state.regen_enabled = !g_bldc_state.regen_enabled;
-                if (!g_bldc_state.regen_enabled) {
-                    g_bldc_state.regen_active = false;
-                    g_regen_active_isr = false;
-                    g_regen_duty_isr = 0;
-                }
-                Serial.printf("[CMD] Regeneracja: %s (Vmax=%.0fV, RPMmin=%d)\n",
-                    g_bldc_state.regen_enabled ? "ON" : "OFF",
-                    VBAT_REGEN_CUTOFF, REGEN_MIN_RPM);
-                serialBuffer = "";
-                continue;
-            case 'b':
-                g_brake_simulated = !g_brake_simulated;
-                Serial.printf("[CMD] Symulacja hamulca: %s\n",
-                    g_brake_simulated ? "ON (hamulec wciśnięty)" : "OFF");
-                serialBuffer = "";
-                continue;
-            default:
-                break;
+        // Komendy jednoznakowe — natychmiast, bez Enter
+        const char* immediateCmds = "edrs+-haRbP";
+        bool isImmediate = false;
+        for (const char* p = immediateCmds; *p; p++) {
+            if (c == *p) { isImmediate = true; break; }
         }
 
-        // Buforowanie cyfr + Enter -> ustawienie duty w %
-        if (c >= '0' && c <= '9') {
-            serialBuffer += c;
-        } else if (c == '\n' || c == '\r') {
+        if (isImmediate && serialBuffer.length() == 0) {
+            String result = executeCommand(String(c));
+            if (result.length() > 0) {
+                Serial.printf("[CMD] %s\n", result.c_str());
+            }
+            continue;
+        }
+
+        // Buforowanie do Enter
+        if (c == '\n' || c == '\r') {
             if (serialBuffer.length() > 0) {
-                int pct = serialBuffer.toInt();
-                if (pct < 0) pct = 0;
-                if (pct > 100) pct = 100;
-                g_bldc_state.duty_cycle = (uint16_t)((uint32_t)pct * PWM_MAX_DUTY / 100);
-                Serial.printf("[CMD] Duty: %d%% (%d/%d)\n",
-                    pct, g_bldc_state.duty_cycle, PWM_MAX_DUTY);
+                String result = executeCommand(serialBuffer);
+                if (result.length() > 0) {
+                    Serial.printf("[CMD] %s\n", result.c_str());
+                }
                 serialBuffer = "";
             }
         } else {
-            serialBuffer = "";
+            serialBuffer += c;
         }
     }
 }
+
+// ============================================================================
+// Wspólna obsługa komend Serial
+// ============================================================================
+
+/**
+ * @brief Wykonuje komendę — wspólna logika.
+ *
+ * Komendy jednoznakowe + komendy konfiguracyjne cfg:param:value.
+ *
+ * @param cmd Komenda jako String
+ * @return Opis wyniku
+ */
+static String executeCommand(const String& cmd) {
+    if (cmd == "e") {
+        g_bldc_state.mode = DRIVE_MODE_BLOCK;
+        g_bldc_state.fault = false;
+        return "BLOCK ON";
+    }
+    if (cmd == "d") {
+        g_bldc_state.mode = DRIVE_MODE_DISABLED;
+        g_bldc_state.duty_cycle = 0;
+        g_bldc_state.duty_target = 0;
+        g_duty_ramped = 0;
+        allMosfetsOff();
+        return "Silnik OFF";
+    }
+    if (cmd == "r") {
+        if (g_bldc_state.mode == DRIVE_MODE_DISABLED) {
+            g_bldc_state.direction = (g_bldc_state.direction == DIRECTION_CW)
+                ? DIRECTION_CCW : DIRECTION_CW;
+            return g_bldc_state.direction == DIRECTION_CW ? "Kierunek: CW" : "Kierunek: CCW";
+        }
+        return "Najpierw wylacz silnik!";
+    }
+    if (cmd == "+") {
+        if (g_bldc_state.duty_target <= PWM_MAX_DUTY - DUTY_STEP)
+            g_bldc_state.duty_target += DUTY_STEP;
+        else
+            g_bldc_state.duty_target = PWM_MAX_DUTY;
+        g_duty_ramped = g_bldc_state.duty_target;
+        return "Duty: " + String((int)((uint32_t)g_bldc_state.duty_target * 100 / PWM_MAX_DUTY)) + "%";
+    }
+    if (cmd == "-") {
+        if (g_bldc_state.duty_target >= DUTY_STEP)
+            g_bldc_state.duty_target -= DUTY_STEP;
+        else
+            g_bldc_state.duty_target = 0;
+        g_duty_ramped = g_bldc_state.duty_target;
+        return "Duty: " + String((int)((uint32_t)g_bldc_state.duty_target * 100 / PWM_MAX_DUTY)) + "%";
+    }
+    if (cmd == "R") {
+        g_bldc_state.regen_enabled = !g_bldc_state.regen_enabled;
+        if (!g_bldc_state.regen_enabled) {
+            g_bldc_state.regen_active = false;
+            g_regen_active_isr = false;
+            g_regen_duty_isr = 0;
+        }
+        config_get().regen_enabled = g_bldc_state.regen_enabled ? 1 : 0;
+        config_save();
+        return g_bldc_state.regen_enabled ? "Regen: ON" : "Regen: OFF";
+    }
+    if (cmd == "b") {
+        g_brake_simulated = !g_brake_simulated;
+        return g_brake_simulated ? "Hamulec: ON" : "Hamulec: OFF";
+    }
+    if (cmd == "s") {
+        printDiagnostics();
+        return "";
+    }
+    if (cmd == "a") {
+        g_autoStatus = !g_autoStatus;
+        g_lastAutoStatusMs = millis();
+        return g_autoStatus ? "Auto-status: ON" : "Auto-status: OFF";
+    }
+    if (cmd == "P") {
+        printDisplayConfig();
+        return "";
+    }
+    if (cmd == "h") {
+        printHelp();
+        return "";
+    }
+
+    // Komendy konfiguracyjne: cfg:param:value
+    if (cmd.startsWith("cfg:")) {
+        controller_config_t& cfg = config_get();
+        if (cmd.startsWith("cfg:mode:")) {
+            int val = cmd.substring(9).toInt();
+            if (val >= DRIVE_MODE_BLOCK && val <= DRIVE_MODE_FOC) {
+                cfg.drive_mode = (uint8_t)val;
+                config_save();
+                const char* names[] = {"OFF", "BLOCK", "SINUS", "FOC"};
+                return String("Tryb boot: ") + names[val];
+            }
+            return "Bledna wartosc trybu";
+        }
+        if (cmd.startsWith("cfg:ramp:")) {
+            int val = cmd.substring(9).toInt();
+            if (val >= 0 && val <= 10000) {
+                cfg.ramp_time_ms = (uint16_t)val;
+                g_bldc_state.ramp_time_ms = (uint16_t)val;
+                config_save();
+                return "Rampa: " + String(val) + " ms";
+            }
+            return "Zakres 0-10000 ms";
+        }
+        if (cmd.startsWith("cfg:regen:")) {
+            int val = cmd.substring(10).toInt();
+            cfg.regen_enabled = val ? 1 : 0;
+            g_bldc_state.regen_enabled = (val != 0);
+            if (!g_bldc_state.regen_enabled) {
+                g_bldc_state.regen_active = false;
+                g_regen_active_isr = false;
+                g_regen_duty_isr = 0;
+            }
+            config_save();
+            return val ? "Regen: ON" : "Regen: OFF";
+        }
+        return "Nieznany parametr cfg";
+    }
+
+    // Numeryczna wartość duty w %
+    bool isNum = true;
+    for (unsigned int i = 0; i < cmd.length(); i++) {
+        if (cmd[i] < '0' || cmd[i] > '9') { isNum = false; break; }
+    }
+    if (isNum && cmd.length() > 0) {
+        int pct = cmd.toInt();
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        g_bldc_state.duty_target = (uint16_t)((uint32_t)pct * PWM_MAX_DUTY / 100);
+        g_duty_ramped = g_bldc_state.duty_target;
+        return "Duty: " + String(pct) + "%";
+    }
+
+    return "Nieznana komenda: " + cmd;
+}
+
+

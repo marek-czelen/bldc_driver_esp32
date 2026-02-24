@@ -221,7 +221,8 @@ onCommutationTimer() [ISR, 20 kHz = co 50 µs]
   ├── hamulec aktywny + regen → regenCommutateISR()
   ├── hamulec aktywny bez regen → allMosfetsOff() (coast)
   ├── sprawdzenie g_motor_enabled
-  └── ustawienie 6 kanałów LEDC zgodnie z tabelą komutacji
+  ├── dispatch trybu sterowania (g_mode_isr → BLOCK / SINUS / FOC)
+  └── ustawienie 6 kanałów LEDC zgodnie z tabelą komutacji danego trybu
 ```
 
 ### Separacja loop/ISR
@@ -235,6 +236,7 @@ Zmienne współdzielone między `loop()` a `onCommutationTimer()` są `volatile`
 - `g_motor_enabled` — czy silnik ma się kręcić
 - `g_brake_isr` — czy hamulec aktywny
 - `g_direction_isr` — kierunek CW/CCW
+- `g_mode_isr` — aktualny tryb sterowania (BLOCK/SINUS/FOC/DISABLED)
 
 ---
 
@@ -508,8 +510,10 @@ duty_target = map(throttle_raw, 400, 2600, 0, maxDuty)
 Przykład: przy assist level 3 (maxDuty=60%) pełen gaz daje 60%, połowa gazu daje 30%.  
 Przy starym podejściu (clamp): pełen gaz dałby 60%, ale połowa gazu — 50% (powyżej progu = obcięte), co dawało słabą rozdzielczość na niższych poziomach.
 
-Przepustnica jest odczytywana tylko w aktywnym trybie sterowania (BLOCK).  
-Komendy UART (`+`, `-`, liczba%) również ustawiają `duty_target`, ale przepustnica nadpisuje tę wartość w każdej iteracji `loop()`.
+Przepustnica jest odczytywana we wszystkich aktywnych trybach sterowania (`mode != DISABLED`).  
+Dzięki temu algorytm mapowania działa identycznie dla BLOCK, SINUS i FOC — bez modyfikacji.
+
+Komendy UART (`+`, `-`, liczba%) ustawiają `duty_target` i natychmiast synchronizują `g_duty_ramped` (bez rampy — feedback ręcznego sterowania powinien być natychmiastowy). Przepustnica nadpisuje tę wartość w każdej iteracji `loop()`.
 
 ---
 
@@ -531,6 +535,7 @@ Przepustnica → duty_target (docelowe)
 
 - **Wzrost (rozpędzanie):** duty_cycle narasta płynnie, ograniczone czasem rampy
 - **Spadek (zwalnianie):** **natychmiastowy** — puszczenie gazu od razu zmniejsza moc (bezpieczeństwo)
+- **Hamulec aktywny:** rampa jest **zerowana** (`g_duty_ramped = 0`) — po puszczeniu hamulca silnik startuje od 0 z pełną rampą rozpędzania, bez nagłego skoku mocy
 
 ### Parametry
 
@@ -542,7 +547,11 @@ Przepustnica → duty_target (docelowe)
 
 Rampa jest oparta na rzeczywistym czasie (`micros()`), więc działa poprawnie niezależnie od szybkości `loop()`.
 
-Przy komendzie `d` (disable) rampa jest resetowana do 0.
+Rampa jest resetowana do 0 przy:
+- komendzie `d` (disable) — silnik wyłączony
+- hamulcu aktywnym — zapobiega szarpnięciu po puszczeniu hamulca
+
+Po puszczeniu hamulca, jeśli przepustnica jest wciśnięta, silnik rozpędza się płynnie od 0 z pełną rampą.
 
 ### Status
 
@@ -653,11 +662,16 @@ Aktualny offset nie jest wyświetlany w statusie. Aby go sprawdzić, można tymc
 - Zamiast włączyć/wyłączyć fazę: generować sinusoidalne PWM na wszystkich 3 fazach
 - Eliminuje szarpanie na niskich obrotach
 - Wymaga: tabeli sinusoid + mapowania kąta Halla na fazę
+- **Infrastruktura gotowa:** ISR ma dispatch `g_mode_isr` — wystarczy dodać `sinusCommutateISR()`
+- Elementy niezależne od trybu (nie wymagają zmian): przepustnica, rampa, assist levels,
+  regen, wyświetlacz, pomiar prędkości, obliczanie mocy, komendy Serial
 
 ### 2. FOC (Field Oriented Control) (DRIVE_MODE_FOC)
 - Transformacja Clarke/Park
 - Regulatory PI dla prądu Id/Iq
 - Wymaga szybkiego ADC (synchronizacja z PWM) i enkoderu/resolvera
+- **Infrastruktura gotowa:** `g_mode_isr` + `g_duty_isr` mogą być reinterpretowane jako amplituda/kąt
+- Nowa komenda Serial (np. `e3`) → `mode = DRIVE_MODE_FOC`
 
 ### 3. Zabezpieczenia (rozszerzone)
 - Overcurrent: porównać `phase_current[i]` z progiem → `allMosfetsOff()` + `fault = true`
