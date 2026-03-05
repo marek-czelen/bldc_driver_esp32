@@ -583,6 +583,15 @@ Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
 | `s`             | Wyświetl status (jednorazowo) |
 | `a`             | Toggle auto-status co 1 s |
 | `h`             | Wyświetl pomoc |
+| `t` Enter       | Pomoc trybu testowego MOSFET |
+| `tAH` Enter     | Test faza A HIGH-side |
+| `tAL` Enter     | Test faza A LOW-side |
+| `tBH` Enter     | Test faza B HIGH-side |
+| `tBL` Enter     | Test faza B LOW-side |
+| `tCH` Enter     | Test faza C HIGH-side |
+| `tCL` Enter     | Test faza C LOW-side |
+| `tp:N` Enter    | Ustaw duty testowe na N% (1-50) |
+| `t0` Enter      | Wyłącz test MOSFET (wszystkie OFF) |
 
 ### Format statusu (jedna linia)
 
@@ -626,6 +635,86 @@ offset = (1 - α) × offset + α × V_ADC
 - Po uruchomieniu firmware należy odczekać kilka sekund bez prądu, żeby offset się ustabilizował
 
 Aktualny offset nie jest wyświetlany w statusie. Aby go sprawdzić, można tymczasowo dodać `Serial.printf` w `readAnalogInputs()`.
+
+---
+
+## Diagnostyka MOSFET — tryb testowy
+
+### Cel
+
+Procedura diagnostyczna umożliwiająca przetestowanie **pojedynczych tranzystorów MOSFET** w mostkach IR2103. Przydatna gdy podejrzewamy uszkodzenie (zwarcie, przerwa) jednego lub więcej tranzystorów.
+
+### Zasada działania
+
+1. Silnik jest wyłączany (`DRIVE_MODE_DISABLED`)
+2. ISR komutacji **nie nadpisuje kanałów LEDC** (flaga `g_mosfet_test_active`)
+3. Wszystkie tranzystory ustawiane w stan bezpieczny (OFF)
+4. Na **jednym** wybranym tranzystorze ustawiany jest PWM (domyślnie **10%**, konfigurowalne 1-50%)
+5. Pozostałe 5 tranzystorów pozostaje wyłączonych
+
+### Komendy (Serial, wymagają Enter)
+
+| Komenda | Tranzystor | Pin ESP32 | IR2103 |
+|---------|-----------|-----------|--------|
+| `tAH`   | Faza A HIGH-side | GPIO32 | HIN_A |
+| `tAL`   | Faza A LOW-side  | GPIO33 | LIN_A |
+| `tBH`   | Faza B HIGH-side | GPIO25 | HIN_B |
+| `tBL`   | Faza B LOW-side  | GPIO26 | LIN_B |
+| `tCH`   | Faza C HIGH-side | GPIO27 | HIN_C |
+| `tCL`   | Faza C LOW-side  | GPIO14 | LIN_C |
+| `tp:N`  | Ustaw duty testowe na N% (1-50) | — | — |
+| `t0`    | Wyłącz test (wszystkie OFF) | — | — |
+| `t`     | Pokaż pomoc testową | — | — |
+
+### Zmiana duty testowego
+
+Domyślne duty testowe to **10%**. Można je zmienić komendą `tp:N` (N = 1-50%):
+
+```
+tp:5    → 5% PWM (ostrożne testowanie)
+tp:20   → 20% PWM (wyraźniejszy prąd)
+tp:50   → 50% PWM (maksimum, używaj ostrożnie!)
+```
+
+Zmiana duty jest natychmiastowa — jeśli test jest aktywny, PWM na bieżącym tranzystorze jest od razu aktualizowane (nie trzeba go ponownie wybierać).
+
+### Logika PWM w trybie testowym
+
+```
+HIGH-side ON: ledcWrite(HIN_channel, test_duty)
+  → HIN = HIGH przez N% okresu → high-side MOSFET przewodzi N%
+
+LOW-side ON:  ledcWrite(LIN_channel, PWM_MAX_DUTY - test_duty)
+  → LIN = LOW przez N% okresu → low-side MOSFET przewodzi N%
+  (LIN jest odwrócony w IR2103!)
+```
+
+### Procedura testowa
+
+1. Wyślij `d` — wyłącz silnik
+2. Wyślij `t` + Enter — pokaż pomoc testową
+3. (opcjonalnie) `tp:5` + Enter — ustaw niskie duty na początek
+4. Wyślij `tAH` + Enter — włącz PWM na high-side fazy A
+5. Wyślij `s` — odczytaj prąd fazy A (`Ia`)
+6. (opcjonalnie) `tp:20` + Enter — zwiększ duty bez zmiany tranzystora
+7. Powtórz dla każdego tranzystora (`tAL`, `tBH`, `tBL`, `tCH`, `tCL`)
+8. Wyślij `t0` + Enter — zakończ test (lub `d`)
+
+### Interpretacja wyników
+
+| Obserwacja | Diagnoza |
+|-----------|----------|
+| Prąd = 0 mimo włączonego testu | Tranzystor otwarty (uszkodzony) lub brak kontaktu |
+| Prąd zbyt wysoki (~max) | Tranzystor zwarty (drain-source) |
+| Prąd proporcjonalny do duty | Tranzystor sprawny |
+| Inne tranzystory wykazują prąd | Zwarcie między fazami lub uszkodzony IR2103 |
+
+> **⚠️ UWAGA BEZPIECZEŃSTWA:**
+> - Nigdy nie włączaj HIGH i LOW tej samej fazy jednocześnie (shoot-through = zwarcie V+ do GND!)
+> - Procedura testowa zabezpiecza przed tym automatycznie — zawsze włączany jest **tylko jeden** tranzystor
+> - Używaj niskiego napięcia zasilania do testów jeśli to możliwe
+> - Duty ograniczone do 50% max — zabezpieczenie przed przypadkowym podaniem pełnej mocy
+> - Monitoruj temperaturę FET podczas testów (komenda `s` pokazuje odczyt czujnika)
 
 ---
 

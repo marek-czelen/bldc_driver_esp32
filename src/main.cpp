@@ -86,6 +86,12 @@ volatile bool g_pas_forward = true;           ///< Kierunek pedałowania (asymet
 volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
 volatile uint16_t g_regen_duty_isr = 0;       ///< Siła hamowania regen 0-PWM_MAX_DUTY
 
+// Tryb testowy MOSFETów — diagnostyka uszkodzonych tranzystorów
+volatile bool g_mosfet_test_active = false;    ///< Tryb testu MOSFET aktywny (ISR nie rusza LEDC)
+static uint16_t g_mosfet_test_duty = PWM_MAX_DUTY * 10 / 100;  ///< Duty testowe (domyślnie 10%)
+static char g_mosfet_test_phase = 0;           ///< Aktualnie testowana faza ('A','B','C') lub 0
+static char g_mosfet_test_side  = 0;           ///< Aktualnie testowana strona ('H','L') lub 0
+
 /// Limit duty regen — 80% max (musi zostać czas OFF na transfer energii do baterii)
 #define REGEN_MAX_DUTY  (PWM_MAX_DUTY * 80 / 100)
 /// Minimalne RPM poniżej którego regen jest nieefektywny (tylko grzeje)
@@ -112,6 +118,8 @@ void blockCommutate(uint8_t hallState, uint16_t duty);
 void processSerialCommands();
 static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir);
 static String executeCommand(const String& cmd);
+static String mosfetTestSet(const String& which);
+static void mosfetTestPrintHelp();
 
 // Dzielnik napięcia VBAT: 1M (góra) / 33k (dół)
 static const float kVbatRTop = 1130000.0f;
@@ -1171,6 +1179,11 @@ void IRAM_ATTR onCommutationTimer() {
         g_hall_prev_isr = hall;
     }
 
+    // Tryb testu MOSFET — ISR nie dotyka kanałów LEDC, tylko mierzy Hall/prędkość
+    if (g_mosfet_test_active) {
+        return;
+    }
+
     if (g_brake_isr) {
         // Hamulec aktywny — regen braking jeśli włączony, inaczej coast
         if (g_regen_active_isr && g_regen_duty_isr > 0) {
@@ -1630,6 +1643,16 @@ void printHelp() {
     Serial.println("s         Pokaż status");
     Serial.println("a         Auto-status co 1s ON/OFF");
     Serial.println("h         Pokaż tę pomoc");
+    Serial.println("---------- Test MOSFET (diagnostyka) ----------");
+    Serial.println("tAH        Test faza A HIGH-side");
+    Serial.println("tAL        Test faza A LOW-side");
+    Serial.println("tBH        Test faza B HIGH-side");
+    Serial.println("tBL        Test faza B LOW-side");
+    Serial.println("tCH        Test faza C HIGH-side");
+    Serial.println("tCL        Test faza C LOW-side");
+    Serial.println("tp:N       Ustaw duty testowe na N% (1-50)");
+    Serial.println("t0         Wyłącz test MOSFET (wszystkie OFF)");
+    Serial.println("t          Pokaż pomoc trybu testowego");
     Serial.println("---------- Konfiguracja NVS ----------");
     Serial.println("cfg:mode:N    Tryb boot (1=BLOCK 2=SIN 3=FOC)");
     Serial.println("cfg:ramp:N    Czas rampy [ms] 0-10000");
@@ -1680,6 +1703,155 @@ void printDisplayConfig() {
         Serial.printf("Tryb prędkości: Hall × %d pole_pairs (direct-drive)\n", p07);
     }
     Serial.println();
+}
+
+// ============================================================================
+// Test MOSFET — diagnostyka pojedynczych tranzystorów
+// ============================================================================
+
+/**
+ * @brief Wyświetla pomoc trybu testowego MOSFET.
+ */
+static void mosfetTestPrintHelp() {
+    Serial.println();
+    Serial.println("========== TEST MOSFET (diagnostyka) ==========");
+    Serial.println("Procedura testu uszkodzonych tranzystorow MOSFET.");
+    Serial.println("Wystawia 10% PWM na POJEDYNCZY wskazany tranzystor.");
+    Serial.println("Pozostale tranzystory sa WYLACZONE.");
+    Serial.println();
+    Serial.println("!!! UWAGA: silnik musi byc WYLACZONY (komenda 'd') !!!");
+    Serial.println("!!! NIGDY nie wlaczaj HIGH+LOW tej samej fazy !!!");
+    Serial.println("!!! (shoot-through = zwarcie zasilania)        !!!");
+    Serial.println();
+    Serial.println("Komendy (wyslij + Enter):");
+    Serial.println("  tAH   Faza A HIGH-side  (GPIO32, IR2103 HIN_A)");
+    Serial.println("  tAL   Faza A LOW-side   (GPIO33, IR2103 LIN_A)");
+    Serial.println("  tBH   Faza B HIGH-side  (GPIO25, IR2103 HIN_B)");
+    Serial.println("  tBL   Faza B LOW-side   (GPIO26, IR2103 LIN_B)");
+    Serial.println("  tCH   Faza C HIGH-side  (GPIO27, IR2103 HIN_C)");
+    Serial.println("  tCL   Faza C LOW-side   (GPIO14, IR2103 LIN_C)");
+    Serial.println("  t0    Wylacz test (wszystkie OFF)");
+    Serial.println("  tp:N  Ustaw duty testowe na N% (1-50, np. tp:20)");
+    Serial.println();
+    Serial.println("Po wlaczeniu testu uzyj 's' aby odczytac prady fazowe.");
+    Serial.printf( "Duty testowe: %d/%d (%.0f%%)\n",
+                   g_mosfet_test_duty, PWM_MAX_DUTY,
+                   100.0f * g_mosfet_test_duty / PWM_MAX_DUTY);
+    Serial.println("================================================");
+    Serial.println();
+}
+
+/**
+ * @brief Ustawia 10% PWM na wybranym tranzystorze MOSFET (diagnostyka).
+ *
+ * Wyłącza silnik, aktywuje tryb testowy (ISR nie nadpisuje LEDC),
+ * ustawia allMosfetsOff() a potem włącza TYLKO wybrany tranzystor.
+ *
+ * Logika IR2103:
+ *   HIGH-side ON: ledcWrite(HIN_channel, g_mosfet_test_duty)
+ *   LOW-side  ON: ledcWrite(LIN_channel, PWM_MAX_DUTY - g_mosfet_test_duty)
+ *                 — LIN=LOW przez X% (wejście odwrócone IR2103)
+ *
+ * @param cmd Komenda "tXY" gdzie X={A,B,C} Y={H,L}
+ * @return Opis wyniku
+ */
+static String mosfetTestSet(const String& cmd) {
+    if (cmd.length() != 3) return "Format: tXY (np. tAH)";
+
+    char phase = cmd[1];  // A, B, C
+    char side  = cmd[2];  // H (high-side), L (low-side)
+
+    // Walidacja
+    if (phase != 'A' && phase != 'a' && phase != 'B' && phase != 'b' && phase != 'C' && phase != 'c') {
+        return "Bledna faza! Uzyj A, B lub C";
+    }
+    if (side != 'H' && side != 'h' && side != 'L' && side != 'l') {
+        return "Bledna strona! Uzyj H (high) lub L (low)";
+    }
+
+    // Normalizacja na wielkie litery
+    phase = toupper(phase);
+    side  = toupper(side);
+
+    // Wyłącz silnik i włącz tryb testowy
+    g_bldc_state.mode = DRIVE_MODE_DISABLED;
+    g_bldc_state.duty_cycle = 0;
+    g_bldc_state.duty_target = 0;
+    g_duty_ramped = 0;
+    g_motor_enabled = false;
+    g_mosfet_test_active = true;  // ISR nie będzie nadpisywać LEDC
+    g_mosfet_test_phase = phase;
+    g_mosfet_test_side  = side;
+
+    // Bezpieczny stan — wszystko OFF
+    allMosfetsOff();
+
+    // Wybór kanału i ustawienie PWM
+    uint16_t duty = g_mosfet_test_duty;
+    const char* pinInfo = "";
+    if (phase == 'A' && side == 'H') {
+        ledcWrite(PWM_CHANNEL_A_HIGH, duty);
+        pinInfo = "GPIO32 HIN_A";
+    } else if (phase == 'A' && side == 'L') {
+        ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY - duty);
+        pinInfo = "GPIO33 LIN_A";
+    } else if (phase == 'B' && side == 'H') {
+        ledcWrite(PWM_CHANNEL_B_HIGH, duty);
+        pinInfo = "GPIO25 HIN_B";
+    } else if (phase == 'B' && side == 'L') {
+        ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY - duty);
+        pinInfo = "GPIO26 LIN_B";
+    } else if (phase == 'C' && side == 'H') {
+        ledcWrite(PWM_CHANNEL_C_HIGH, duty);
+        pinInfo = "GPIO27 HIN_C";
+    } else if (phase == 'C' && side == 'L') {
+        ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY - duty);
+        pinInfo = "GPIO14 LIN_C";
+    }
+
+    // Komunikat z informacji diagnostycznych
+    int pct = (int)((uint32_t)duty * 100 / PWM_MAX_DUTY);
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "TEST: Faza %c %s-side ON (%d%% PWM) [%s]",
+             phase, (side == 'H') ? "HIGH" : "LOW", pct, pinInfo);
+    return String(buf);
+}
+
+/**
+ * @brief Zmienia duty testowe i aktualizuje aktywny test (jeśli trwa).
+ *
+ * @param pct Procent PWM (1-50)
+ * @return Opis wyniku
+ */
+static String mosfetTestSetDuty(int pct) {
+    if (pct < 1)  pct = 1;
+    if (pct > 50) pct = 50;
+    g_mosfet_test_duty = (uint16_t)((uint32_t)pct * PWM_MAX_DUTY / 100);
+
+    // Jeśli test jest aktywny — natychmiast zaktualizuj PWM na bieżącym tranzystorze
+    if (g_mosfet_test_active && g_mosfet_test_phase != 0) {
+        // Ponowne ustawienie tego samego tranzystora z nowym duty
+        allMosfetsOff();
+        uint16_t duty = g_mosfet_test_duty;
+        char phase = g_mosfet_test_phase;
+        char side  = g_mosfet_test_side;
+        if (phase == 'A' && side == 'H') ledcWrite(PWM_CHANNEL_A_HIGH, duty);
+        else if (phase == 'A' && side == 'L') ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY - duty);
+        else if (phase == 'B' && side == 'H') ledcWrite(PWM_CHANNEL_B_HIGH, duty);
+        else if (phase == 'B' && side == 'L') ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY - duty);
+        else if (phase == 'C' && side == 'H') ledcWrite(PWM_CHANNEL_C_HIGH, duty);
+        else if (phase == 'C' && side == 'L') ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY - duty);
+
+        char buf[96];
+        snprintf(buf, sizeof(buf), "Test duty: %d%% — zaktualizowano Faza %c %s-side",
+                 pct, phase, (side == 'H') ? "HIGH" : "LOW");
+        return String(buf);
+    }
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Test duty: %d%% (aktywuj komenda tXY)", pct);
+    return String(buf);
 }
 
 /**
@@ -1753,11 +1925,13 @@ void processSerialCommands() {
  */
 static String executeCommand(const String& cmd) {
     if (cmd == "e") {
+        g_mosfet_test_active = false;  // Wyłącz tryb testowy MOSFET
         g_bldc_state.mode = DRIVE_MODE_BLOCK;
         g_bldc_state.fault = false;
         return "BLOCK ON";
     }
     if (cmd == "d") {
+        g_mosfet_test_active = false;  // Wyłącz tryb testowy MOSFET
         g_bldc_state.mode = DRIVE_MODE_DISABLED;
         g_bldc_state.duty_cycle = 0;
         g_bldc_state.duty_target = 0;
@@ -1820,6 +1994,25 @@ static String executeCommand(const String& cmd) {
     if (cmd == "h") {
         printHelp();
         return "";
+    }
+
+    // --- Test MOSFET: komendy tXX ---
+    if (cmd == "t") {
+        mosfetTestPrintHelp();
+        return "";
+    }
+    if (cmd == "t0") {
+        g_mosfet_test_active = false;
+        allMosfetsOff();
+        g_bldc_state.mode = DRIVE_MODE_DISABLED;
+        return "Test MOSFET: OFF — wszystkie tranzystory wyłączone";
+    }
+    if (cmd.startsWith("tp:")) {
+        int pct = cmd.substring(3).toInt();
+        return mosfetTestSetDuty(pct);
+    }
+    if (cmd.startsWith("t") && cmd.length() == 3) {
+        return mosfetTestSet(cmd);
     }
 
     // Komendy konfiguracyjne: cfg:param:value
