@@ -1,8 +1,8 @@
 # BLDC Motor Driver — ESP32
 
 Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
-Obsługiwana metoda sterowania: **komutacja blokowa (6-step / trapezoidalna)**.  
-Planowane rozszerzenia: sterowanie sinusoidalne, FOC.
+Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)** oraz **komutacja sinusoidalna**.  
+Planowane rozszerzenia: FOC (Field Oriented Control).
 
 ---
 
@@ -22,8 +22,9 @@ Planowane rozszerzenia: sterowanie sinusoidalne, FOC.
 12. [Rampa rozpędzania](#rampa-rozpędzania)
 13. [Sterowanie przez UART/Serial](#sterowanie-przez-uartserial)
 14. [Kalibracja prądów](#kalibracja-prądów)
-15. [Znane problemy i uwagi](#znane-problemy-i-uwagi)
-16. [Rozbudowa projektu](#rozbudowa-projektu)
+15. [Konfiguracja NVS](#konfiguracja-nvs)
+16. [Znane problemy i uwagi](#znane-problemy-i-uwagi)
+17. [Rozbudowa projektu](#rozbudowa-projektu)
 
 ---
 
@@ -276,6 +277,184 @@ Dla **CCW** tabela jest lustrzanym odbiciem (zamienione fazy HIGH i LOW).
 
 ---
 
+## Komutacja sinusoidalna — zasada działania
+
+Tryb `DRIVE_MODE_SINUS` generuje trójfazowe sinusoidalne napięcia PWM zamiast
+prostokątnych przełączeń blokowych, co daje:
+- Płynniejszą pracę silnika, zwłaszcza na niskich obrotach
+- Mniejsze pulsacje momentu obrotowego
+- Cichszą pracę (brak szarpania 6× na obrót elektryczny)
+
+Algorytm jest portem 1:1 ze sprawdzonego projektu STM32 (`bldc_driver_v2`).
+
+### Tablica sinusów (LUT)
+
+Tablica `g_sine_table[97]` zawiera 96 wpisów (= 360° elekt.) + 1 guard entry
+(wrap-around bez `% 96`). Wartości: `round(sin(i × 360°/96) × 1024)`,
+zakres −1024..+1024. Umieszczona w DRAM (`DRAM_ATTR`) — ESP32 nie pozwala na
+byte-access do IRAM (LoadStoreError).
+
+```
+indeks:   0 →     0  (0°,   sin = 0)
+indeks:  24 → +1024  (90°,  sin = +1)
+indeks:  48 →     0  (180°, sin = 0)
+indeks:  72 → −1024  (270°, sin = −1)
+indeks:  96 →     0  (guard = [0])
+```
+
+### Mapowanie Hall → sektor
+
+Tablica `g_hall_to_sector[8]` mapuje stan Halla (1–6) na indeks sektora 0–5.
+Kolejność sektorów odpowiada sekwencji CW z komutacji blokowej: 1→3→2→6→4→5.
+
+| Hall (CW) | Sektor | Block commutation |
+|-----------|--------|-------------------|
+| 1 (001)   |    0   | A→B               |
+| 3 (011)   |    1   | A→C−              |
+| 2 (010)   |    2   | B→C−              |
+| 6 (110)   |    3   | B→A−              |
+| 4 (100)   |    4   | C→A−              |
+| 5 (101)   |    5   | C→B−              |
+
+### Ciągłe śledzenie kąta (angle tracking)
+
+W przeciwieństwie do prostego snap-to-Hall, kąt jest śledzony ciągle w Q16
+fixed-point (0..96<<16). Co tick ISR (50 µs):
+
+```
+angle += speed_q16  (lub −= dla CCW)
+```
+
+Prędkość `speed_q16` = (16 × 50) << 16 / hall_period_us = 52428800 / hall_period_us,
+obliczana w loop() (dzielenie 32-bit w ISR na ESP32 powoduje LoadStoreError).
+
+Na przejściu Halla kąt jest KORYGOWANY (nie nadpisywany) — o 1/8 różnicy między
+oczekiwanym a aktualnym. To daje płynne śledzenie bez skoków.
+
+### Start sinusoidalny (bez block startup)
+
+Tryb SINUS startuje **natychmiast** — bez fazy komutacji blokowej. Po wydaniu
+komendy `S` (lub `m2`):
+1. Kąt jest ustawiany (snap) na środek aktualnego sektora Halla
+2. `g_sine_running = 1` — ISR od razu generuje sinusoidalne PWM
+3. Silnik rusza w trybie **crawl** (otwartopętlowa minimalna prędkość)
+4. Pierwsze przejście Halla daje realną prędkość i crawl wyłącza się
+
+### Tryb crawl (rozruch z miejsca)
+
+Gdy `g_sine_speed_q16 == 0` (brak danych o prędkości — np. start z miejsca lub po
+stall fallback), ISR używa minimalnej prędkości otwartopętlowej:
+
+| Stała | Wartość | Opis |
+|---|---|---|
+| `SINE_CRAWL_SPEED_Q16` | 315 | ≈ 1 obrót elektr./s (52428800/166666) |
+
+Pole magnetyczne wolno się obraca, rotor zaczyna podążać, i pierwsze przejście
+Halla daje realną prędkość — crawl wyłącza się automatycznie.
+
+### Coast threshold (próg coastingu)
+
+Center-aligned PWM z bazą 512 przy małej amplitudzie generuje ~50% switching na
+wszystkich 6 FETach = **aktywne hamowanie elektromagnetyczne** (w odróżnieniu od
+trybu BLOCK, gdzie mały duty = tiny PWM na 1 fazie, reszta float).
+
+Aby temu zapobiec, gdy `amplitude < SINE_MIN_AMPLITUDE` wszystkie FETy są wyłączane
+(coast — motor biegnie swobodnie):
+
+| Stała | Wartość | Opis |
+|---|---|---|
+| `SINE_MIN_AMPLITUDE` | 15 | Poniżej tego: coast zamiast sinus |
+
+### Stall freeze
+
+Jeśli brak przejść Halla > 200 ms → kąt nie jest avansowany (zamrożony). Zapobiega to
+ucieczce kąta przy zatrzymanym silniku, co powodowałoby oscylacje i prąd zwarcia.
+
+**Wyjątek: tryb crawl** — gdy `speed == 0`, stall freeze jest wyłączony. Crawl obraca
+pole z prędkością ~1 obr.elekt./s, co nie generuje niebezpiecznych prądów, a jest
+konieczne do ruszenia silnika z miejsca. Bez tego wyjątku crawl byłby permanentnie
+zablokowany (deadlock).
+
+### Safety fallback (zabezpieczenie przed utratą Halli)
+
+Gdy brak przejść Halla przez dłuższy czas (timeout dynamiczny: `max(400ms, 4×hall_period + 20ms)`):
+1. Prędkość jest zerowana (`g_sine_speed_q16 = 0`)
+2. Timestamp Halla jest resetowany (`g_sine_last_hall_ms = now`)
+3. ISR przechodzi w tryb crawl — wolno obraca pole, czekając na przejście Halla
+
+Reset timestampu (punkt 2) jest kluczowy — bez niego crawl byłby natychmiast
+zablokowany przez stall freeze (ponieważ stary timestamp wskazywałby >200ms).
+
+### Generacja PWM 3 faz (center-aligned complementary)
+
+Mapowanie faz (dopasowane do tabeli komutacji blokowej CW):
+- **Faza A**: `sin(θ)` — referencyjna (peak w sektorach 0,1)
+- **Faza B**: `sin(θ + 64)` (64/96 × 360° = 240°, peak w sektorach 2,3)
+- **Faza C**: `sin(θ + 32)` (32/96 × 360° = 120°, peak w sektorach 4,5)
+
+Dzięki temu sekwencja peaków A→B→C jest zgodna z kierunkiem obrotu blokowego CW.
+
+Dla każdej fazy:
+1. Interpolacja liniowa z tabeli: `sin_val = sine_interp_q16(angle + offset)`
+2. Duty: `duty = 512 + (sin_val × amplitude) >> 10`
+3. HIN i LIN dostają TEN SAM duty → IR2103 z odwróconym LIN tworzy
+   naturalnie komplementarne przełączanie z wbudowanym dead-time (~520 ns)
+
+### Strojenie offsetu fazy (Hall phase offset)
+
+Offset `g_sine_hall_phase_offset` koryguje niedopasowanie między pozycją czujników
+Halla a optymalnym kątem wyprzedzenia pola magnetycznego. 1 wpis = 3.75° elektr.
+
+**Ręczne strojenie:**
+- `so` — pokaż aktualny offset
+- `so+` / `so-` — zmień o ±2 wpisy (±7.5°)
+- `so:N` — ustaw na wartość N (-48..+48)
+
+**Automatyczne strojenie (komenda `sat`):**
+
+Algorytm przelatuje zakres offsetów (-24..+24, krok 2) przy stałym niskim duty (10%).
+Na każdym kroku mierzy średni prąd (400ms stabilizacja + 600ms pomiar).
+Optymalny offset = minimum prądu → najlepsza sprawność (najmniej strat cieplnych
+przy stałym momencie obrotowym).
+
+Przykład użycia:
+```
+S            ← włącz tryb SINUS
+15           ← ustaw duty 15% (żeby się kręcił)
+sat          ← start auto-tune (silnik przechodzi na 10%, sweep ~25s)
+             ← wynik: najlepszy offset ustawiony automatycznie
+so           ← sprawdź jaki offset został wybrany
+```
+
+Opcjonalnie można podać zakres: `sat:-8:8:1` (od -8 do +8, krok 1).
+Wysyłane ponownie `sat` podczas pracy anuluje strojenie i przywraca poprzedni offset.
+
+Całkowity czas: ~25 kroków × 1s = ~25 sekund (domyślne).
+
+### Stałe sinusoidalne
+
+| Stała | Wartość | Opis |
+|---|---|---|
+| `SINE_STALL_FREEZE_MS` | 200 ms | Brak Halla → zamrożenie kąta (z wyjątkiem crawl) |
+| `SINE_CRAWL_SPEED_Q16` | 315 | Minimalna prędkość crawl ≈ 1 obr.elekt./s |
+| `SINE_STALL_FALLBACK_MS` | 400 ms | Minimalny timeout safety fallback |
+| `SINE_START_MAX_HALL_US` | 30000 µs | Max okres Halla do wejścia w SINUS |
+| `SINE_PHASE_CORR_SHIFT` | 3 | Korekcja kąta: 1/8 błędu na przejście Halla |
+| `SINE_SPEED_FILTER_SHIFT` | 2 | Filtr prędkości: 1/4 new + 3/4 old |
+| `SINE_SAFE_MAX_DUTY` | 45% PWM_MAX | Limit bezpieczeństwa amplitudy |
+| `SINE_MIN_AMPLITUDE` | 15 | Poniżej tego: coast (zapobiega hamowaniu EM) |
+| `SINE_TABLE_SIZE` | 96 | Wpisów w tablicy sinusów (= 360° elektr.) |
+
+### Aktywacja
+
+- Komenda `S` (natychmiastowa, bez Enter) lub `m2` + Enter
+- Silnik startuje bezpośrednio w trybie sinusoidalnym (bez fazy blokowej)
+- Z miejsca: tryb crawl rusza silnik, potem przejście na śledzenie Halla
+- Powrót do trybu blokowego: komenda `e`
+- Wyłączenie silnika: komenda `d`
+
+---
+
 ## Timer sprzętowy i ISR
 
 ```cpp
@@ -479,9 +658,28 @@ Jeśli warunki nie są spełnione → coast (allMosfetsOff).
 - **Pin:** GPIO2 (ADC2_CH2)
 - **Martwa strefa:** wartości ADC < 400 → duty = 0
 - **Zakres roboczy:** 400–2600 ADC
+- **Filtr EMA:** α = 0.15 (filtr szumów ADC2)
 
 > Zakres 400–2600 został skalibrowany empirycznie dla konkretnej przepustnicy.  
 > Jeśli przepustnica ma inny zakres, zmień `THROTTLE_DEAD_ZONE`, `THROTTLE_MIN_RAW`, `THROTTLE_MAX_RAW` w `main.cpp`.
+
+### Filtr EMA przepustnicy
+
+GPIO2 (ADC2) jest podatny na szumy od PWM silnika — bez filtra pojedyncza szpilka
+poniżej 400 daje `duty=0` i powoduje stall silnika. Zastosowano filtr EMA
+(Exponential Moving Average):
+
+```
+thr_ema += α × (thr_raw − thr_ema)
+```
+
+| Parametr | Wartość | Opis |
+|---|---|---|
+| `kThrottleFilterAlpha` | 0.15 | Szybkość reakcji filtra |
+| Czas ustalania | ~10 iteracji loop | 63% wartości docelowej |
+
+Filtr eliminuje pojedyncze szpilki szumowe bez zauważalnego opóźnienia reakcji
+przepustnicy. Pierwsza próbka inicjalizuje filtr (brak opóźnienia na starcie).
 
 ### Mapowanie proporcjonalne (wspólny algorytm BLOCK / SINUS / FOC)
 
@@ -572,6 +770,8 @@ Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
 | Komenda         | Opis |
 |-----------------|------|
 | `e`             | Włącz silnik — tryb BLOCK |
+| `S`             | Włącz silnik — tryb SINUS |
+| `m2` Enter      | Włącz silnik — tryb SINUS (alternatywna) |
 | `d`             | Wyłącz silnik, duty = 0 |
 | `r`             | Odwróć kierunek CW↔CCW (tylko gdy wyłączony) |
 | `+`             | Zwiększ duty o 5% |
@@ -592,6 +792,18 @@ Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
 | `tCL` Enter     | Test faza C LOW-side |
 | `tp:N` Enter    | Ustaw duty testowe na N% (1-50) |
 | `t0` Enter      | Wyłącz test MOSFET (wszystkie OFF) |
+| `so`           | Pokaż aktualny sine phase offset |
+| `so+` / `so-`  | Offset ±2 wpisy (±7.5°) |
+| `so:N`         | Ustaw offset na N (-48..+48) |
+| `sat`          | Auto-tune offsetu fazy (sweep ~25s) |
+| `sat:M:N`      | Auto-tune zakres M..N |
+| `sat:M:N:S`    | Auto-tune zakres M..N krok S |
+| `man`          | Manual duty ON/OFF (manetka ignorowana) |
+| `gdbg`         | Debug SINUS/BLOCK ON/OFF (co 200ms) |
+| `cfg`          | Pokaż konfigurację NVS + runtime |
+| `cfg:mode:N` Enter | Tryb boot: 1=BLOCK, 2=SINUS, 3=FOC (zapis NVS) |
+| `cfg:ramp:N` Enter | Czas rampy 0-10000 ms (zapis NVS + natychmiast runtime) |
+| `cfg:regen:N` Enter | Regeneracja boot: 0=OFF, 1=ON (zapis NVS + natychmiast runtime) |
 
 ### Format statusu (jedna linia)
 
@@ -635,6 +847,61 @@ offset = (1 - α) × offset + α × V_ADC
 - Po uruchomieniu firmware należy odczekać kilka sekund bez prądu, żeby offset się ustabilizował
 
 Aktualny offset nie jest wyświetlany w statusie. Aby go sprawdzić, można tymczasowo dodać `Serial.printf` w `readAnalogInputs()`.
+
+---
+
+## Konfiguracja NVS
+
+Sterownik zapisuje konfigurację w pamięci nieulotnej ESP32 (NVS — Non-Volatile Storage).
+Konfiguracja przetrwa restart i wyłączenie zasilania.
+
+### Struktura `controller_config_t` (64 bajty)
+
+| Pole | Typ | Domyślnie | Opis |
+|---|---|---|---|
+| `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
+| `version` | uint16_t | 1 | Wersja struktury |
+| `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
+| `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
+| `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
+| `_reserved[54]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
+
+### Walidacja
+
+Przy starcie firmware sprawdza `magic` i `version` w NVS:
+- **Zgodne** → konfiguracja załadowana
+- **Niezgodne** (nowa wersja firmware, pusty NVS, uszkodzone dane) → reset do domyślnych + zapis
+
+### Komendy
+
+| Komenda | Opis |
+|---|---|
+| `cfg` | Wyświetla aktualną konfigurację NVS + parametry runtime |
+| `cfg:mode:N` | Zmienia tryb boot (1=BLOCK, 2=SINUS, 3=FOC), zapisuje NVS |
+| `cfg:ramp:N` | Zmienia czas rampy 0-10000 ms, **natychmiast aktualizuje runtime**, zapisuje NVS |
+| `cfg:regen:N` | Zmienia regen (0/1), **natychmiast aktualizuje runtime**, zapisuje NVS |
+
+### Przykład wyjścia `cfg`
+
+```
+========== KONFIGURACJA NVS ==========
+drive_mode:    2 (SINUS)
+ramp_time_ms:  1200 ms
+regen_enabled: 0 (OFF)
+magic:         0x424C4401 OK
+version:       1
+======================================
+--- Runtime (bieżące) ---
+mode:          SINUS
+ramp_time_ms:  1200 ms
+regen:         OFF
+direction:     CW
+sine_offset:   0 (0.0°)
+```
+
+> **Uwaga:** Komendy `cfg:ramp:N` i `cfg:regen:N` zmieniają zarówno NVS jak i bieżący
+> stan runtime — efekt jest natychmiastowy. Komenda `cfg:mode:N` zmienia tylko tryb
+> boot — bieżący tryb sterowania nie jest zmieniany (wymaga restartu lub komendy `S`/`e`).
 
 ---
 
@@ -747,13 +1014,9 @@ LOW-side ON:  ledcWrite(LIN_channel, PWM_MAX_DUTY - test_duty)
 
 ## Rozbudowa projektu
 
-### 1. Sterowanie sinusoidalne (DRIVE_MODE_SINUS)
-- Zamiast włączyć/wyłączyć fazę: generować sinusoidalne PWM na wszystkich 3 fazach
-- Eliminuje szarpanie na niskich obrotach
-- Wymaga: tabeli sinusoid + mapowania kąta Halla na fazę
-- **Infrastruktura gotowa:** ISR ma dispatch `g_mode_isr` — wystarczy dodać `sinusCommutateISR()`
-- Elementy niezależne od trybu (nie wymagają zmian): przepustnica, rampa, assist levels,
-  regen, wyświetlacz, pomiar prędkości, obliczanie mocy, komendy Serial
+### 1. ~~Sterowanie sinusoidalne (DRIVE_MODE_SINUS)~~ — **ZAIMPLEMENTOWANE** ✓
+- Komenda `S` (natychmiastowa) lub `m2` + Enter — przełącza na tryb sinusoidalny
+- Szczegóły: patrz sekcja **Komutacja sinusoidalna** poniżej
 
 ### 2. FOC (Field Oriented Control) (DRIVE_MODE_FOC)
 - Transformacja Clarke/Park
@@ -773,9 +1036,10 @@ LOW-side ON:  ledcWrite(LIN_channel, PWM_MAX_DUTY - test_duty)
 - Pętla prądowa: INA180A2 → limit prądu regen z P14
 - Konfiguracja duty regen z wyświetlacza lub komend Serial
 
-### 5. Konfiguracja przez UART
-- Możliwość zmiany `THROTTLE_DEAD_ZONE`, `THROTTLE_MAX_RAW` bez rekompilacji
-- Zapis do NVS (Non-Volatile Storage) ESP32
+### 5. ~~Konfiguracja przez UART~~ — **CZĘŚCIOWO ZAIMPLEMENTOWANE** ✓
+- Komenda `cfg` — wyświetlanie konfiguracji NVS + runtime
+- Komendy `cfg:mode:N`, `cfg:ramp:N`, `cfg:regen:N` — zmiana i zapis do NVS
+- **Do rozbudowy:** zmiana `THROTTLE_DEAD_ZONE`, `THROTTLE_MAX_RAW` bez rekompilacji
 
 ### 6. CAN bus / RS485
 - Gotowy pin UART_EN (GPIO17) sugeruje planowany RS485 lub CAN
@@ -801,5 +1065,5 @@ board_build.partitions = default.csv
 
 ---
 
-*Dokumentacja wygenerowana: 2026-02-23*  
-*Wersja firmware: 0.1.0*
+*Dokumentacja wygenerowana: 2026-03-06*  
+*Wersja firmware: 0.2.0*

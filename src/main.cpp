@@ -56,6 +56,30 @@ volatile uint8_t g_hall_prev_isr = 0;         ///< Poprzedni stan Halla w ISR
 volatile uint32_t g_hall_last_change_us = 0;  ///< micros() ostatniego przejścia
 volatile uint32_t g_hall_period_us = 0;       ///< Okres między przejściami Halla [µs]
 
+// Sinusoidal commutation state — ported from bldc_driver_v2 (STM32, proven algorithm)
+// Continuous angle tracking with Hall correction, NOT snap-to-hall approach.
+volatile uint32_t g_sine_angle_q16 = 0;       ///< Kąt elektr. w wpisach tabeli (Q16, 0..96<<16)
+volatile uint32_t g_sine_speed_q16 = 0;       ///< Prędkość: wpisów tabeli na tick ISR (Q16)
+volatile uint8_t  g_sine_running = 0;          ///< 1 = tryb sinusoidalny aktywny, 0 = block startup
+volatile uint8_t  g_sine_startup_count = 0;    ///< Licznik komutacji blokowych przed przejściem na sinus
+volatile int8_t   g_sine_last_hall_idx = -1;   ///< Ostatni indeks Halla w sekwencji (0-5, -1=unknown)
+volatile int8_t   g_sine_dir = 1;              ///< Kierunek z przejść Halla: +1 forward, -1 reverse
+volatile uint32_t g_sine_last_hall_ms = 0;     ///< HAL tick ostatniego przejścia Halla (stall detection)
+volatile int8_t   g_sine_hall_phase_offset = 0; ///< Runtime-tunable Hall phase offset (-48..+48 entries, 1 entry = 3.75°)
+
+// Debug sterowania sinusoidalnego (snapshot + liczniki zdarzeń ISR)
+volatile uint32_t g_dbg_hall_edges = 0;
+volatile uint32_t g_dbg_sine_enter_count = 0;
+volatile uint32_t g_dbg_sine_fallback_count = 0;
+volatile uint32_t g_dbg_sine_start_reject_count = 0;
+volatile uint8_t  g_dbg_last_hall = 0;
+volatile uint32_t g_dbg_last_sine_enter_ms = 0;
+volatile uint32_t g_dbg_last_fallback_ms = 0;
+volatile uint16_t g_dbg_last_amp = 0;
+volatile int16_t  g_dbg_last_ma = 0;
+volatile int16_t  g_dbg_last_mb = 0;
+volatile int16_t  g_dbg_last_mc = 0;
+
 // Pomiar RPM z pinu SPEED (GPIO ISR, dla silników przekładniowych, P07==1)
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
 volatile uint32_t g_speed_period_us = 0;      ///< Okres między impulsami SPEED [µs]
@@ -92,6 +116,86 @@ static uint16_t g_mosfet_test_duty = PWM_MAX_DUTY * 10 / 100;  ///< Duty testowe
 static char g_mosfet_test_phase = 0;           ///< Aktualnie testowana faza ('A','B','C') lub 0
 static char g_mosfet_test_side  = 0;           ///< Aktualnie testowana strona ('H','L') lub 0
 
+// ============================================================================
+// Sterowanie sinusoidalne — port z bldc_driver_v2 (STM32, sprawdzony algorytm)
+// ============================================================================
+//
+// Algorytm źródłowy: bldc_driver_v2/src/bldc.c, TIM1_UP_IRQHandler()
+// Kluczowe cechy:
+//   1. Ciągłe śledzenie kąta (angle_q16 += speed_q16 co tick ISR)
+//   2. Hall KORYGUJE kąt (1/8 błędu), NIE narzuca go
+//   3. Block startup: 6 komutacji blokowych buduje dane o prędkości
+//   4. Stall freeze: brak Halla >200ms → zamrożenie kąta
+//   5. Center-aligned complementary PWM: duty = center + sine * amp
+//
+// Tablica: 97 elementów (96 + guard entry), wartości -1024..+1024
+// 96 wpisy = 360° elektrycznych, 16 wpisów na sektor (60°)
+// Rozdzielczość: 3.75° na wpis
+
+/**
+ * @brief Tablica sinusa: 96 wpisów + 1 guard (wrap-around).
+ * Wartości: round(sin(i × 360°/96) × 1024), zakres -1024..+1024.
+ * Guard entry [96] = [0] = 0 dla bezpiecznej interpolacji.
+ * DRAM_ATTR: uint8/int16 load z IRAM → LoadStoreError na ESP32.
+ */
+static const DRAM_ATTR int16_t g_sine_table[97] = {
+       0,   67,  134,  200,  265,  329,  392,  453,
+     512,  569,  623,  675,  724,  770,  812,  851,
+     887,  918,  946,  970,  989, 1004, 1015, 1022,
+    1024, 1022, 1015, 1004,  989,  970,  946,  918,
+     887,  851,  812,  770,  724,  675,  623,  569,
+     512,  453,  392,  329,  265,  200,  134,   67,
+       0,  -67, -134, -200, -265, -329, -392, -453,
+    -512, -569, -623, -675, -724, -770, -812, -851,
+    -887, -918, -946, -970, -989,-1004,-1015,-1022,
+   -1024,-1022,-1015,-1004, -989, -970, -946, -918,
+    -887, -851, -812, -770, -724, -675, -623, -569,
+    -512, -453, -392, -329, -265, -200, -134,  -67,
+       0   // guard entry [96] = entry [0]
+};
+
+/**
+ * @brief Mapowanie Hall→indeks sektora (0-5) dla sekwencji CW.
+ *
+ * Sekwencja CW z komutacji blokowej: 1→3→2→6→4→5
+ * Sektor 0 = Hall 1, Sektor 1 = Hall 3, ... Sektor 5 = Hall 5
+ * Wartość -1 = nieprawidłowy stan Halla (0 lub 7).
+ */
+static const DRAM_ATTR int8_t g_hall_to_sector[8] = {
+    -1,     // 0 = invalid
+     0,     // 1 (001) → sector 0  (block: A→B)
+     2,     // 2 (010) → sector 2  (block: B→C−)
+     1,     // 3 (011) → sector 1  (block: A→C−)
+     4,     // 4 (100) → sector 4  (block: C→A−)
+     5,     // 5 (101) → sector 5  (block: C→B−)
+     3,     // 6 (110) → sector 3  (block: B→A−)
+    -1      // 7 = invalid
+};
+
+// Stałe sinusoidalne (identyczne z bldc_driver_v2)
+#define SINE_TABLE_SIZE         96
+#define SINE_TABLE_Q16_FULL     (96UL << 16)   // 6291456
+#define SINE_SECTOR_ENTRIES     16              // 96 / 6
+#define SINE_SECTOR_CENTER      8               // środek sektora
+// SINE_HALL_PHASE_OFFSET: teraz runtime variable g_sine_hall_phase_offset (komendy so+/so-/so:N)
+// Domyślnie 0; strojenie: 1 wpis = 3.75° elektr.
+// Offsety fazowe: dopasowane do tabeli komutacji blokowej CW (1→3→2→6→4→5)
+// Faza A = referencyjna (peak w sektorach 0,1)
+// Faza B = +240° (peak w sektorach 2,3)
+// Faza C = +120° (peak w sektorach 4,5)
+#define SINE_PHASE_A_OFFSET     0               // faza referencyjna
+#define SINE_PHASE_B_OFFSET     64              // 96*2/3 = 240°
+#define SINE_PHASE_C_OFFSET     32              // 96/3 = 120°
+#define SINE_STARTUP_COMMUT     12              // komutacji blokowych przed sinus
+#define SINE_STALL_FREEZE_MS    200             // ms bez Halla → zamrożenie kąta
+#define SINE_CRAWL_SPEED_Q16    315             // minimalna prędkość startowa ≈ 1 obr.elekt./s (52428800/166666)
+#define SINE_STALL_FALLBACK_MS  400             // minimalny timeout fallback (histereza, anty-szarpanie)
+#define SINE_START_MAX_HALL_US  30000           // max okres Halla (min prędkość) do wejścia w SINUS
+#define SINE_PHASE_CORR_SHIFT   3               // korekcja 1/8 błędu na przejście Halla
+#define SINE_SPEED_FILTER_SHIFT 2               // filtr prędkości: 1/4 new + 3/4 old
+#define SINE_SAFE_MAX_DUTY      (PWM_MAX_DUTY * 45 / 100)  // limit bezpieczeństwa dla trybu sinus
+#define SINE_MIN_AMPLITUDE      15              // poniżej tego coast (center-aligned 50% = hamowanie)
+
 /// Limit duty regen — 80% max (musi zostać czas OFF na transfer energii do baterii)
 #define REGEN_MAX_DUTY  (PWM_MAX_DUTY * 80 / 100)
 /// Minimalne RPM poniżej którego regen jest nieefektywny (tylko grzeje)
@@ -117,6 +221,8 @@ void printDisplayConfig();
 void blockCommutate(uint8_t hallState, uint16_t duty);
 void processSerialCommands();
 static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir);
+static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude);
+static void printSineDebug();
 static String executeCommand(const String& cmd);
 static String mosfetTestSet(const String& which);
 static void mosfetTestPrintHelp();
@@ -140,11 +246,17 @@ static const uint16_t DUTY_STEP = PWM_MAX_DUTY / 20;  // 5% kroku
 static const uint16_t THROTTLE_DEAD_ZONE = 400;
 static const uint16_t THROTTLE_MIN_RAW   = 400;   // 0% duty
 static const uint16_t THROTTLE_MAX_RAW   = 2600;  // 100% duty
+static const float kThrottleFilterAlpha  = 0.15f;  ///< EMA α dla przepustnicy (filtr szumów ADC2)
+                                                    //   α=0.15 @ 2kHz loop → τ≈3ms, 99% settling≈14ms
+                                                    //   Szpilka 1870→0 → po filtrze: 1590 (>400 dead zone)
 
 // Auto-status
 static bool g_autoStatus = false;
 static unsigned long g_lastAutoStatusMs = 0;
 static const unsigned long AUTO_STATUS_INTERVAL_MS = 1000;
+static bool g_debugSine = false;
+static unsigned long g_lastDebugSineMs = 0;
+static const unsigned long DEBUG_SINE_INTERVAL_MS = 200;
 
 // Bufor na komendy numeryczne
 static String serialBuffer = "";
@@ -155,6 +267,31 @@ static bool g_brake_simulated = false;
 // Rampa rozpędzania silnika
 static uint16_t g_duty_ramped = 0;                   ///< Aktualny duty po rampie
 static unsigned long g_ramp_last_us = 0;             ///< Timestamp ostatniego kroku rampy [µs]
+static bool g_manual_duty_override = false;          ///< true = duty z komendy serial, manetka ignorowana
+
+// Auto-tune fazy sinusoidalnej (komenda 'sat')
+enum AutoTuneState : uint8_t {
+    ATUNE_IDLE = 0,
+    ATUNE_INIT,
+    ATUNE_SETTLE,
+    ATUNE_MEASURE,
+    ATUNE_NEXT,
+    ATUNE_DONE
+};
+static AutoTuneState g_atune_state = ATUNE_IDLE;
+static int8_t   g_atune_offset_min   = -24;      ///< Początek zakresu sweep
+static int8_t   g_atune_offset_max   = 24;       ///< Koniec zakresu sweep
+static int8_t   g_atune_offset_step  = 2;        ///< Krok sweep (wpisy tabeli)
+static int8_t   g_atune_current_ofs  = 0;        ///< Aktualnie testowany offset
+static int8_t   g_atune_best_ofs     = 0;        ///< Najlepszy offset (min prąd)
+static float    g_atune_best_current = 1e9f;     ///< Najniższy średni prąd [A]
+static float    g_atune_sum_current  = 0.0f;     ///< Akumulator prądu w fazie MEASURE
+static uint32_t g_atune_sample_count = 0;        ///< Liczba próbek w fazie MEASURE
+static unsigned long g_atune_phase_start_ms = 0; ///< millis() startu aktualnej fazy
+static int8_t   g_atune_saved_offset = 0;        ///< Zapisany offset przed auto-tune
+static uint16_t g_atune_test_duty    = 0;        ///< Duty testowe (10% domyślnie)
+static const unsigned long ATUNE_SETTLE_MS  = 400;  ///< Czas stabilizacji [ms]
+static const unsigned long ATUNE_MEASURE_MS = 600;  ///< Czas pomiaru [ms]
 
 // Wyświetlacz S866 (zawsze aktywny na Serial2)
 static s866_display_t g_display;
@@ -535,6 +672,140 @@ void setup() {
 }
 
 // ============================================================================
+// Auto-tune fazy sinusoidalnej
+// ============================================================================
+
+/**
+ * @brief Maszyna stanów auto-strojenia offsetu fazy sinusoidalnej.
+ *
+ * Algorytm: przy stałym niskim duty (10%) przelatuje zakres offsetów
+ * g_sine_hall_phase_offset od -24 do +24 (co 2 wpisy = 7.5° elektr.).
+ * Na każdym kroku: 400ms stabilizacja + 600ms pomiar średniego prądu.
+ * Optymalny offset = minimum prądu (najlepsza sprawność, najmniej strat).
+ *
+ * Uruchamiany komendą 'sat'. Wymaga trybu SINUS i działającego silnika.
+ * Podczas strojenia przepustnica jest ignorowana (g_manual_duty_override).
+ *
+ * Całkowity czas: ~25 kroków × 1s = ~25 sekund.
+ */
+static void autoTuneStep() {
+    if (g_atune_state == ATUNE_IDLE) return;
+
+    unsigned long now = millis();
+
+    switch (g_atune_state) {
+    case ATUNE_INIT: {
+        // Zapisz stan, ustaw stałe duty testowe
+        g_atune_saved_offset = g_sine_hall_phase_offset;
+        g_atune_current_ofs = g_atune_offset_min;
+        g_atune_best_ofs = 0;
+        g_atune_best_current = 1e9f;
+
+        // Ustaw duty testowe (10%) i override manetki
+        g_atune_test_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * 10 / 100);
+        g_manual_duty_override = true;
+        g_bldc_state.duty_target = g_atune_test_duty;
+        g_duty_ramped = g_atune_test_duty;
+
+        // Ustaw pierwszy offset
+        g_sine_hall_phase_offset = g_atune_current_ofs;
+
+        Serial.println("[SAT] Auto-tune start: offset " + String((int)g_atune_offset_min)
+                       + ".." + String((int)g_atune_offset_max)
+                       + " krok " + String((int)g_atune_offset_step)
+                       + ", duty=10%");
+        Serial.println("[SAT]  ofs |  avg_I [A] | *=best");
+
+        g_atune_phase_start_ms = now;
+        g_atune_state = ATUNE_SETTLE;
+        break;
+    }
+
+    case ATUNE_SETTLE: {
+        // Czekaj na stabilizację prądu po zmianie offsetu
+        if (now - g_atune_phase_start_ms >= ATUNE_SETTLE_MS) {
+            g_atune_sum_current = 0.0f;
+            g_atune_sample_count = 0;
+            g_atune_phase_start_ms = now;
+            g_atune_state = ATUNE_MEASURE;
+        }
+        break;
+    }
+
+    case ATUNE_MEASURE: {
+        // Akumuluj próbki prądu (suma 3 faz)
+        float i_sum = g_bldc_state.phase_current[0]
+                    + g_bldc_state.phase_current[1]
+                    + g_bldc_state.phase_current[2];
+        g_atune_sum_current += i_sum;
+        g_atune_sample_count++;
+
+        if (now - g_atune_phase_start_ms >= ATUNE_MEASURE_MS) {
+            // Oblicz średni prąd
+            float avg = (g_atune_sample_count > 0)
+                        ? (g_atune_sum_current / (float)g_atune_sample_count)
+                        : 999.0f;
+
+            bool is_best = (avg < g_atune_best_current);
+            if (is_best) {
+                g_atune_best_current = avg;
+                g_atune_best_ofs = g_atune_current_ofs;
+            }
+
+            // Wypisz wynik kroku
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[SAT] %+4d | %6.3f A   %s",
+                     (int)g_atune_current_ofs, avg, is_best ? "*" : "");
+            Serial.println(buf);
+
+            g_atune_state = ATUNE_NEXT;
+        }
+        break;
+    }
+
+    case ATUNE_NEXT: {
+        // Przejdź do następnego offsetu lub zakończ
+        int next = (int)g_atune_current_ofs + (int)g_atune_offset_step;
+        if (next > (int)g_atune_offset_max) {
+            g_atune_state = ATUNE_DONE;
+        } else {
+            g_atune_current_ofs = (int8_t)next;
+            g_sine_hall_phase_offset = g_atune_current_ofs;
+            // Utrzymaj stałe duty testowe
+            g_bldc_state.duty_target = g_atune_test_duty;
+            g_duty_ramped = g_atune_test_duty;
+            g_atune_phase_start_ms = millis();
+            g_atune_state = ATUNE_SETTLE;
+        }
+        break;
+    }
+
+    case ATUNE_DONE: {
+        // Zastosuj najlepszy offset
+        g_sine_hall_phase_offset = g_atune_best_ofs;
+
+        Serial.println("[SAT] ==============================");
+        Serial.println("[SAT] Najlepszy offset: " + String((int)g_atune_best_ofs)
+                       + " (" + String((float)g_atune_best_ofs * 3.75f, 1) + "°)"
+                       + "  avg_I=" + String(g_atune_best_current, 3) + " A");
+        Serial.println("[SAT] Poprzedni offset: " + String((int)g_atune_saved_offset)
+                       + " (" + String((float)g_atune_saved_offset * 3.75f, 1) + "°)");
+        Serial.println("[SAT] Auto-tune zakończony. Offset zastosowany.");
+        Serial.println("[SAT] Użyj so/so+/so- do ręcznej korekty.");
+
+        // Przywróć duty — manetka przejmie kontrolę
+        g_manual_duty_override = false;
+        g_atune_state = ATUNE_IDLE;
+        break;
+    }
+
+    default:
+        g_atune_state = ATUNE_IDLE;
+        break;
+    }
+}
+
+// ============================================================================
 // Loop
 // ============================================================================
 
@@ -574,7 +845,7 @@ void loop() {
     //   P10=0: PAS + gaz → duty = max(throttle_duty, pas_duty)
     //   P10=1: tylko gaz → duty = throttle_duty
     //   P10=2: tylko PAS → duty = pas_duty
-    if (g_bldc_state.mode != DRIVE_MODE_DISABLED) {
+    if (g_bldc_state.mode != DRIVE_MODE_DISABLED && !g_manual_duty_override) {
         uint16_t maxDuty = getAssistMaxDuty();
 
         // --- Oblicz kadencję PAS i prędkość koła ---
@@ -644,6 +915,25 @@ void loop() {
     g_brake_isr = g_bldc_state.brake_active;
     g_direction_isr = g_bldc_state.direction;
     g_mode_isr = g_bldc_state.mode;
+
+    // Prekalkulacja prędkości sinusoidalnej z okresu Halla.
+    // speed_q16 = (SINE_SECTOR_ENTRIES × ISR_PERIOD_US) << 16 / hall_period
+    //           = (16 × 50) << 16 / p = 52428800 / p
+    // Filtr EMA: 3/4 old + 1/4 new (identycznie jak bldc_driver_v2)
+    {
+        static uint32_t prev_hall_period = 0;
+        uint32_t p = g_hall_period_us;
+        if (p != prev_hall_period && p > 0 && p < 500000) {
+            uint32_t new_speed = 52428800UL / p;
+            uint32_t old_speed = g_sine_speed_q16;
+            if (old_speed == 0) {
+                g_sine_speed_q16 = new_speed;  // pierwszy pomiar — bez filtra
+            } else {
+                g_sine_speed_q16 = (old_speed * 3 + new_speed) >> SINE_SPEED_FILTER_SHIFT;
+            }
+            prev_hall_period = p;
+        }
+    }
 
     // Obliczanie mocy: P = Vbat × max(Ia, Ib, Ic)
     {
@@ -758,6 +1048,15 @@ void loop() {
         g_lastAutoStatusMs = millis();
         printDiagnostics();
     }
+
+    // Debug sinus co 200ms (krok po kroku)
+    if (g_debugSine && (millis() - g_lastDebugSineMs >= DEBUG_SINE_INTERVAL_MS)) {
+        g_lastDebugSineMs = millis();
+        printSineDebug();
+    }
+
+    // Auto-tune fazy sinusoidalnej (maszyna stanów)
+    autoTuneStep();
 }
 
 // ============================================================================
@@ -950,7 +1249,21 @@ void readAnalogInputs() {
     uint16_t batteryRaw = analogRead(PIN_BATTERY_VOLTAGE);
     // Odczyt prądu fazy A (GPIO39)
     uint16_t phaseA_raw = analogRead(PIN_PHASE_A_CURRENT);
-    g_bldc_state.throttle_raw = analogRead(PIN_THROTTLE);
+
+    // Przepustnica: odczyt + filtr EMA (ADC2/GPIO2 jest podatny na szumy
+    // od PWM silnika — bez filtra pojedyncza szpilka <400 daje duty=0 i stall)
+    {
+        uint16_t thr_raw = analogRead(PIN_THROTTLE);
+        static float thr_ema = 0.0f;
+        static bool  thr_init = false;
+        if (!thr_init) {
+            thr_ema = (float)thr_raw;
+            thr_init = true;
+        } else {
+            thr_ema += kThrottleFilterAlpha * ((float)thr_raw - thr_ema);
+        }
+        g_bldc_state.throttle_raw = (uint16_t)(thr_ema + 0.5f);
+    }
 
     // Odczyt prądów fazowych
     uint16_t phaseB_raw = analogRead(PIN_PHASE_B_CURRENT);
@@ -1134,6 +1447,44 @@ void printDiagnostics() {
     Serial.println();
 }
 
+/**
+ * @brief Diagnostyka krokowa trybu SINUS/BLOCK.
+ *
+ * Linie [SDBG] pokazują sekwencję:
+ * Hall edges -> startup -> wejście SINUS -> fallback -> ponowny startup.
+ */
+static void printSineDebug() {
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t since_hall = now_ms - g_sine_last_hall_ms;
+    int32_t angle_entry = (int32_t)(g_sine_angle_q16 >> 16);
+    int32_t angle_frac = (int32_t)(g_sine_angle_q16 & 0xFFFF);
+
+    Serial.printf("[SDBG] mode:%s run:%u st:%u hall:%u hp:%luus since:%lums ",
+        (g_bldc_state.mode == DRIVE_MODE_SINUS) ? "SIN" : ((g_bldc_state.mode == DRIVE_MODE_BLOCK) ? "BLK" : "OTH"),
+        (unsigned)g_sine_running,
+        (unsigned)g_sine_startup_count,
+        (unsigned)g_dbg_last_hall,
+        (unsigned long)g_hall_period_us,
+        (unsigned long)since_hall);
+
+    Serial.printf("spd:%lu ang:%ld.%04ld dir:%s amp:%u m:%d/%d/%d ",
+        (unsigned long)g_sine_speed_q16,
+        (long)angle_entry,
+        (long)((angle_frac * 10000L) >> 16),
+        (g_direction_isr == DIRECTION_CW) ? "CW" : "CCW",
+        (unsigned)g_dbg_last_amp,
+        (int)g_dbg_last_ma, (int)g_dbg_last_mb, (int)g_dbg_last_mc);
+
+    Serial.printf("ofs:%d ev[h:%lu en:%lu rej:%lu fb:%lu lastEn:%lums lastFb:%lums]\n",
+        (int)g_sine_hall_phase_offset,
+        (unsigned long)g_dbg_hall_edges,
+        (unsigned long)g_dbg_sine_enter_count,
+        (unsigned long)g_dbg_sine_start_reject_count,
+        (unsigned long)g_dbg_sine_fallback_count,
+        (unsigned long)g_dbg_last_sine_enter_ms,
+        (unsigned long)g_dbg_last_fallback_ms);
+}
+
 // ============================================================================
 // Timer ISR - komutacja w przerwaniu (niezależna od loop)
 // ============================================================================
@@ -1172,11 +1523,67 @@ void IRAM_ATTR onCommutationTimer() {
     // Pomiar czasu między przejściami Halla → RPM (niezależnie od stanu silnika)
     if (hall != g_hall_prev_isr) {
         uint32_t now_us = (uint32_t)esp_timer_get_time();
+        g_dbg_hall_edges++;
+        g_dbg_last_hall = hall;
         if (g_hall_last_change_us > 0) {
             g_hall_period_us = now_us - g_hall_last_change_us;
         }
         g_hall_last_change_us = now_us;
         g_hall_prev_isr = hall;
+
+        // ── Sine mode: przetwarzanie przejścia Halla ──
+        // Port z bldc_driver_v2: bldc_hall_interrupt()
+        if (g_mode_isr == DRIVE_MODE_SINUS) {
+            g_sine_last_hall_ms = (uint32_t)(now_us / 1000);  // stall detection timestamp
+
+            int8_t new_idx = g_hall_to_sector[hall];
+            if (new_idx >= 0) {
+                int8_t old_idx = g_sine_last_hall_idx;
+
+                // Detekcja kierunku z sekwencji przejść Halla
+                if (old_idx >= 0) {
+                    int8_t fwd = (old_idx + 1) % 6;
+                    int8_t rev = (new_idx + 1) % 6;
+                    if (new_idx == fwd) {
+                        g_sine_dir = 1;   // forward (CW)
+                    } else if (old_idx == rev) {
+                        g_sine_dir = -1;  // reverse (CCW)
+                    }
+                }
+
+                // Korekcja kąta na przejściu Halla
+                // Oczekiwany kąt = środek sektora + offset fazowy Halla
+                int32_t expected_entry = (int32_t)new_idx * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
+                if (expected_entry < 0) expected_entry += SINE_TABLE_SIZE;
+                if (expected_entry >= SINE_TABLE_SIZE) expected_entry -= SINE_TABLE_SIZE;
+                int32_t expected = expected_entry << 16;
+                int32_t current = (int32_t)g_sine_angle_q16;
+                int32_t err = expected - current;
+                // Wrap error to [-48<<16, +48<<16] (half revolution)
+                if (err > (int32_t)(SINE_TABLE_Q16_FULL >> 1)) err -= (int32_t)SINE_TABLE_Q16_FULL;
+                if (err < -(int32_t)(SINE_TABLE_Q16_FULL >> 1)) err += (int32_t)SINE_TABLE_Q16_FULL;
+
+                if (g_sine_speed_q16 == 0) {
+                    // Przy starcie/crawl: pełny snap kąta na środek sektora
+                    // (nie 1/8 korekcji — krokowe przesuwanie pola)
+                    g_sine_angle_q16 = (uint32_t)expected;
+                } else {
+                    // Normalna praca: łagodna korekcja 1/8 błędu
+                    g_sine_angle_q16 = (uint32_t)(current + (err >> SINE_PHASE_CORR_SHIFT));
+                }
+                // Wrap angle
+                if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+                    g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+                }
+
+                g_sine_last_hall_idx = new_idx;
+
+                // Licznik przejść Halla (statystyka, nie blokuje startu sinusa)
+                if (g_sine_startup_count < 255) {
+                    g_sine_startup_count++;
+                }
+            }
+        }
     }
 
     // Tryb testu MOSFET — ISR nie dotyka kanałów LEDC, tylko mierzy Hall/prędkość
@@ -1211,13 +1618,45 @@ void IRAM_ATTR onCommutationTimer() {
 
     uint16_t d = g_duty_isr;
 
-    // Dispatch trybu sterowania — obecnie zaimplementowany tylko BLOCK
-    // Aby dodać SINUS/FOC: zamień poniższy if na switch(g_mode_isr) z nowymi case'ami
-    if (g_mode_isr != DRIVE_MODE_BLOCK) {
-        // Tryb niezaimplementowany → bezpieczny stan (wszystkie FETy OFF)
-        ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-        ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-        return;
+    // SINUS safety fallback: gdy brak przejść Halla przez dłuższy czas → zeruj prędkość.
+    // Timeout dynamiczny: max(400ms, 4*ostatni_hall_period + 20ms), aby uniknąć
+    // oscylacji przy chwilowym spadku prędkości pod obciążeniem.
+    // Po zerowaniu prędkości, crawl w sinusCommutateISR wolno obraca pole,
+    // aż silnik da przejście Halla i prędkość zostanie przywrócona.
+    if (g_mode_isr == DRIVE_MODE_SINUS) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t hp_us = g_hall_period_us;
+        uint32_t dyn_ms = SINE_STALL_FALLBACK_MS;
+        if (hp_us > 0 && hp_us < 500000) {
+            uint32_t est_ms = ((hp_us * 4U) / 1000U) + 20U;
+            if (est_ms > dyn_ms) dyn_ms = est_ms;
+        }
+        if ((now_ms - g_sine_last_hall_ms) > dyn_ms) {
+            if (g_sine_speed_q16 != 0) {
+                g_sine_speed_q16 = 0;
+                g_dbg_sine_fallback_count++;
+                g_dbg_last_fallback_ms = now_ms;
+            }
+            // Reset timestampu — pozwala crawl w sinusCommutateISR działać
+            // kolejne STALL_FREEZE_MS ms zanim stall freeze znów zadziała.
+            // Bez tego crawl byłby permanentnie zablokowany (deadlock).
+            g_sine_last_hall_ms = now_ms;
+        }
+    }
+
+    // Dispatch trybu sterowania
+    switch (g_mode_isr) {
+        case DRIVE_MODE_SINUS:
+            // Sinus mode — zawsze sinusoidalny (bez block startup)
+            sinusCommutateISR(hall, d);
+            return;
+        case DRIVE_MODE_BLOCK:
+            break;  // kontynuuj do komutacji blokowej poniżej
+        default:
+            // Tryb niezaimplementowany (FOC) lub DISABLED → bezpieczny stan
+            ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
+            ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            return;
     }
 
     if (g_direction_isr == DIRECTION_CW) {
@@ -1321,6 +1760,161 @@ void initCommutationTimer() {
     timerAttachInterrupt(commutationTimer, &onCommutationTimer, true);
     timerAlarmWrite(commutationTimer, 50, true);
     timerAlarmEnable(commutationTimer);
+}
+
+// ============================================================================
+// Komutacja sinusoidalna — ISR (port z bldc_driver_v2 TIM1_UP_IRQHandler)
+// ============================================================================
+
+/**
+ * @brief Interpolacja liniowa sinusa z tablicy 97-elementowej (Q16).
+ *
+ * Identyczna logika jak sine_interp_q16() z bldc_driver_v2/src/bldc.c.
+ * Tablica ma 97 wpisów (96+guard) — guard entry [96]=[0] eliminuje % 96.
+ *
+ * @param angle_q16  Kąt w wpisach tablicy (Q16), musi być 0..SINE_TABLE_Q16_FULL-1
+ * @return Wartość sinusa -1024..+1024
+ */
+static inline int32_t IRAM_ATTR sine_interp_q16(uint32_t angle_q16) {
+    uint32_t idx  = angle_q16 >> 16;        // indeks całkowity 0..95
+    uint32_t frac = angle_q16 & 0xFFFF;     // część ułamkowa Q16
+    int32_t s0 = (int32_t)g_sine_table[idx];
+    int32_t s1 = (int32_t)g_sine_table[idx + 1];  // guard entry [96] = entry [0]
+    return s0 + (((s1 - s0) * (int32_t)frac) >> 16);
+}
+
+/**
+ * @brief Komutacja sinusoidalna — ciągłe śledzenie kąta.
+ *
+ * ## Algorytm (port z bldc_driver_v2 TIM1_UP_IRQHandler)
+ *
+ * 1. Advance angle: angle += speed_q16 (lub -= dla CCW)
+ * 2. Stall freeze: brak przejść Halla > 200ms → zamrożenie kąta
+ * 3. Oblicz 3 kąty fazowe: C=base, A=base+32, B=base+64 (×120°)
+ * 4. Interpolacja sinusa z tabeli + obliczenie duty
+ * 5. Center-aligned complementary: HIN=LIN=ten sam duty
+ *
+ * ## Mapowanie faz (identyczne z STM32)
+ *   Phase C = sin(θ)           — faza referencyjna
+ *   Phase A = sin(θ + 120°)    — offset 32 wpisów (96/3)
+ *   Phase B = sin(θ + 240°)    — offset 64 wpisów (96×2/3)
+ *
+ * ## PWM center-aligned complementary
+ *   duty = 512 + (sine_val × amplitude) >> 10
+ *   HIN = LIN = duty → IR2103 produkuje komplementarne switching z dead-time
+ *
+ * @param hall      Aktualny stan Halla [C:B:A] 1-6
+ * @param amplitude Duty z przepustnicy/rampy 0-PWM_MAX_DUTY
+ */
+static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
+    // Walidacja Halla
+    if (hall == 0 || hall == 7) {
+        allMosfetsOff();
+        return;
+    }
+
+    // Gdy amplitude < SINE_MIN_AMPLITUDE → coast (wszystkie FETy OFF).
+    // Center-aligned PWM z bazą 512 przy małej amplitudzie = ~50% switching
+    // na wszystkich fazach = aktywne hamowanie elektromagnetyczne.
+    // W block mode mały duty = niemal 0 prądu (tiny PWM na 1 fazie).
+    if (amplitude < SINE_MIN_AMPLITUDE) {
+        allMosfetsOff();
+        return;
+    }
+
+    // ── 1. Stall freeze: brak przejścia Halla > 200ms → nie avansuj kąta ──
+    // WYJĄTEK: w trybie crawl (speed==0) zawsze avansuj — crawl jest wolny
+    // (~1 obr.elekt./s) i nie generuje niebezpiecznych prądów.
+    // Bez tego wyjątku: stall freeze blokuje crawl → silnik nigdy nie ruszy → deadlock.
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t since_hall = now_ms - g_sine_last_hall_ms;
+    uint32_t real_speed = g_sine_speed_q16;
+    bool in_crawl = (real_speed == 0);
+    bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
+
+    // ── 2. Advance angle ──
+    if (!stalled) {
+        uint32_t spd = real_speed;
+        // Gdy speed==0 (startup/crawl), użyj minimalnej prędkości otwartopętlowej
+        // aby pole magnetyczne wolno się obracało i rotor zaczął podążać.
+        // Pierwsze przejście Halla da realną prędkość i crawl się wyłączy.
+        if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
+        {
+            bool forward = (g_direction_isr == DIRECTION_CW);
+            if (forward) {
+                g_sine_angle_q16 += spd;
+                if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+                    g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+                }
+            } else {
+                if (g_sine_angle_q16 >= spd) {
+                    g_sine_angle_q16 -= spd;
+                } else {
+                    g_sine_angle_q16 = SINE_TABLE_Q16_FULL - (spd - g_sine_angle_q16);
+                }
+            }
+        }
+    }
+
+    // ── 3. Oblicz 3 kąty fazowe z offsetami ──
+    // Mapowanie faz dopasowane do tabeli komutacji blokowej CW:
+    //   Phase A = sin(θ)           — faza referencyjna (peak w sektorach 0,1)
+    //   Phase B = sin(θ + 240°)    — offset 64 wpisów (peak w sektorach 2,3)
+    //   Phase C = sin(θ + 120°)    — offset 32 wpisy (peak w sektorach 4,5)
+    uint32_t angle = g_sine_angle_q16;
+    uint32_t angle_a = angle;  // A = reference
+    uint32_t angle_b = angle + ((uint32_t)SINE_PHASE_B_OFFSET << 16);
+    uint32_t angle_c = angle + ((uint32_t)SINE_PHASE_C_OFFSET << 16);
+
+    // Wrap to valid range (subtraction, no modulo)
+    if (angle_b >= SINE_TABLE_Q16_FULL) angle_b -= SINE_TABLE_Q16_FULL;
+    if (angle_c >= SINE_TABLE_Q16_FULL) angle_c -= SINE_TABLE_Q16_FULL;
+
+    // ── 4. Interpolacja sinusa + obliczenie duty ──
+    int32_t sin_a = sine_interp_q16(angle_a);  // -1024..+1024
+    int32_t sin_b = sine_interp_q16(angle_b);
+    int32_t sin_c = sine_interp_q16(angle_c);
+
+    // amplitude: 0..PWM_MAX_DUTY(1023), z ograniczeniem bezpieczeństwa
+    int32_t amp = (int32_t)((amplitude > SINE_SAFE_MAX_DUTY) ? SINE_SAFE_MAX_DUTY : amplitude);
+    g_dbg_last_amp = (uint16_t)amp;
+
+    // Modulacja fazy: -amp..+amp
+    int32_t ma = (sin_a * amp) >> 10;
+    int32_t mb = (sin_b * amp) >> 10;
+    int32_t mc = (sin_c * amp) >> 10;
+    g_dbg_last_ma = (int16_t)ma;
+    g_dbg_last_mb = (int16_t)mb;
+    g_dbg_last_mc = (int16_t)mc;
+
+    // ── 5. Write LEDC (center-aligned complementary PWM) ──
+    // duty = 512 + modulation; obie gałęzie (HIN, LIN) dostają TEN SAM duty.
+    // IR2103 z odwróconym LIN tworzy naturalnie komplementarne przełączanie:
+    //   HIN=HIGH, LIN=HIGH → HS ON, LS OFF → phase = Vbus
+    //   HIN=LOW,  LIN=LOW  → HS OFF, LS ON → phase = GND
+    // Sygnały są zsynchronizowane (ten sam timer LEDC), więc żaden moment
+    // nie ma HS ON + LS ON jednocześnie. Dead-time IR2103 ~520ns obsługuje przejścia.
+    {
+        int32_t da = 512 + ma;
+        if (da < 0) da = 0;
+        if (da > (int32_t)PWM_MAX_DUTY) da = (int32_t)PWM_MAX_DUTY;
+        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
+        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
+    }
+    {
+        int32_t db = 512 + mb;
+        if (db < 0) db = 0;
+        if (db > (int32_t)PWM_MAX_DUTY) db = (int32_t)PWM_MAX_DUTY;
+        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
+        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
+    }
+    {
+        int32_t dc = 512 + mc;
+        if (dc < 0) dc = 0;
+        if (dc > (int32_t)PWM_MAX_DUTY) dc = (int32_t)PWM_MAX_DUTY;
+        ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc);
+        ledcWrite(PWM_CHANNEL_C_LOW,  (uint32_t)dc);
+    }
 }
 
 // ============================================================================
@@ -1631,18 +2225,29 @@ void blockCommutate(uint8_t hallState, uint16_t duty) {
 /** @brief Wypisuje tabelę dostępnych komend Serial na konsole. */
 void printHelp() {
     Serial.println();
-    Serial.println("========== KOMENDY ==========");
-    Serial.println("e         Włącz tryb BLOCK sterowania");
-    Serial.println("d         Wyłącz silnik (duty=0)");
-    Serial.println("r         Odwróć kierunek (CW/CCW) - tylko gdy wyłączony");
-    Serial.println("+/-       Zmień duty o ±5%");
-    Serial.println("0-100     Ustaw duty w procentach (wpisz liczbę i Enter)");
-    Serial.println("R         Regeneracja ON/OFF (hamowanie rekuperacyjne)");
-    Serial.println("b         Symulacja hamulca ON/OFF");
-    Serial.println("P         Pokaż parametry wyświetlacza P01-P20");
-    Serial.println("s         Pokaż status");
-    Serial.println("a         Auto-status co 1s ON/OFF");
-    Serial.println("h         Pokaż tę pomoc");
+    Serial.println("========== KOMENDY (wszystkie wymagają Enter) ==========");
+    Serial.println("e          Włącz tryb BLOCK sterowania");
+    Serial.println("S          Włącz tryb SINUS sterowania");
+    Serial.println("m2         Włącz tryb SINUS (alternatywna)");
+    Serial.println("d          Wyłącz silnik (duty=0)");
+    Serial.println("r          Odwróć kierunek (CW/CCW) - tylko gdy wyłączony");
+    Serial.println("+/-        Zmień duty o ±5%");
+    Serial.println("0-100      Ustaw duty w procentach");
+    Serial.println("R          Regeneracja ON/OFF (hamowanie rekuperacyjne)");
+    Serial.println("b          Symulacja hamulca ON/OFF");
+    Serial.println("P          Pokaż parametry wyświetlacza P01-P20");
+    Serial.println("s          Pokaż status");
+    Serial.println("a          Auto-status co 1s ON/OFF");
+    Serial.println("man        Manual duty ON/OFF (manetka ignorowana gdy ON)");
+    Serial.println("gdbg       Debug SINUS/BLOCK ON/OFF (co 200ms)");
+    Serial.println("so         Pokaż aktualny sine phase offset");
+    Serial.println("so+        Offset +2 wpisy (+7.5°)");
+    Serial.println("so-        Offset -2 wpisy (-7.5°)");
+    Serial.println("so:N       Ustaw offset na N (-48..+48, 1=3.75°)");
+    Serial.println("sat        Auto-tune offsetu fazy (sweep -24..+24, ~25s)");
+    Serial.println("sat:M:N    Auto-tune zakres M..N  (np. sat:-16:16)");
+    Serial.println("sat:M:N:S  Auto-tune zakres M..N krok S (np. sat:-8:8:1)");
+    Serial.println("h          Pokaż tę pomoc");
     Serial.println("---------- Test MOSFET (diagnostyka) ----------");
     Serial.println("tAH        Test faza A HIGH-side");
     Serial.println("tAL        Test faza A LOW-side");
@@ -1654,6 +2259,7 @@ void printHelp() {
     Serial.println("t0         Wyłącz test MOSFET (wszystkie OFF)");
     Serial.println("t          Pokaż pomoc trybu testowego");
     Serial.println("---------- Konfiguracja NVS ----------");
+    Serial.println("cfg            Poka\u017c aktualn\u0105 konfiguracj\u0119 NVS");
     Serial.println("cfg:mode:N    Tryb boot (1=BLOCK 2=SIN 3=FOC)");
     Serial.println("cfg:ramp:N    Czas rampy [ms] 0-10000");
     Serial.println("cfg:regen:N   Regeneracja boot (0/1)");
@@ -1857,46 +2463,13 @@ static String mosfetTestSetDuty(int pct) {
 /**
  * @brief Przetwarza wszystkie dostępne bajty z bufora Serial.
  *
- * Komendy jednoznakowe (e, d, r, +, -, s, a, h, R, b, P) są obsługiwane natychmiast
- * (bez Enter). Pozostałe znaki buforowane do Enter — wtedy przekazywane do
- * wspólnej executeCommand() (obsługuje też cfg:param:value i numeryczne duty).
- *
- * Komendy:
- * | Znak   | Akcja |
- * |--------|-------|
- * | e      | Włącz BLOCK mode |
- * | d      | Wyłącz silnik, duty=0 |
- * | r      | Odwróć kierunek (tylko gdy off) |
- * | +/-    | Duty ±5% |
- * | 0-100  | Ustaw duty w % (Enter) |
- * | R      | Regeneracja ON/OFF |
- * | b      | Symulacja hamulca ON/OFF |
- * | P      | Pokaż parametry wyświetlacza P01-P20 |
- * | s      | Jednorazowy status |
- * | a      | Toggle auto-status co 1 s |
- * | h      | Pomoc |
- * | cfg:.. | Komendy konfiguracyjne (Enter) |
+ * Wszystkie komendy wymagają Enter. Znaki buforowane do '\n'/'\r',
+ * wtedy przekazywane do executeCommand().
  */
 void processSerialCommands() {
     while (Serial.available()) {
         char c = Serial.read();
 
-        // Komendy jednoznakowe — natychmiast, bez Enter
-        const char* immediateCmds = "edrs+-haRbP";
-        bool isImmediate = false;
-        for (const char* p = immediateCmds; *p; p++) {
-            if (c == *p) { isImmediate = true; break; }
-        }
-
-        if (isImmediate && serialBuffer.length() == 0) {
-            String result = executeCommand(String(c));
-            if (result.length() > 0) {
-                Serial.printf("[CMD] %s\n", result.c_str());
-            }
-            continue;
-        }
-
-        // Buforowanie do Enter
         if (c == '\n' || c == '\r') {
             if (serialBuffer.length() > 0) {
                 String result = executeCommand(serialBuffer);
@@ -1925,13 +2498,36 @@ void processSerialCommands() {
  */
 static String executeCommand(const String& cmd) {
     if (cmd == "e") {
-        g_mosfet_test_active = false;  // Wyłącz tryb testowy MOSFET
+        g_mosfet_test_active = false;
+        g_manual_duty_override = false;
         g_bldc_state.mode = DRIVE_MODE_BLOCK;
         g_bldc_state.fault = false;
         return "BLOCK ON";
     }
+    if (cmd == "m2" || cmd == "S") {
+        g_mosfet_test_active = false;
+        g_manual_duty_override = false;
+        g_bldc_state.mode = DRIVE_MODE_SINUS;
+        g_bldc_state.fault = false;
+        // Reset stanu sinusoidalnego — natychmiastowy start sinusa
+        g_sine_startup_count = 0;
+        g_sine_last_hall_idx = -1;
+        g_sine_speed_q16 = 0;
+        g_sine_dir = 1;
+        g_sine_last_hall_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        // Snap kąta do środka aktualnego sektora Halla
+        uint8_t hall_now = g_bldc_state.hall_state;
+        int8_t sector = (hall_now >= 1 && hall_now <= 6) ? g_hall_to_sector[hall_now] : 0;
+        int32_t init_entry = (int32_t)sector * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
+        if (init_entry < 0) init_entry += SINE_TABLE_SIZE;
+        if (init_entry >= SINE_TABLE_SIZE) init_entry -= SINE_TABLE_SIZE;
+        g_sine_angle_q16 = (uint32_t)init_entry << 16;
+        g_sine_running = 1;  // od razu sinus, bez block startup
+        return "SINUS ON";
+    }
     if (cmd == "d") {
         g_mosfet_test_active = false;  // Wyłącz tryb testowy MOSFET
+        g_manual_duty_override = false;
         g_bldc_state.mode = DRIVE_MODE_DISABLED;
         g_bldc_state.duty_cycle = 0;
         g_bldc_state.duty_target = 0;
@@ -1948,6 +2544,7 @@ static String executeCommand(const String& cmd) {
         return "Najpierw wylacz silnik!";
     }
     if (cmd == "+") {
+        g_manual_duty_override = true;
         if (g_bldc_state.duty_target <= PWM_MAX_DUTY - DUTY_STEP)
             g_bldc_state.duty_target += DUTY_STEP;
         else
@@ -1956,6 +2553,7 @@ static String executeCommand(const String& cmd) {
         return "Duty: " + String((int)((uint32_t)g_bldc_state.duty_target * 100 / PWM_MAX_DUTY)) + "%";
     }
     if (cmd == "-") {
+        g_manual_duty_override = true;
         if (g_bldc_state.duty_target >= DUTY_STEP)
             g_bldc_state.duty_target -= DUTY_STEP;
         else
@@ -1987,6 +2585,82 @@ static String executeCommand(const String& cmd) {
         g_lastAutoStatusMs = millis();
         return g_autoStatus ? "Auto-status: ON" : "Auto-status: OFF";
     }
+    if (cmd == "gdbg") {
+        g_debugSine = !g_debugSine;
+        g_lastDebugSineMs = millis();
+        return g_debugSine ? "Debug SINUS: ON" : "Debug SINUS: OFF";
+    }
+    if (cmd == "man") {
+        g_manual_duty_override = !g_manual_duty_override;
+        return g_manual_duty_override ? "Manual duty: ON (manetka ignorowana)" : "Manual duty: OFF (manetka aktywna)";
+    }
+    // Strojenie SINE_HALL_PHASE_OFFSET w runtime (1 wpis = 3.75° elektr.)
+    if (cmd == "so") {
+        return "Sine offset: " + String((int)g_sine_hall_phase_offset) + " (" + String((float)g_sine_hall_phase_offset * 3.75f, 1) + "°)";
+    }
+    if (cmd == "so+") {
+        int8_t o = g_sine_hall_phase_offset;
+        if (o < 47) o += 2;
+        g_sine_hall_phase_offset = o;
+        return "Sine offset: " + String((int)o) + " (" + String((float)o * 3.75f, 1) + "°)";
+    }
+    if (cmd == "so-") {
+        int8_t o = g_sine_hall_phase_offset;
+        if (o > -47) o -= 2;
+        g_sine_hall_phase_offset = o;
+        return "Sine offset: " + String((int)o) + " (" + String((float)o * 3.75f, 1) + "°)";
+    }
+    if (cmd.startsWith("so:")) {
+        int val = cmd.substring(3).toInt();
+        if (val < -48 || val > 48) return "Zakres: -48..+48 (1 wpis = 3.75°)";
+        g_sine_hall_phase_offset = (int8_t)val;
+        return "Sine offset: " + String(val) + " (" + String((float)val * 3.75f, 1) + "°)";
+    }
+    // Auto-tune fazy sinusoidalnej
+    if (cmd == "sat" || cmd.startsWith("sat:")) {
+        if (g_atune_state != ATUNE_IDLE) {
+            g_atune_state = ATUNE_IDLE;
+            g_sine_hall_phase_offset = g_atune_saved_offset;
+            g_manual_duty_override = false;
+            return "[SAT] Anulowano. Offset przywrócony: " + String((int)g_atune_saved_offset);
+        }
+        if (g_bldc_state.mode != DRIVE_MODE_SINUS) {
+            return "[SAT] Wymaga trybu SINUS! Użyj S lub m2 aby włączyć.";
+        }
+        // Opcjonalnie: sat:MIN:MAX:STEP  np. sat:-16:16:4
+        if (cmd.startsWith("sat:")) {
+            // Parsuj parametry sat:min:max[:step]
+            String params = cmd.substring(4);
+            int c1 = params.indexOf(':');
+            if (c1 > 0) {
+                int mn = params.substring(0, c1).toInt();
+                String rest = params.substring(c1 + 1);
+                int c2 = rest.indexOf(':');
+                int mx, st = 2;
+                if (c2 > 0) {
+                    mx = rest.substring(0, c2).toInt();
+                    st = rest.substring(c2 + 1).toInt();
+                } else {
+                    mx = rest.toInt();
+                }
+                if (mn < -48) mn = -48;
+                if (mx > 48) mx = 48;
+                if (st < 1) st = 1;
+                if (st > 16) st = 16;
+                if (mn >= mx) return "[SAT] Błąd: min >= max";
+                g_atune_offset_min = (int8_t)mn;
+                g_atune_offset_max = (int8_t)mx;
+                g_atune_offset_step = (int8_t)st;
+            }
+        } else {
+            // Domyślne: -24..+24 krok 2
+            g_atune_offset_min = -24;
+            g_atune_offset_max = 24;
+            g_atune_offset_step = 2;
+        }
+        g_atune_state = ATUNE_INIT;
+        return "";
+    }
     if (cmd == "P") {
         printDisplayConfig();
         return "";
@@ -2015,7 +2689,30 @@ static String executeCommand(const String& cmd) {
         return mosfetTestSet(cmd);
     }
 
-    // Komendy konfiguracyjne: cfg:param:value
+    // Komendy konfiguracyjne: cfg / cfg:param:value
+    if (cmd == "cfg") {
+        controller_config_t& cfg = config_get();
+        const char* modeNames[] = {"DISABLED", "BLOCK", "SINUS", "FOC"};
+        const char* modeName = (cfg.drive_mode <= DRIVE_MODE_FOC) ? modeNames[cfg.drive_mode] : "???";
+        Serial.println();
+        Serial.println("========== KONFIGURACJA NVS ==========");
+        Serial.printf("drive_mode:    %d (%s)\n", cfg.drive_mode, modeName);
+        Serial.printf("ramp_time_ms:  %d ms\n",   cfg.ramp_time_ms);
+        Serial.printf("regen_enabled: %d (%s)\n", cfg.regen_enabled, cfg.regen_enabled ? "ON" : "OFF");
+        Serial.printf("magic:         0x%08X %s\n", cfg.magic, (cfg.magic == CONFIG_MAGIC) ? "OK" : "BAD!");
+        Serial.printf("version:       %d\n",      cfg.version);
+        Serial.println("======================================");
+        // Runtime (bie\u017c\u0105ce, mog\u0105 r\u00f3\u017cni\u0107 si\u0119 od NVS):
+        Serial.println("--- Runtime (bie\u017c\u0105ce) ---");
+        const char* rtMode = (g_bldc_state.mode <= DRIVE_MODE_FOC) ? modeNames[g_bldc_state.mode] : "???";
+        Serial.printf("mode:          %s\n", rtMode);
+        Serial.printf("ramp_time_ms:  %d ms\n", g_bldc_state.ramp_time_ms);
+        Serial.printf("regen:         %s\n", g_bldc_state.regen_enabled ? "ON" : "OFF");
+        Serial.printf("direction:     %s\n", (g_bldc_state.direction == DIRECTION_CW) ? "CW" : "CCW");
+        Serial.printf("sine_offset:   %d (%.1f\u00b0)\n", (int)g_sine_hall_phase_offset, (float)g_sine_hall_phase_offset * 3.75f);
+        Serial.println();
+        return "";
+    }
     if (cmd.startsWith("cfg:")) {
         controller_config_t& cfg = config_get();
         if (cmd.startsWith("cfg:mode:")) {
@@ -2062,6 +2759,7 @@ static String executeCommand(const String& cmd) {
         int pct = cmd.toInt();
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
+        g_manual_duty_override = true;
         g_bldc_state.duty_target = (uint16_t)((uint32_t)pct * PWM_MAX_DUTY / 100);
         g_duty_ramped = g_bldc_state.duty_target;
         return "Duty: " + String(pct) + "%";
