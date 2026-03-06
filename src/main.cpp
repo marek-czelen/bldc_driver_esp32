@@ -191,10 +191,20 @@ static const DRAM_ATTR int8_t g_hall_to_sector[8] = {
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prędkość startowa ≈ 1 obr.elekt./s (52428800/166666)
 #define SINE_STALL_FALLBACK_MS  400             // minimalny timeout fallback (histereza, anty-szarpanie)
 #define SINE_START_MAX_HALL_US  30000           // max okres Halla (min prędkość) do wejścia w SINUS
-#define SINE_PHASE_CORR_SHIFT   3               // korekcja 1/8 błędu na przejście Halla
-#define SINE_SPEED_FILTER_SHIFT 2               // filtr prędkości: 1/4 new + 3/4 old
-#define SINE_SAFE_MAX_DUTY      (PWM_MAX_DUTY * 45 / 100)  // limit bezpieczeństwa dla trybu sinus
+#define SINE_PHASE_CORR_SHIFT   2               // korekcja 1/4 błędu na przejście Halla
+#define SINE_SPEED_FILTER_SHIFT 1               // filtr prędkości: 1/2 new + 1/2 old
+#define SINE_SNAP_THRESHOLD     (24 << 16)       // błąd > 1/4 obrotu elektr. → pełny snap kąta
+#define SINE_SAFE_MAX_DUTY      (PWM_MAX_DUTY * 75 / 100)  // SVPWM: liniowy do 58%, overmod do 75%, powyżej szkodliwe harmoniczne
 #define SINE_MIN_AMPLITUDE      15              // poniżej tego coast (center-aligned 50% = hamowanie)
+
+/// Debounce czujników Halla: minimalna przerwa między przejściami [us].
+/// W trybie SINUS 6 FETów przekłądają jednocześnie (center-aligned PWM),
+/// generując znacznie więcej EMI niż BLOCK (2 FETy). Szumy sprzegają się
+/// w linie Halla i tworzą fałszywe przejścia (dt ~50us = 1 tick ISR).
+/// Bez debounce: hall_period_us = 50us → speed_q16 = 1M → kąt ucieka → desync.
+/// 200us = 4 ticki ISR, bezpieczne do ~50k eRPM (daleko poza realnym motorem).
+#define HALL_MIN_PERIOD_US      200
+#define DEFAULT_P07_STANDALONE  90              // domyślne P07 gdy brak wyświetlacza (6 × 15 par biegunów)
 
 /// Limit duty regen — 80% max (musi zostać czas OFF na transfer energii do baterii)
 #define REGEN_MAX_DUTY  (PWM_MAX_DUTY * 80 / 100)
@@ -916,24 +926,9 @@ void loop() {
     g_direction_isr = g_bldc_state.direction;
     g_mode_isr = g_bldc_state.mode;
 
-    // Prekalkulacja prędkości sinusoidalnej z okresu Halla.
-    // speed_q16 = (SINE_SECTOR_ENTRIES × ISR_PERIOD_US) << 16 / hall_period
-    //           = (16 × 50) << 16 / p = 52428800 / p
-    // Filtr EMA: 3/4 old + 1/4 new (identycznie jak bldc_driver_v2)
-    {
-        static uint32_t prev_hall_period = 0;
-        uint32_t p = g_hall_period_us;
-        if (p != prev_hall_period && p > 0 && p < 500000) {
-            uint32_t new_speed = 52428800UL / p;
-            uint32_t old_speed = g_sine_speed_q16;
-            if (old_speed == 0) {
-                g_sine_speed_q16 = new_speed;  // pierwszy pomiar — bez filtra
-            } else {
-                g_sine_speed_q16 = (old_speed * 3 + new_speed) >> SINE_SPEED_FILTER_SHIFT;
-            }
-            prev_hall_period = p;
-        }
-    }
+    // Prędkość sinusoidalna (speed_q16) jest teraz obliczana bezpośrednio
+    // w ISR (onCommutationTimer) na przejściu Halla — bez opóźnienia loop().
+    // Tu nie ma nic do roboty — zostawione jako komentarz dla czytelności.
 
     // Obliczanie mocy: P = Vbat × max(Ia, Ib, Ic)
     {
@@ -1002,8 +997,13 @@ void loop() {
         uint8_t p07 = g_display.config.p07_speed_magnets;
         uint32_t wt_us = 0;
 
+        // Gdy brak wyświetlacza i p07==0 → fallback na Halle z domyślnym P07
+        if (p07 == 0 && !g_display.connected) {
+            p07 = DEFAULT_P07_STANDALONE;
+        }
+
         if (p07 <= 1) {
-            // P07==0 lub P07==1: czujnik zewnętrzny SPEED (1 magnes na koło)
+            // P07==1: czujnik zewnętrzny SPEED (1 magnes na koło)
             uint32_t sp = g_speed_period_us;  // volatile → local copy
             uint32_t last = g_speed_last_pulse_us;
             uint32_t now_us = (uint32_t)esp_timer_get_time();
@@ -1521,69 +1521,101 @@ void IRAM_ATTR onCommutationTimer() {
     uint8_t hall = (hc << 2) | (hb << 1) | ha;
 
     // Pomiar czasu między przejściami Halla → RPM (niezależnie od stanu silnika)
+    // DEBOUNCE: ignoruj przejścia szybsze niż HALL_MIN_PERIOD_US.
+    // W trybie SINUS 6 FETów na center-aligned PWM generuje silne EMI,
+    // które sprzega się w linie Halla tworząc fałszywe przejścia.
+    // Bez debounce: hall_period = 50us → speed ucieka → kąt ucieka → desync.
     if (hall != g_hall_prev_isr) {
         uint32_t now_us = (uint32_t)esp_timer_get_time();
-        g_dbg_hall_edges++;
-        g_dbg_last_hall = hall;
-        if (g_hall_last_change_us > 0) {
-            g_hall_period_us = now_us - g_hall_last_change_us;
-        }
-        g_hall_last_change_us = now_us;
-        g_hall_prev_isr = hall;
+        uint32_t dt_us = now_us - g_hall_last_change_us;
 
-        // ── Sine mode: przetwarzanie przejścia Halla ──
-        // Port z bldc_driver_v2: bldc_hall_interrupt()
-        if (g_mode_isr == DRIVE_MODE_SINUS) {
-            g_sine_last_hall_ms = (uint32_t)(now_us / 1000);  // stall detection timestamp
+        // Debounce: akceptuj przejście tylko jeśli minęło wystarczająco dużo czasu
+        // od ostatniego POTWIERDZONEGO przejścia (lub pierwszy pomiar)
+        if (g_hall_last_change_us == 0 || dt_us >= HALL_MIN_PERIOD_US) {
+            g_dbg_hall_edges++;
+            g_dbg_last_hall = hall;
+            if (g_hall_last_change_us > 0) {
+                g_hall_period_us = dt_us;
+            }
+            g_hall_last_change_us = now_us;
+            g_hall_prev_isr = hall;
 
-            int8_t new_idx = g_hall_to_sector[hall];
-            if (new_idx >= 0) {
-                int8_t old_idx = g_sine_last_hall_idx;
+            // ── Sine mode: przetwarzanie przejścia Halla ──
+            // Port z bldc_driver_v2: bldc_hall_interrupt()
+            if (g_mode_isr == DRIVE_MODE_SINUS) {
+                g_sine_last_hall_ms = (uint32_t)(now_us / 1000);  // stall detection timestamp
 
-                // Detekcja kierunku z sekwencji przejść Halla
-                if (old_idx >= 0) {
-                    int8_t fwd = (old_idx + 1) % 6;
-                    int8_t rev = (new_idx + 1) % 6;
-                    if (new_idx == fwd) {
-                        g_sine_dir = 1;   // forward (CW)
-                    } else if (old_idx == rev) {
-                        g_sine_dir = -1;  // reverse (CCW)
+                // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
+                // Krytyczne: obliczanie w loop() dawało opóźnienie 1-50ms
+                // (Serial.printf), co przy 500 RPM = 20-1000 ISR ticków
+                // z nieaktualną prędkością → kąt ucieka → desync.
+                // 32-bit dzielenie na ESP32 Xtensa jest bezpieczne w ISR
+                // (LoadStoreError dotyczy tylko byte-access do IRAM, nie ALU).
+                if (dt_us >= HALL_MIN_PERIOD_US && dt_us < 500000) {
+                    uint32_t new_speed = 52428800UL / dt_us;
+                    uint32_t old_speed = g_sine_speed_q16;
+                    if (old_speed == 0) {
+                        g_sine_speed_q16 = new_speed;
+                    } else {
+                        g_sine_speed_q16 = (old_speed + new_speed) >> SINE_SPEED_FILTER_SHIFT;
                     }
                 }
 
-                // Korekcja kąta na przejściu Halla
-                // Oczekiwany kąt = środek sektora + offset fazowy Halla
-                int32_t expected_entry = (int32_t)new_idx * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
-                if (expected_entry < 0) expected_entry += SINE_TABLE_SIZE;
-                if (expected_entry >= SINE_TABLE_SIZE) expected_entry -= SINE_TABLE_SIZE;
-                int32_t expected = expected_entry << 16;
-                int32_t current = (int32_t)g_sine_angle_q16;
-                int32_t err = expected - current;
-                // Wrap error to [-48<<16, +48<<16] (half revolution)
-                if (err > (int32_t)(SINE_TABLE_Q16_FULL >> 1)) err -= (int32_t)SINE_TABLE_Q16_FULL;
-                if (err < -(int32_t)(SINE_TABLE_Q16_FULL >> 1)) err += (int32_t)SINE_TABLE_Q16_FULL;
+                int8_t new_idx = g_hall_to_sector[hall];
+                if (new_idx >= 0) {
+                    int8_t old_idx = g_sine_last_hall_idx;
 
-                if (g_sine_speed_q16 == 0) {
-                    // Przy starcie/crawl: pełny snap kąta na środek sektora
-                    // (nie 1/8 korekcji — krokowe przesuwanie pola)
-                    g_sine_angle_q16 = (uint32_t)expected;
-                } else {
-                    // Normalna praca: łagodna korekcja 1/8 błędu
-                    g_sine_angle_q16 = (uint32_t)(current + (err >> SINE_PHASE_CORR_SHIFT));
-                }
-                // Wrap angle
-                if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
-                    g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
-                }
+                    // Detekcja kierunku z sekwencji przejść Halla
+                    if (old_idx >= 0) {
+                        int8_t fwd = (old_idx + 1) % 6;
+                        int8_t rev = (new_idx + 1) % 6;
+                        if (new_idx == fwd) {
+                            g_sine_dir = 1;   // forward (CW)
+                        } else if (old_idx == rev) {
+                            g_sine_dir = -1;  // reverse (CCW)
+                        }
+                    }
 
-                g_sine_last_hall_idx = new_idx;
+                    // Korekcja kąta na przejściu Halla
+                    // Oczekiwany kąt = środek sektora + offset fazowy Halla
+                    int32_t expected_entry = (int32_t)new_idx * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
+                    if (expected_entry < 0) expected_entry += SINE_TABLE_SIZE;
+                    if (expected_entry >= SINE_TABLE_SIZE) expected_entry -= SINE_TABLE_SIZE;
+                    int32_t expected = expected_entry << 16;
+                    int32_t current = (int32_t)g_sine_angle_q16;
+                    int32_t err = expected - current;
+                    // Wrap error to [-48<<16, +48<<16] (half revolution)
+                    if (err > (int32_t)(SINE_TABLE_Q16_FULL >> 1)) err -= (int32_t)SINE_TABLE_Q16_FULL;
+                    if (err < -(int32_t)(SINE_TABLE_Q16_FULL >> 1)) err += (int32_t)SINE_TABLE_Q16_FULL;
 
-                // Licznik przejść Halla (statystyka, nie blokuje startu sinusa)
-                if (g_sine_startup_count < 255) {
-                    g_sine_startup_count++;
+                    int32_t abs_err = (err >= 0) ? err : -err;
+
+                    if (g_sine_speed_q16 == 0) {
+                        // Przy starcie/crawl: pełny snap kąta na środek sektora
+                        g_sine_angle_q16 = (uint32_t)expected;
+                    } else if (abs_err > SINE_SNAP_THRESHOLD) {
+                        // Duży błąd (>90° elektr.) = desync → pełny snap
+                        // Zapobiega pozytywnej pętli zwrotnej: błąd→mniej momentu→stall
+                        g_sine_angle_q16 = (uint32_t)expected;
+                    } else {
+                        // Normalna praca: łagodna korekcja 1/4 błędu
+                        g_sine_angle_q16 = (uint32_t)(current + (err >> SINE_PHASE_CORR_SHIFT));
+                    }
+                    // Wrap angle
+                    if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+                        g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+                    }
+
+                    g_sine_last_hall_idx = new_idx;
+
+                    // Licznik przejść Halla (statystyka, nie blokuje startu sinusa)
+                    if (g_sine_startup_count < 255) {
+                        g_sine_startup_count++;
+                    }
                 }
             }
         }
+        // else: szum EMI — ignoruj (nie aktualizuj prev ani timestamp)
     }
 
     // Tryb testu MOSFET — ISR nie dotyka kanałów LEDC, tylko mierzy Hall/prędkość
@@ -1887,29 +1919,41 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     g_dbg_last_mb = (int16_t)mb;
     g_dbg_last_mc = (int16_t)mc;
 
-    // ── 5. Write LEDC (center-aligned complementary PWM) ──
-    // duty = 512 + modulation; obie gałęzie (HIN, LIN) dostają TEN SAM duty.
-    // IR2103 z odwróconym LIN tworzy naturalnie komplementarne przełączanie:
-    //   HIN=HIGH, LIN=HIGH → HS ON, LS OFF → phase = Vbus
-    //   HIN=LOW,  LIN=LOW  → HS OFF, LS ON → phase = GND
-    // Sygnały są zsynchronizowane (ten sam timer LEDC), więc żaden moment
-    // nie ma HS ON + LS ON jednocześnie. Dead-time IR2103 ~520ns obsługuje przejścia.
+    // ── 5. Write LEDC — SVPWM (Space Vector PWM / min-max centering) ──
+    // Zamiast stałej bazy 512, przesuwamy wszystkie 3 modulacje razem tak,
+    // żeby mieściły się w zakresie 0..PWM_MAX_DUTY bez klipowania.
+    // Offset = 512 - (max+min)/2 to zero-sequence (common-mode) składowa,
+    // która nie wpływa na napięcie linia-linia, ale zwiększa zakres liniowy
+    // o 15.5% (z Vbus*√3/2 do Vbus) — identycznie jak SVPWM.
+    //
+    // Bez SVPWM: amp > 512 → klipowanie → brak wzrostu napięcia fundamentalnego
+    // Z SVPWM:   amp do ~591 → pełny Vbus bez zniekształceń
+    //
+    // IR2103: HIN i LIN dostają TEN SAM duty → komplementarne przełączanie
+    // z wbudowanym dead-time ~520ns.
     {
-        int32_t da = 512 + ma;
+        // Min-max centering (SVPWM)
+        int32_t mn = ma;
+        if (mb < mn) mn = mb;
+        if (mc < mn) mn = mc;
+        int32_t mx = ma;
+        if (mb > mx) mx = mb;
+        if (mc > mx) mx = mc;
+        int32_t offset = 512 - ((mx + mn) >> 1);
+
+        int32_t da = offset + ma;
         if (da < 0) da = 0;
         if (da > (int32_t)PWM_MAX_DUTY) da = (int32_t)PWM_MAX_DUTY;
         ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
         ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
-    }
-    {
-        int32_t db = 512 + mb;
+
+        int32_t db = offset + mb;
         if (db < 0) db = 0;
         if (db > (int32_t)PWM_MAX_DUTY) db = (int32_t)PWM_MAX_DUTY;
         ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
         ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
-    }
-    {
-        int32_t dc = 512 + mc;
+
+        int32_t dc = offset + mc;
         if (dc < 0) dc = 0;
         if (dc > (int32_t)PWM_MAX_DUTY) dc = (int32_t)PWM_MAX_DUTY;
         ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc);
