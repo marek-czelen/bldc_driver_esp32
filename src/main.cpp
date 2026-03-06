@@ -67,6 +67,37 @@ volatile int8_t   g_sine_dir = 1;              ///< Kierunek z przejść Halla: 
 volatile uint32_t g_sine_last_hall_ms = 0;     ///< HAL tick ostatniego przejścia Halla (stall detection)
 volatile int8_t   g_sine_hall_phase_offset = 0; ///< Runtime-tunable Hall phase offset (-48..+48 entries, 1 entry = 3.75°)
 
+// FOC state — regulatory PI i wektory napięciowe
+struct foc_pi_t {
+    float kp;
+    float ki;
+    float integral;
+    float limit;
+};
+// Inicjalizacja g_foc_pi_d/q: wartości domyślne ustawiane w setup()
+// (SINE_SAFE_MAX_DUTY jeszcze nie zdefiniowany w tym momencie pliku)
+static foc_pi_t g_foc_pi_d = {0};
+static foc_pi_t g_foc_pi_q = {0};
+volatile int32_t g_foc_vd_i = 0;          ///< Napięcie d do ISR (jednostki PWM: -SAFE_MAX..+SAFE_MAX)
+volatile int32_t g_foc_vq_i = 0;          ///< Napięcie q do ISR (jednostki PWM)
+volatile float g_foc_iq_target = 0.0f;    ///< Docelowy prąd Iq [A] (torque)
+// Debug/pomiar FOC (zapisywane w loop, czytane w diagnostyce)
+static float g_foc_id_meas = 0.0f;       ///< Zmierzony Id [A]
+static float g_foc_iq_meas = 0.0f;       ///< Zmierzony Iq [A]
+static float g_foc_vd_dbg = 0.0f;        ///< Kopia Vd do debugowania (float, non-volatile)
+static float g_foc_vq_dbg = 0.0f;        ///< Kopia Vq do debugowania (float, non-volatile)
+static float g_foc_ia_signed = 0.0f;     ///< Prąd fazy A [A] (surowy, przed klipowaniem)
+static float g_foc_ib_signed = 0.0f;     ///< Prąd fazy B [A]
+static float g_foc_ic_signed = 0.0f;     ///< Prąd fazy C [A]
+// EMA-filtrowane prądy dla FOC (wygładzenie sporadycznych odczytów ADC)
+static float g_foc_ia_ema = 0.0f;        ///< EMA Ia [A]
+static float g_foc_ib_ema = 0.0f;        ///< EMA Ib [A]
+static float g_foc_ic_ema = 0.0f;        ///< EMA Ic [A]
+static bool g_foc_debug = false;          ///< Debug FOC (komenda fdbg)
+static bool g_foc_voltage_mode = false;   ///< Tryb napięciowy: Vq = duty wprost, bez PI
+static unsigned long g_foc_last_debug_ms = 0;
+static unsigned long g_foc_last_loop_us = 0;  ///< Timestamp ostatniej iteracji FOC loop
+
 // Debug sterowania sinusoidalnego (snapshot + liczniki zdarzeń ISR)
 volatile uint32_t g_dbg_hall_edges = 0;
 volatile uint32_t g_dbg_sine_enter_count = 0;
@@ -206,6 +237,24 @@ static const DRAM_ATTR int8_t g_hall_to_sector[8] = {
 #define HALL_MIN_PERIOD_US      200
 #define DEFAULT_P07_STANDALONE  90              // domyślne P07 gdy brak wyświetlacza (6 × 15 par biegunów)
 
+// ── FOC (Field Oriented Control) ──
+// Architektura: pętla prądowa w loop() (~2kHz), modulacja SVPWM w ISR (20kHz).
+// loop(): czyta prądy ADC → Clarke → Park → PI(Id,Iq) → zapisuje Vd,Vq (volatile)
+// ISR: czyta Vd,Vq → InvPark(θ) → InvClarke → SVPWM → ledcWrite
+// Kąt θ: współdzielony z SINUS (Hall tracking + interpolacja Q16)
+#define FOC_KP_DEFAULT      0.5f    ///< Domyślne Kp regulatora PI d/q (PWM/A)
+#define FOC_KI_DEFAULT      5.0f    ///< Domyślne Ki regulatora PI d/q (PWM/(A·s))
+#define FOC_INTEGRAL_LIMIT  ((float)SINE_SAFE_MAX_DUTY)  ///< Absolutny max integrala (anti-windup)
+#define FOC_PI_CORR_LIMIT   100.0f  ///< Max korekta PI wokół feedforward [±PWM]
+#define FOC_IQ_MAX          10.0f   ///< Maksymalny prąd Iq target [A]
+#define FOC_LOOP_DT         0.0005f ///< Przybliżony dt pętli prądowej [s] (~2kHz loop)
+#define FOC_INV_SQRT3       0.57735026919f  ///< 1/√3
+#define FOC_SQRT3           1.73205080757f  ///< √3
+#define FOC_CURRENT_EMA_ALPHA  0.05f ///< EMA α dla prądów FOC (~2kHz → τ≈10ms)
+                                     //   Uśrednia sporadyczne odczyty ADC (analogRead
+                                     //   nie jest zsynchr. z PWM, INA180A2 widzi prąd
+                                     //   tylko gdy low-side ON → ~50% odczytów = 0)
+
 /// Limit duty regen — 80% max (musi zostać czas OFF na transfer energii do baterii)
 #define REGEN_MAX_DUTY  (PWM_MAX_DUTY * 80 / 100)
 /// Minimalne RPM poniżej którego regen jest nieefektywny (tylko grzeje)
@@ -232,6 +281,8 @@ void blockCommutate(uint8_t hallState, uint16_t duty);
 void processSerialCommands();
 static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir);
 static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude);
+static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude);
+static inline int32_t IRAM_ATTR sine_interp_q16(uint32_t angle_q16);
 static void printSineDebug();
 static String executeCommand(const String& cmd);
 static String mosfetTestSet(const String& which);
@@ -628,6 +679,10 @@ void setup() {
     g_bldc_state.ramp_time_ms = cfg.ramp_time_ms;
     g_bldc_state.regen_enabled = (cfg.regen_enabled != 0);
 
+    // Inicjalizacja regulatorów PI dla FOC
+    g_foc_pi_d = {FOC_KP_DEFAULT, FOC_KI_DEFAULT, 0.0f, FOC_INTEGRAL_LIMIT};
+    g_foc_pi_q = {FOC_KP_DEFAULT, FOC_KI_DEFAULT, 0.0f, FOC_INTEGRAL_LIMIT};
+
     // Inicjalizacja GPIO
     initGPIO();
     Serial.println("[OK] GPIO zainicjalizowane");
@@ -918,6 +973,151 @@ void loop() {
         g_bldc_state.duty_cycle = g_duty_ramped;
     }
 
+    // ============================================================================
+    // FOC: pętla prądowa (Clarke → Park → PI → Vd/Vq)
+    // ============================================================================
+    // Działa z częstotliwością loop() (~2kHz). ISR (20kHz) odczytuje Vd/Vq
+    // i generuje SVPWM z aktualnym kątem θ (inverse Park + inverse Clarke).
+    if (g_bldc_state.mode == DRIVE_MODE_FOC) {
+        if (g_bldc_state.duty_cycle > 0) {
+            // ── Tryb napięciowy (fvolt): Vq = duty, Vd = 0, bez PI ──
+            // Działa identycznie jak SINUS ale w ramie dq.
+            // Pozwala porównać "sinus vs FOC" i wykluczyć PI jako źródło hałasu.
+            if (g_foc_voltage_mode) {
+                float vq = (float)g_bldc_state.duty_cycle;
+                if (vq > (float)SINE_SAFE_MAX_DUTY) vq = (float)SINE_SAFE_MAX_DUTY;
+                g_foc_vd_i = 0;
+                g_foc_vq_i = (int32_t)vq;
+                g_foc_vd_dbg = 0.0f;
+                g_foc_vq_dbg = vq;
+                g_foc_iq_target = vq;  // dla debug wyświetlania
+                g_foc_id_meas = 0.0f;
+                g_foc_iq_meas = 0.0f;
+            } else {
+            // ── Tryb PI (normalny FOC) ──
+
+            // 1. Mapowanie duty → Iq target (torque)
+            g_foc_iq_target = (float)g_bldc_state.duty_cycle * FOC_IQ_MAX / (float)PWM_MAX_DUTY;
+
+            // 2. Feedforward napięciowy: Vq_ff = duty (natychmiastowe napięcie)
+            // PI dodaje tylko małą korektę wokół tego punktu pracy.
+            // Bez feedforward: PI integruje od zera do limitu
+            // → przy Ki=5, err=1.5A → ~7.5 PWM/s → 20s do 153 PWM.
+            // Z feedforward: Vq = duty natychmiast + PI(±korekta).
+            float ff_vq = (float)g_bldc_state.duty_cycle;
+            if (ff_vq > (float)SINE_SAFE_MAX_DUTY) ff_vq = (float)SINE_SAFE_MAX_DUTY;
+            // Feedforward dla Vd = 0 (chcemy Id = 0)
+            float ff_vd = 0.0f;
+
+            // Globalny limit napięcia (bezpieczeństwo)
+            float amp_limit = ff_vq;  // max = feedforward (duty)
+
+            // PI limit = mała korekta wokół feedforward
+            float pi_limit = FOC_PI_CORR_LIMIT;
+            if (pi_limit > amp_limit) pi_limit = amp_limit;  // korekta nie większa niż FF
+            g_foc_pi_d.limit = pi_limit;
+            g_foc_pi_q.limit = pi_limit;
+
+            // 3. Rekonstrukcja prądów ze znakiem (INA180A2 jest jednokierunkowy)
+            // Użyj EMA-filtrowanych prądów (wygładzone z niesynchr. ADC).
+            // Czujnik klipuje prąd ujemny do ~0V. Kirchhoff: Ia+Ib+Ic=0,
+            // więc faza z najmniejszym odczytem = -(suma pozostałych dwóch).
+            float ia = g_foc_ia_ema;
+            float ib = g_foc_ib_ema;
+            float ic = g_foc_ic_ema;
+
+            if (ia <= ib && ia <= ic) {
+                ia = -(ib + ic);
+            } else if (ib <= ia && ib <= ic) {
+                ib = -(ia + ic);
+            } else {
+                ic = -(ia + ib);
+            }
+
+            // 4. Clarke: Ia,Ib,Ic → Iα,Iβ
+            float i_alpha = ia;
+            float i_beta  = (ia + 2.0f * ib) * FOC_INV_SQRT3;
+
+            // 5. Park: Iα,Iβ → Id,Iq (używając aktualnego kąta z ISR)
+            // Znaki dopasowane do konwencji inverse Park (zob. focCommutateISR):
+            //   Id =  Iα·cos + Iβ·sin
+            //   Iq =  Iα·sin - Iβ·cos
+            uint32_t angle = g_sine_angle_q16;  // volatile → local copy
+            int32_t sin_val = sine_interp_q16(angle);
+            uint32_t cos_angle = angle + (24UL << 16);  // +90°
+            if (cos_angle >= SINE_TABLE_Q16_FULL) cos_angle -= SINE_TABLE_Q16_FULL;
+            int32_t cos_val = sine_interp_q16(cos_angle);
+            float sin_f = (float)sin_val * (1.0f / 1024.0f);
+            float cos_f = (float)cos_val * (1.0f / 1024.0f);
+
+            float id =  i_alpha * cos_f + i_beta * sin_f;
+            float iq =  i_alpha * sin_f - i_beta * cos_f;
+            g_foc_id_meas = id;
+            g_foc_iq_meas = iq;
+
+            // 6. Oblicz dt (czas od ostatniej iteracji)
+            unsigned long now_foc_us = micros();
+            float dt = (float)(now_foc_us - g_foc_last_loop_us) / 1000000.0f;
+            g_foc_last_loop_us = now_foc_us;
+            if (dt <= 0.0f || dt > 0.05f) dt = FOC_LOOP_DT;  // clamp (max 50ms)
+
+            // 7. PI regulator osi d: target Id = 0 (MTPA — max torque per amp)
+            float err_d = 0.0f - id;
+            g_foc_pi_d.integral += g_foc_pi_d.ki * err_d * dt;
+            if (g_foc_pi_d.integral >  pi_limit) g_foc_pi_d.integral =  pi_limit;
+            if (g_foc_pi_d.integral < -pi_limit) g_foc_pi_d.integral = -pi_limit;
+            float corr_d = g_foc_pi_d.kp * err_d + g_foc_pi_d.integral;
+            if (corr_d >  pi_limit) corr_d =  pi_limit;
+            if (corr_d < -pi_limit) corr_d = -pi_limit;
+            float vd = ff_vd + corr_d;  // feedforward + korekta
+
+            // 8. PI regulator osi q: target Iq z przepustnicy
+            float err_q = g_foc_iq_target - iq;
+            g_foc_pi_q.integral += g_foc_pi_q.ki * err_q * dt;
+            if (g_foc_pi_q.integral >  pi_limit) g_foc_pi_q.integral =  pi_limit;
+            if (g_foc_pi_q.integral < -pi_limit) g_foc_pi_q.integral = -pi_limit;
+            float corr_q = g_foc_pi_q.kp * err_q + g_foc_pi_q.integral;
+            if (corr_q >  pi_limit) corr_q =  pi_limit;
+            if (corr_q < -pi_limit) corr_q = -pi_limit;
+            float vq = ff_vq + corr_q;  // feedforward + korekta
+
+            // 9. Clamp globalny: Vd,Vq do bezpiecznego zakresu
+            float v_max = (float)SINE_SAFE_MAX_DUTY;
+            if (vd >  v_max) vd =  v_max;
+            if (vd < -v_max) vd = -v_max;
+            if (vq >  v_max) vq =  v_max;
+            if (vq < -v_max) vq = -v_max;
+
+            // 10. Clamp wektora napięciowego: |V| ≤ SINE_SAFE_MAX_DUTY
+            float v_mag_sq = vd * vd + vq * vq;
+            float v_lim_sq = v_max * v_max;
+            if (v_mag_sq > v_lim_sq && v_mag_sq > 0.01f) {
+                float scale = v_max / sqrtf(v_mag_sq);
+                vd *= scale;
+                vq *= scale;
+                g_foc_pi_d.integral *= scale;
+                g_foc_pi_q.integral *= scale;
+            }
+
+            // 11. Zapisz Vd/Vq dla ISR (inverse Park + SVPWM) jako int32_t
+            // ISR NIE może używać float (brak zapisu kontekstu FPU w timer ISR).
+            g_foc_vd_i = (int32_t)vd;
+            g_foc_vq_i = (int32_t)vq;
+            g_foc_vd_dbg = vd;  // kopia float do debugowania
+            g_foc_vq_dbg = vq;
+            }  // koniec else (tryb PI)
+        } else {
+            // Duty = 0 → reset PI integratorów
+            g_foc_pi_d.integral = 0.0f;
+            g_foc_pi_q.integral = 0.0f;
+            g_foc_vd_i = 0;
+            g_foc_vq_i = 0;
+            g_foc_vd_dbg = 0.0f;
+            g_foc_vq_dbg = 0.0f;
+            g_foc_iq_target = 0.0f;
+        }
+    }
+
     // Aktualizacja zmiennych ISR z głównego stanu
     g_hall_isr = g_bldc_state.hall_state;
     g_duty_isr = g_bldc_state.duty_cycle;
@@ -1053,6 +1253,18 @@ void loop() {
     if (g_debugSine && (millis() - g_lastDebugSineMs >= DEBUG_SINE_INTERVAL_MS)) {
         g_lastDebugSineMs = millis();
         printSineDebug();
+    }
+
+    // Debug FOC co 200ms
+    if (g_foc_debug && g_bldc_state.mode == DRIVE_MODE_FOC
+        && (millis() - g_foc_last_debug_ms >= 200)) {
+        g_foc_last_debug_ms = millis();
+        Serial.printf("[FOC%s] Vd=%5.1f Vq=%5.1f | Id=%5.2f Iq=%5.2f | tgt=%4.1f lim=%3.0f ff=%3.0f | ia=%5.2f ib=%5.2f ic=%5.2f\n",
+            g_foc_voltage_mode ? "-V" : "-PI",
+            g_foc_vd_dbg, g_foc_vq_dbg, g_foc_id_meas, g_foc_iq_meas,
+            g_foc_iq_target, g_foc_pi_q.limit,
+            (float)g_bldc_state.duty_cycle,  // feedforward value
+            g_foc_ia_ema, g_foc_ib_ema, g_foc_ic_ema);
     }
 
     // Auto-tune fazy sinusoidalnej (maszyna stanów)
@@ -1290,6 +1502,22 @@ void readAnalogInputs() {
     float ia = (phaseA_V - g_currentOffsetV[0]) * kCurrentScale;
     float ib = (phaseB_V - g_currentOffsetV[1]) * kCurrentScale;
     float ic = (phaseC_V - g_currentOffsetV[2]) * kCurrentScale;
+
+    // FOC: zapisz prądy przed klipowaniem (Clarke/Park potrzebuje wartości ze znakiem)
+    g_foc_ia_signed = ia;
+    g_foc_ib_signed = ib;
+    g_foc_ic_signed = ic;
+
+    // FOC: EMA filtr prądów — wygładza sporadyczne odczyty z niesynchr. ADC.
+    // INA180A2 mierzy prąd tylko gdy low-side ON (center-aligned PWM).
+    // analogRead() trafia w low-side ON ~50% czasu → reszta to zera.
+    // EMA uśrednia to do stabilnego feedbacku dla PI regulatorów.
+    if (g_bldc_state.mode == DRIVE_MODE_FOC) {
+        g_foc_ia_ema += FOC_CURRENT_EMA_ALPHA * (ia - g_foc_ia_ema);
+        g_foc_ib_ema += FOC_CURRENT_EMA_ALPHA * (ib - g_foc_ib_ema);
+        g_foc_ic_ema += FOC_CURRENT_EMA_ALPHA * (ic - g_foc_ic_ema);
+    }
+
     if (ia < 0.0f) ia = 0.0f;
     if (ib < 0.0f) ib = 0.0f;
     if (ic < 0.0f) ic = 0.0f;
@@ -1540,9 +1768,10 @@ void IRAM_ATTR onCommutationTimer() {
             g_hall_last_change_us = now_us;
             g_hall_prev_isr = hall;
 
-            // ── Sine mode: przetwarzanie przejścia Halla ──
+            // ── Sine/FOC mode: przetwarzanie przejścia Halla ──
             // Port z bldc_driver_v2: bldc_hall_interrupt()
-            if (g_mode_isr == DRIVE_MODE_SINUS) {
+            // FOC współdzieli angle tracking z SINUS (ten sam algorytm Q16)
+            if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
                 g_sine_last_hall_ms = (uint32_t)(now_us / 1000);  // stall detection timestamp
 
                 // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
@@ -1653,9 +1882,9 @@ void IRAM_ATTR onCommutationTimer() {
     // SINUS safety fallback: gdy brak przejść Halla przez dłuższy czas → zeruj prędkość.
     // Timeout dynamiczny: max(400ms, 4*ostatni_hall_period + 20ms), aby uniknąć
     // oscylacji przy chwilowym spadku prędkości pod obciążeniem.
-    // Po zerowaniu prędkości, crawl w sinusCommutateISR wolno obraca pole,
+    // Po zerowaniu prędkości, crawl w sinusCommutateISR/focCommutateISR wolno obraca pole,
     // aż silnik da przejście Halla i prędkość zostanie przywrócona.
-    if (g_mode_isr == DRIVE_MODE_SINUS) {
+    if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         uint32_t hp_us = g_hall_period_us;
         uint32_t dyn_ms = SINE_STALL_FALLBACK_MS;
@@ -1682,10 +1911,14 @@ void IRAM_ATTR onCommutationTimer() {
             // Sinus mode — zawsze sinusoidalny (bez block startup)
             sinusCommutateISR(hall, d);
             return;
+        case DRIVE_MODE_FOC:
+            // FOC — inverse Park + SVPWM z Vd/Vq z loop()
+            focCommutateISR(hall, d);
+            return;
         case DRIVE_MODE_BLOCK:
             break;  // kontynuuj do komutacji blokowej poniżej
         default:
-            // Tryb niezaimplementowany (FOC) lub DISABLED → bezpieczny stan
+            // Tryb DISABLED → bezpieczny stan
             ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
             ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
             return;
@@ -1958,6 +2191,135 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
         if (dc > (int32_t)PWM_MAX_DUTY) dc = (int32_t)PWM_MAX_DUTY;
         ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc);
         ledcWrite(PWM_CHANNEL_C_LOW,  (uint32_t)dc);
+    }
+}
+
+// ============================================================================
+// Komutacja FOC — ISR (inverse Park + inverse Clarke + SVPWM)
+// ============================================================================
+
+/**
+ * @brief Komutacja FOC — ISR generuje SVPWM z Vd/Vq przygotowanych w loop().
+ *
+ * ## KRYTYCZNE: INTEGER-ONLY MATH
+ * Timer ISR na ESP32 (level 3 interrupt) NIE zapisuje kontekst FPU.
+ * Użycie float w ISR korumpuje rejestry koprocesora → crash (LoadProhibited).
+ * Cała arytmetyka używa int32_t, identycznie jak sinusCommutateISR.
+ *
+ * ## Algorytm ISR (arytmetyka identyczna z sinusCommutateISR)
+ * 1. Advance angle (Hall tracking + interpolacja Q16)
+ * 2. Inverse Park: Vα = (Vd·cos - Vq·sin) >> 10, Vβ = (Vd·sin + Vq·cos) >> 10
+ * 3. Inverse Clarke: Va=Vα, Vb=(-Vα+√3·Vβ)/2, Vc=(-Vα-√3·Vβ)/2
+ *    (√3 ≈ 1774/1024 w Q10)
+ * 4. SVPWM min-max centering
+ * 5. ledcWrite
+ *
+ * @param hall      Aktualny stan Halla [C:B:A] 1-6
+ * @param amplitude Duty z przepustnicy/rampy — używane tylko jako guard (>SINE_MIN_AMPLITUDE)
+ */
+static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
+    // Walidacja Halla
+    if (hall == 0 || hall == 7) {
+        allMosfetsOff();
+        return;
+    }
+
+    // Guard: bardzo małe duty → coast (identycznie jak SINUS)
+    if (amplitude < SINE_MIN_AMPLITUDE) {
+        allMosfetsOff();
+        return;
+    }
+
+    // ── 1. Stall freeze (identycznie jak SINUS) ──
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t since_hall = now_ms - g_sine_last_hall_ms;
+    uint32_t real_speed = g_sine_speed_q16;
+    bool in_crawl = (real_speed == 0);
+    bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
+
+    // ── 2. Advance angle (identycznie jak SINUS) ──
+    if (!stalled) {
+        uint32_t spd = real_speed;
+        if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
+        {
+            bool forward = (g_direction_isr == DIRECTION_CW);
+            if (forward) {
+                g_sine_angle_q16 += spd;
+                if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+                    g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+                }
+            } else {
+                if (g_sine_angle_q16 >= spd) {
+                    g_sine_angle_q16 -= spd;
+                } else {
+                    g_sine_angle_q16 = SINE_TABLE_Q16_FULL - (spd - g_sine_angle_q16);
+                }
+            }
+        }
+    }
+
+    // ── 3. Read Vd, Vq from loop() PI controller (int32_t, duty units) ──
+    int32_t vd_i = g_foc_vd_i;
+    int32_t vq_i = g_foc_vq_i;
+
+    // ── 4. Inverse Park transform (INTEGER-ONLY) ──
+    // sin_val, cos_val: -1024..+1024 (Q10)
+    //
+    // UWAGA: znaki dopasowane do konwencji kąta sinusCommutateISR.
+    // Standardowy inverse Park to: Vα = Vd·cos - Vq·sin, Vβ = Vd·sin + Vq·cos
+    // ale z naszą tabelą sinusa i mapowaniem faz A=0°, B=240°, C=120°
+    // to daje wektor obracający się w przeciwnym kierunku niż SINUS.
+    // Weryfikacja numeryczna przy θ=0°:
+    //   SINUS: A=512 B=468 C=556
+    //   Poprawiony FOC: A=512 B=468 C=556 ✔
+    //
+    // Vα = (Vd·cos + Vq·sin) >> 10
+    // Vβ = (Vd·sin - Vq·cos) >> 10
+    uint32_t angle = g_sine_angle_q16;
+    int32_t sin_val = sine_interp_q16(angle);  // -1024..+1024
+    uint32_t cos_angle = angle + (24UL << 16); // +90° (24/96 entries = 90°)
+    if (cos_angle >= SINE_TABLE_Q16_FULL) cos_angle -= SINE_TABLE_Q16_FULL;
+    int32_t cos_val = sine_interp_q16(cos_angle);
+
+    int32_t v_alpha = (vd_i * cos_val + vq_i * sin_val) >> 10;
+    int32_t v_beta  = (vd_i * sin_val - vq_i * cos_val) >> 10;
+
+    // ── 5. Inverse Clarke → 3 napięcia fazowe (INTEGER-ONLY) ──
+    // Va = Vα
+    // Vb = (-Vα + √3·Vβ) / 2    [√3 ≈ 1774/1024 w Q10]
+    // Vc = (-Vα - √3·Vβ) / 2
+    int32_t va = v_alpha;
+    int32_t sqrt3_vbeta = (1774 * v_beta) >> 10;  // √3·Vβ
+    int32_t vb = (-v_alpha + sqrt3_vbeta) >> 1;
+    int32_t vc = (-v_alpha - sqrt3_vbeta) >> 1;
+
+    // ── 6. SVPWM min-max centering (identycznie jak SINUS) ──
+    {
+        int32_t mn = va;
+        if (vb < mn) mn = vb;
+        if (vc < mn) mn = vc;
+        int32_t mx = va;
+        if (vb > mx) mx = vb;
+        if (vc > mx) mx = vc;
+        int32_t offset = 512 - ((mx + mn) >> 1);
+
+        int32_t da = offset + va;
+        if (da < 0) da = 0;
+        if (da > (int32_t)PWM_MAX_DUTY) da = (int32_t)PWM_MAX_DUTY;
+        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
+        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
+
+        int32_t db = offset + vb;
+        if (db < 0) db = 0;
+        if (db > (int32_t)PWM_MAX_DUTY) db = (int32_t)PWM_MAX_DUTY;
+        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
+        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
+
+        int32_t dc_duty = offset + vc;
+        if (dc_duty < 0) dc_duty = 0;
+        if (dc_duty > (int32_t)PWM_MAX_DUTY) dc_duty = (int32_t)PWM_MAX_DUTY;
+        ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc_duty);
+        ledcWrite(PWM_CHANNEL_C_LOW,  (uint32_t)dc_duty);
     }
 }
 
@@ -2273,6 +2635,8 @@ void printHelp() {
     Serial.println("e          Włącz tryb BLOCK sterowania");
     Serial.println("S          Włącz tryb SINUS sterowania");
     Serial.println("m2         Włącz tryb SINUS (alternatywna)");
+    Serial.println("F          Włącz tryb FOC sterowania");
+    Serial.println("m3         Włącz tryb FOC (alternatywna)");
     Serial.println("d          Wyłącz silnik (duty=0)");
     Serial.println("r          Odwróć kierunek (CW/CCW) - tylko gdy wyłączony");
     Serial.println("+/-        Zmień duty o ±5%");
@@ -2291,6 +2655,14 @@ void printHelp() {
     Serial.println("sat        Auto-tune offsetu fazy (sweep -24..+24, ~25s)");
     Serial.println("sat:M:N    Auto-tune zakres M..N  (np. sat:-16:16)");
     Serial.println("sat:M:N:S  Auto-tune zakres M..N krok S (np. sat:-8:8:1)");
+    Serial.println("---------- FOC (Field Oriented Control) ----------");
+    Serial.println("foc        Pokaż status FOC (Vd/Vq, Id/Iq, PI)");
+    Serial.println("fdbg       Debug FOC ON/OFF (co 200ms)");
+    Serial.println("fkp:N.N    Ustaw Kp obu osi d/q (0.0-100.0)");
+    Serial.println("fki:N.N    Ustaw Ki obu osi d/q (0.0-1000.0)");
+    Serial.println("fkpd:N.N   Ustaw Kp tylko osi d (0.0-100.0)");
+    Serial.println("fkid:N.N   Ustaw Ki tylko osi d (0.0-1000.0)");
+    Serial.println("fvolt      FOC voltage mode ON/OFF (Vq=duty, bez PI)");
     Serial.println("h          Pokaż tę pomoc");
     Serial.println("---------- Test MOSFET (diagnostyka) ----------");
     Serial.println("tAH        Test faza A HIGH-side");
@@ -2569,6 +2941,41 @@ static String executeCommand(const String& cmd) {
         g_sine_running = 1;  // od razu sinus, bez block startup
         return "SINUS ON";
     }
+    if (cmd == "F" || cmd == "m3") {
+        g_mosfet_test_active = false;
+        // NIE resetuj g_manual_duty_override — użytkownik może chcieć
+        // ręcznie sterować duty w FOC (man + d:60).
+        g_bldc_state.mode = DRIVE_MODE_FOC;
+        g_bldc_state.fault = false;
+        // Reset FOC PI
+        g_foc_pi_d.integral = 0.0f;
+        g_foc_pi_q.integral = 0.0f;
+        g_foc_vd_i = 0;
+        g_foc_vq_i = 0;
+        g_foc_vd_dbg = 0.0f;
+        g_foc_vq_dbg = 0.0f;
+        g_foc_iq_target = 0.0f;
+        g_foc_last_loop_us = micros();
+        // Reset EMA prądów
+        g_foc_ia_ema = 0.0f;
+        g_foc_ib_ema = 0.0f;
+        g_foc_ic_ema = 0.0f;
+        // Reset angle tracking (współdzielone z SINUS)
+        g_sine_startup_count = 0;
+        g_sine_last_hall_idx = -1;
+        g_sine_speed_q16 = 0;
+        g_sine_dir = 1;
+        g_sine_last_hall_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        // Snap kąta do środka aktualnego sektora Halla
+        uint8_t hall_foc = g_bldc_state.hall_state;
+        int8_t sec_foc = (hall_foc >= 1 && hall_foc <= 6) ? g_hall_to_sector[hall_foc] : 0;
+        int32_t init_foc = (int32_t)sec_foc * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
+        if (init_foc < 0) init_foc += SINE_TABLE_SIZE;
+        if (init_foc >= SINE_TABLE_SIZE) init_foc -= SINE_TABLE_SIZE;
+        g_sine_angle_q16 = (uint32_t)init_foc << 16;
+        g_sine_running = 1;
+        return "FOC ON";
+    }
     if (cmd == "d") {
         g_mosfet_test_active = false;  // Wyłącz tryb testowy MOSFET
         g_manual_duty_override = false;
@@ -2633,6 +3040,70 @@ static String executeCommand(const String& cmd) {
         g_debugSine = !g_debugSine;
         g_lastDebugSineMs = millis();
         return g_debugSine ? "Debug SINUS: ON" : "Debug SINUS: OFF";
+    }
+    // ── FOC: strojenie i diagnostyka ──
+    if (cmd == "fdbg") {
+        g_foc_debug = !g_foc_debug;
+        g_foc_last_debug_ms = millis();
+        return g_foc_debug ? "Debug FOC: ON (co 200ms)" : "Debug FOC: OFF";
+    }
+    if (cmd == "foc") {
+        Serial.println();
+        Serial.println("========== STATUS FOC ==========");
+        Serial.printf("Kp=%.2f  Ki=%.2f  Limit=%.0f\n", g_foc_pi_q.kp, g_foc_pi_q.ki, g_foc_pi_q.limit);
+        Serial.printf("Vd=%.1f  Vq=%.1f\n", g_foc_vd_dbg, g_foc_vq_dbg);
+        Serial.printf("Id=%.2fA  Iq=%.2fA  Iq_tgt=%.2fA\n", g_foc_id_meas, g_foc_iq_meas, g_foc_iq_target);
+        Serial.printf("IntD=%.1f  IntQ=%.1f\n", g_foc_pi_d.integral, g_foc_pi_q.integral);
+        Serial.printf("Ia=%.2f  Ib=%.2f  Ic=%.2f (signed)\n", g_foc_ia_signed, g_foc_ib_signed, g_foc_ic_signed);
+        Serial.printf("EMA: %.2f  %.2f  %.2f  (alpha=%.3f)\n", g_foc_ia_ema, g_foc_ib_ema, g_foc_ic_ema, FOC_CURRENT_EMA_ALPHA);
+        Serial.printf("Mode: %s\n", g_foc_voltage_mode ? "VOLTAGE (open-loop)" : "PI (closed-loop)");
+        Serial.println("================================");
+        return "";
+    }
+    if (cmd.startsWith("fkp:")) {
+        float val = cmd.substring(4).toFloat();
+        if (val >= 0.0f && val <= 100.0f) {
+            g_foc_pi_d.kp = val;
+            g_foc_pi_q.kp = val;
+            return "FOC Kp: " + String(val, 2);
+        }
+        return "Zakres: 0.0-100.0";
+    }
+    if (cmd.startsWith("fki:")) {
+        float val = cmd.substring(4).toFloat();
+        if (val >= 0.0f && val <= 1000.0f) {
+            g_foc_pi_d.ki = val;
+            g_foc_pi_q.ki = val;
+            return "FOC Ki: " + String(val, 1);
+        }
+        return "Zakres: 0.0-1000.0";
+    }
+    if (cmd.startsWith("fkpd:")) {
+        float val = cmd.substring(5).toFloat();
+        if (val >= 0.0f && val <= 100.0f) {
+            g_foc_pi_d.kp = val;
+            return "FOC Kp_d: " + String(val, 2);
+        }
+        return "Zakres: 0.0-100.0";
+    }
+    if (cmd.startsWith("fkid:")) {
+        float val = cmd.substring(5).toFloat();
+        if (val >= 0.0f && val <= 1000.0f) {
+            g_foc_pi_d.ki = val;
+            return "FOC Ki_d: " + String(val, 1);
+        }
+        return "Zakres: 0.0-1000.0";
+    }
+    if (cmd == "fvolt") {
+        g_foc_voltage_mode = !g_foc_voltage_mode;
+        // Reset PI przy zmianie trybu
+        g_foc_pi_d.integral = 0.0f;
+        g_foc_pi_q.integral = 0.0f;
+        g_foc_vd_i = 0;
+        g_foc_vq_i = 0;
+        return g_foc_voltage_mode
+            ? "FOC Voltage mode: ON (Vq=duty, bez PI — jak SINUS w ramie dq)"
+            : "FOC Voltage mode: OFF (PI closed-loop)";
     }
     if (cmd == "man") {
         g_manual_duty_override = !g_manual_duty_override;

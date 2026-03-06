@@ -1,8 +1,7 @@
 # BLDC Motor Driver — ESP32
 
 Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
-Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)** oraz **komutacja sinusoidalna**.  
-Planowane rozszerzenia: FOC (Field Oriented Control).
+Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, **komutacja sinusoidalna** oraz **FOC (Field Oriented Control)**.  
 
 ---
 
@@ -23,8 +22,9 @@ Planowane rozszerzenia: FOC (Field Oriented Control).
 13. [Sterowanie przez UART/Serial](#sterowanie-przez-uartserial)
 14. [Kalibracja prądów](#kalibracja-prądów)
 15. [Konfiguracja NVS](#konfiguracja-nvs)
-16. [Znane problemy i uwagi](#znane-problemy-i-uwagi)
-17. [Rozbudowa projektu](#rozbudowa-projektu)
+16. [FOC — Field Oriented Control](#foc--field-oriented-control)
+17. [Znane problemy i uwagi](#znane-problemy-i-uwagi)
+18. [Rozbudowa projektu](#rozbudowa-projektu)
 
 ---
 
@@ -441,7 +441,7 @@ Całkowity czas: ~25 kroków × 1s = ~25 sekund (domyślne).
 | `SINE_START_MAX_HALL_US` | 30000 µs | Max okres Halla do wejścia w SINUS |
 | `SINE_PHASE_CORR_SHIFT` | 3 | Korekcja kąta: 1/8 błędu na przejście Halla |
 | `SINE_SPEED_FILTER_SHIFT` | 2 | Filtr prędkości: 1/4 new + 3/4 old |
-| `SINE_SAFE_MAX_DUTY` | 45% PWM_MAX | Limit bezpieczeństwa amplitudy |
+| `SINE_SAFE_MAX_DUTY` | 75% PWM_MAX (767) | Limit bezpieczeństwa amplitudy (SVPWM) |
 | `SINE_MIN_AMPLITUDE` | 15 | Poniżej tego: coast (zapobiega hamowaniu EM) |
 | `SINE_TABLE_SIZE` | 96 | Wpisów w tablicy sinusów (= 360° elektr.) |
 
@@ -800,6 +800,16 @@ Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
 | `sat:M:N:S`    | Auto-tune zakres M..N krok S |
 | `man`          | Manual duty ON/OFF (manetka ignorowana) |
 | `gdbg`         | Debug SINUS/BLOCK ON/OFF (co 200ms) |
+| **FOC** | |
+| `F` / `m3`     | Włącz tryb FOC |
+| `foc`          | Pokaż status FOC (Vd/Vq, Id/Iq, PI, EMA) |
+| `fdbg`         | Debug FOC ON/OFF (co 200ms) |
+| `fkp:N.N`      | Ustaw Kp obu osi d/q (0.0–100.0) |
+| `fki:N.N`      | Ustaw Ki obu osi d/q (0.0–1000.0) |
+| `fkpd:N.N`     | Ustaw Kp tylko osi d (0.0–100.0) |
+| `fkid:N.N`     | Ustaw Ki tylko osi d (0.0–1000.0) |
+| `fvolt`        | FOC voltage mode ON/OFF (Vq=duty, bez PI) |
+| **Konfiguracja NVS** | |
 | `cfg`          | Pokaż konfigurację NVS + runtime |
 | `cfg:mode:N` Enter | Tryb boot: 1=BLOCK, 2=SINUS, 3=FOC (zapis NVS) |
 | `cfg:ramp:N` Enter | Czas rampy 0-10000 ms (zapis NVS + natychmiast runtime) |
@@ -985,7 +995,194 @@ LOW-side ON:  ledcWrite(LIN_channel, PWM_MAX_DUTY - test_duty)
 
 ---
 
-## Znane problemy i uwagi
+## FOC — Field Oriented Control
+
+Tryb `DRIVE_MODE_FOC` implementuje sterowanie wektorowe (FOC) w ramie obrotowej dq.
+Silnik jest sterowany jako wektor napięciowy o składowych Vd (pole) i Vq (moment),
+co daje potencjał do precyzyjnej regulacji momentu obrotowego.
+
+### Architektura
+
+```
+loop() (~2 kHz)                          ISR (20 kHz)
+───────────────                          ───────────
+
+ADC → EMA filtr                          Read Vd_i, Vq_i (volatile int32)
+   ↓                                        ↓
+Clarke (Ia,Ib,Ic → Iα,Iβ)              Inverse Park (Vd,Vq → Vα,Vβ)
+   ↓                                        ↓
+Park (Iα,Iβ → Id,Iq)                  Inverse Clarke (Vα,Vβ → Va,Vb,Vc)
+   ↓                                        ↓
+PI(Id) + PI(Iq)                          SVPWM min-max centering
+   ↓                                        ↓
+Vd = ff_d + korekta_d                    ledcWrite (6 kanałów)
+Vq = ff_q + korekta_q
+   ↓
+Zapisz Vd_i, Vq_i (volatile int32)
+```
+
+**KRYTYCZNE:** ISR timera (level 3 interrupt) na ESP32 **nie zapisuje kontekstu FPU**.
+Użycie `float` w ISR korumpuje rejestry koprocesora → crash `LoadProhibited`.
+Dlatego cała arytmetyka ISR używa `int32_t` (Q10 fixed-point).
+
+### Feedforward + PI
+
+FOC używa architektury **feedforward + korekta PI**:
+
+```
+Vq = feedforward(duty) + PI_korekta(±100 max)
+     └─ natychmiastowe      └─ mała korekta prądowa
+         napięcie z duty          (gdy ADC złapie prąd)
+```
+
+- **Feedforward:** `Vq_ff = duty_cycle` (po rampie). Silnik otrzymuje napięcie
+  natychmiast, identycznie jak w trybie SINUS. Rampa rozpędzania obowiązuje.
+- **PI korekta:** `±FOC_PI_CORR_LIMIT` (domyślnie ±100 PWM) wokół feedforward.
+  Regulator koryguje Vq w górę/dół na podstawie błędu prądowego Id/Iq.
+- **Vd feedforward = 0** (cel: Id = 0, MTPA — max torque per amp)
+
+Bez feedforward PI integrowało od zera → silnik rozpędzał się bardzo wolno
+(Ki=5, err=1.5A → ~7.5 PWM/s → 20s do 153 PWM). Z feedforward reakcja jest
+natychmiastowa.
+
+### Kąt i inverse Park
+
+Kąt θ jest współdzielony z trybem SINUS (Hall tracking + interpolacja Q16).
+Inverse Park w ISR używa konwencji znaków dopasowanej do mapowania faz
+A=0°, B=240°, C=120°:
+
+```
+Vα = (Vd·cos + Vq·sin) >> 10
+Vβ = (Vd·sin - Vq·cos) >> 10
+```
+
+Forward Park w loop() ma odpowiadające znaki:
+```
+Id =  Iα·cos + Iβ·sin
+Iq =  Iα·sin - Iβ·cos
+```
+
+### Pomiar prądów i filtr EMA
+
+Czujniki INA180A2 są **jednokierunkowe** (klipują prąd ujemny do ~0V).
+`analogRead()` nie jest zsynchronizowany z PWM → ~50% odczytów trafia
+w czas gdy low-side jest OFF (prąd = 0).
+
+Aby uzyskać stabilny feedback dla PI:
+
+1. **EMA filtr** (α = 0.05, τ ≈ 10ms):
+   ```
+   g_foc_ia_ema += α × (ia_raw - g_foc_ia_ema)
+   ```
+   Uśrednia sporadyczne odczyty do ciągłego sygnału.
+
+2. **Rekonstrukcja Kirchhoffa:** Faza z najmniejszym odczytem = -(suma dwóch pozostałych).
+   Pozwala odtworzyć prąd ujemny z jednokierunkowych czujników.
+
+### Tryb napięciowy (`fvolt`)
+
+Komenda `fvolt` przełącza FOC w **tryb napięciowy** (open-loop):
+- `Vq = duty` (bezpośrednio), `Vd = 0`
+- Brak PI — identyczne zachowanie jak SINUS ale w ramie dq
+- Pozwala porównać jakość pracy z trybem SINUS i wykluczyć PI jako źródło problemów
+- Debug: `[FOC-V]` vs `[FOC-PI]`
+
+### Stałe FOC
+
+| Stała | Wartość | Opis |
+|---|---|---|
+| `FOC_KP_DEFAULT` | 0.5 | Domyślne Kp regulatorów PI d/q [PWM/A] |
+| `FOC_KI_DEFAULT` | 5.0 | Domyślne Ki regulatorów PI d/q [PWM/(A·s)] |
+| `FOC_INTEGRAL_LIMIT` | SINE_SAFE_MAX_DUTY (767) | Absolutny max integrala |
+| `FOC_PI_CORR_LIMIT` | 100 | Max korekta PI wokół feedforward [±PWM] |
+| `FOC_IQ_MAX` | 10.0 | Maksymalny prąd Iq target [A] |
+| `FOC_LOOP_DT` | 0.0005 s | Przybliżony dt pętli prądowej (~2kHz) |
+| `FOC_CURRENT_EMA_ALPHA` | 0.05 | EMA α dla filtrowania prądów |
+
+### Komendy Serial
+
+| Komenda | Opis |
+|---------|------|
+| `F` / `m3` | Włącz tryb FOC |
+| `foc` | Status FOC: Kp, Ki, Limit, Vd/Vq, Id/Iq, EMA, tryb |
+| `fdbg` | Debug ON/OFF (co 200ms): Vd, Vq, Id, Iq, tgt, lim, ff, EMA prądy |
+| `fkp:N.N` | Ustaw Kp obu osi d/q (0.0–100.0) |
+| `fki:N.N` | Ustaw Ki obu osi d/q (0.0–1000.0) |
+| `fkpd:N.N` | Ustaw Kp tylko osi d (0.0–100.0) |
+| `fkid:N.N` | Ustaw Ki tylko osi d (0.0–1000.0) |
+| `fvolt` | Tryb napięciowy ON/OFF (Vq=duty, bez PI) |
+
+### Format debug (`fdbg`)
+
+```
+[FOC-PI] Vd=  0.0 Vq=153.0 | Id= 0.01 Iq= 0.03 | tgt= 1.5 lim=100 ff=153 | ia= 0.12 ib= 0.08 ic= 0.05
+         │        │           │         │           │         │    │      └─ EMA prądy faz [A]
+         │        │           │         │           │         │    └─ feedforward [PWM]
+         │        │           │         │           │         └─ PI limit [±PWM]
+         │        │           │         │           └─ Iq target z przepustnicy [A]
+         │        │           │         └─ Zmierzony Iq [A] (Park)
+         │        │           └─ Zmierzony Id [A]
+         │        └─ Napięcie q (torque) = ff + korekta [PWM]
+         └─ Napięcie d (field) = 0 + korekta [PWM]
+```
+
+### Procedura strojenia
+
+**1. Sprawdź tryb napięciowy (powinien brzmieć jak SINUS):**
+```
+F              ← włącz FOC
+fvolt          ← tryb napięciowy (bez PI)
+fdbg           ← debug ON
+```
+Jeśli brzmi jak SINUS — ISR działa poprawnie.
+
+**2. Przełącz na PI i dostrajaj:**
+```
+fvolt          ← wyłącz voltage mode (wróć na PI)
+fkp:0          ← wyłącz Kp
+fki:1.0        ← niskie Ki (korekta wolno narasta)
+```
+
+**3. Zwiększaj Ki stopniowo:**
+```
+fki:2.0        ← cicho? →
+fki:5.0        ← hałas? → cofnij do 2.0
+```
+
+**4. Dodaj Kp (reakcja na zmiany):**
+```
+fkp:0.1        ← obserwuj
+fkp:0.5        ← oscylacja? → cofnij
+```
+
+### Na co patrzeć w debug
+
+| Symptom | Przyczyna | Rozwiązanie |
+|---------|-----------|-------------|
+| `Vq` skacze ±20% | Oscylacja PI (Ki za duże) | `fki:1.0` |
+| `Vq` stałe = ff | PI nasycony (OK, quasi-open-loop) | — |
+| `ia/ib/ic` ≈ 0.00 | ADC nie łapie prądów | Obniż Ki (działa open-loop) |
+| `Id` duże (>0.5A) | Zły kąt fazy | `so+`/`so-` strojenie |
+| `Iq` bliskie `tgt` | Zamknięta pętla działa! | Zwiększ Ki/Kp |
+| Silnik wibruje stojąc | Kąt daleko od Halla | `so+` kilka razy |
+
+### Ograniczenia sprzętowe
+
+Pełne FOC (zamknięta pętla prądowa) wymaga:
+- **Dwukierunkowego czujnika prądu** (np. INA240 z Vref=1.65V) — INA180A2 klipuje prąd ujemny
+- **ADC zsynchronizowanego z PWM** (sample w centrum impulsu) — `analogRead()` trafia losowo
+- **Szybkiego ADC** (<5µs/kanał) — ESP32 `analogRead()` ≈ 100µs
+
+Z obecnym sprzętem FOC działa jako **"sinus z feedforward + lekkie korekty PI"**.
+Optymalne ustawienie: niskie Ki (1–3), Kp ≈ 0–0.5, co daje zachowanie zbliżone do SINUS
+ale z ramą dq.
+
+### Aktywacja
+
+- Komenda `F` (natychmiastowa, bez Enter) lub `m3` + Enter
+- Silnik startuje identycznie jak w trybie SINUS (snap do sektora, crawl, rampa)
+- Do FOC-V: `fvolt` po włączeniu FOC
+- Powrót: `S` (SINUS), `e` (BLOCK), `d` (wyłącz)
 
 ### Problem: Silnik drga/stuka zamiast się kręcić
 - Tabela komutacji Hall→fazy nie pasuje do silnika
@@ -1018,12 +1215,14 @@ LOW-side ON:  ledcWrite(LIN_channel, PWM_MAX_DUTY - test_duty)
 - Komenda `S` (natychmiastowa) lub `m2` + Enter — przełącza na tryb sinusoidalny
 - Szczegóły: patrz sekcja **Komutacja sinusoidalna** poniżej
 
-### 2. FOC (Field Oriented Control) (DRIVE_MODE_FOC)
-- Transformacja Clarke/Park
-- Regulatory PI dla prądu Id/Iq
-- Wymaga szybkiego ADC (synchronizacja z PWM) i enkoderu/resolvera
-- **Infrastruktura gotowa:** `g_mode_isr` + `g_duty_isr` mogą być reinterpretowane jako amplituda/kąt
-- Nowa komenda Serial (np. `e3`) → `mode = DRIVE_MODE_FOC`
+### 2. ~~FOC (Field Oriented Control) (DRIVE_MODE_FOC)~~ — **ZAIMPLEMENTOWANE** ✓
+- Komenda `F` (natychmiastowa) lub `m3` + Enter — przełącza na tryb FOC
+- Feedforward + PI korekta, inverse Park/Clarke, SVPWM
+- Tryb napięciowy (`fvolt`) i tryb PI z pełną diagnostyką
+- Strojenie online: `fkp:`, `fki:`, `fkpd:`, `fkid:`
+- Szczegóły: patrz sekcja **FOC — Field Oriented Control**
+- **Ograniczenie:** pełna zamknięta pętla prądowa wymaga dwukierunkowych czujników
+  i ADC zsynchronizowanego z PWM (obecny sprzęt: feedforward + lekka korekta PI)
 
 ### 3. Zabezpieczenia (rozszerzone)
 - Overcurrent: porównać `phase_current[i]` z progiem → `allMosfetsOff()` + `fault = true`
@@ -1066,4 +1265,4 @@ board_build.partitions = default.csv
 ---
 
 *Dokumentacja wygenerowana: 2026-03-06*  
-*Wersja firmware: 0.2.0*
+*Wersja firmware: 0.3.0 (FOC)*
