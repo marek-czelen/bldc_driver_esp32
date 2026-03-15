@@ -398,10 +398,14 @@ static uint8_t getSpeedLimitKmh() {
 }
 
 /**
- * @brief Globalny limit prędkości z power fade.
+ * @brief Globalny limit prędkości z power fade (filtrowany EMA).
  *
  * Redukuje duty_target w miarę zbliżania się do prędkości maksymalnej (P08).
- * Strefa fade: 80%..100% limitu. Powyżej limitu: duty = 0 (coast).
+ * Strefa fade: 70%..100% limitu. Powyżej limitu: duty = 0 (coast).
+ *
+ * Współczynnik mocy (0.0..1.0) jest filtrowany filtrem EMA aby uniknąć
+ * oscylacji duty spowodowanych zaszumioną prędkością koła (1 impuls/obrót).
+ * Bez filtra: speed bounces around limit → duty bounces → speed bounces → ...
  *
  * Dotyczy WSZYSTKICH trybów (BLOCK, SINUS, FOC) i źródeł duty (manetka, PAS).
  *
@@ -409,21 +413,48 @@ static uint8_t getSpeedLimitKmh() {
  * @param speed_kmh Aktualna prędkość koła [km/h].
  * @return Duty po limitowaniu.
  */
+static float g_speed_limit_factor = 1.0f;           ///< EMA-filtrowany współczynnik mocy 0..1
+#define SPEED_LIMIT_EMA_ALPHA     0.03f              ///< EMA α (~2kHz loop → τ≈16ms, gładki)
+#define SPEED_LIMIT_FADE_START    0.70f              ///< Fade zaczyna się od 70% limitu
+
 static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
-    if (duty_in == 0) return 0;
+    if (duty_in == 0) {
+        // Przy zerowym duty nie modyfikuj filtra — silnik nie jedzie
+        return 0;
+    }
     uint8_t limit_kmh = getSpeedLimitKmh();
     float limit_f = (float)limit_kmh;
 
+    // Oblicz surowy współczynnik mocy (0.0 .. 1.0)
+    float raw_factor;
     if (speed_kmh >= limit_f) {
-        return 0;  // powyżej limitu → coast
+        raw_factor = 0.0f;  // powyżej limitu → zero mocy
+    } else {
+        float fade_start = limit_f * SPEED_LIMIT_FADE_START;
+        if (speed_kmh <= fade_start) {
+            raw_factor = 1.0f;  // poniżej strefy fade → pełna moc
+        } else {
+            // Liniowy spadek 1.0→0.0 w strefie fade (70%..100% limitu)
+            raw_factor = (limit_f - speed_kmh) / (limit_f - fade_start);
+        }
     }
-    float fade_start = limit_f * 0.8f;
-    if (speed_kmh <= fade_start) {
-        return duty_in;  // poniżej 80% limitu → pełna moc
+
+    // Filtr EMA: współczynnik zmienia się płynnie, eliminuje oscylacje
+    // spowodowane szumem pomiaru prędkości koła.
+    // Spadek (hamowanie): filtrowany — bez gwałtownych skoków duty
+    // Wzrost (przyspieszenie): filtrowany — płynny powrót mocy
+    g_speed_limit_factor += SPEED_LIMIT_EMA_ALPHA * (raw_factor - g_speed_limit_factor);
+
+    // Clamp do 0..1 (bezpieczeństwo numeryczne)
+    if (g_speed_limit_factor < 0.0f) g_speed_limit_factor = 0.0f;
+    if (g_speed_limit_factor > 1.0f) g_speed_limit_factor = 1.0f;
+
+    // Twardy clamp: jeśli prędkość > limit+2km/h → natychmiast zero (bezpieczeństwo)
+    if (speed_kmh > limit_f + 2.0f) {
+        g_speed_limit_factor = 0.0f;
     }
-    // Strefa fade: liniowy spadek 100%→0% w zakresie 80%..100% limitu
-    float factor = (limit_f - speed_kmh) / (limit_f - fade_start);
-    uint16_t result = (uint16_t)((float)duty_in * factor);
+
+    uint16_t result = (uint16_t)((float)duty_in * g_speed_limit_factor);
     return result;
 }
 
