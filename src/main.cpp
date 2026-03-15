@@ -123,6 +123,7 @@ volatile uint32_t g_pas_falling_us = 0;       ///< Czas ostatniego FALLING edge
 volatile uint32_t g_pas_high_time_us = 0;     ///< Czas trwania stanu HIGH [µs]
 volatile uint32_t g_pas_low_time_us = 0;      ///< Czas trwania stanu LOW [µs]
 volatile bool g_pas_forward = true;           ///< Kierunek pedałowania (asymetria duty cycle)
+volatile uint32_t g_pas_edge_count = 0;       ///< Licznik krawędzi PAS (ISR inkrementuje)
 
 /// Timeout PAS: jeśli >1.5s bez impulsu → kadencja = 0 (użytkownik przestał pedałować)
 #define PAS_TIMEOUT_US          1500000
@@ -133,9 +134,17 @@ volatile bool g_pas_forward = true;           ///< Kierunek pedałowania (asymet
 /// Minimalna różnica duty cycle do detekcji kierunku (5% = 0.05)
 /// Jeśli |HIGH-LOW| < 5% okresu → magnesy symetryczne, zakładamy forward
 #define PAS_DIR_MIN_ASYMMETRY   5
-/// Maksymalna kadencja (prędkość pedałowania) mapowana na pełną prędkość koła [RPM]
-/// Typowa kadencja sprawneg rowerzysty to 60-90 RPM
-#define PAS_CADENCE_MAX_RPM     80
+
+// --- Nowy system PAS: maszyna stanów + V_target speed control ---
+/// Minimalna prędkość docelowa PAS [km/h] (przy assist_level > 0)
+#define PAS_VTARGET_MIN_KMH     6.0f
+/// Szerokość strefy ramp-down przed V_target [km/h]
+#define PAS_RAMP_DOWN_KMH       1.0f
+/// EMA α filtra współczynnika prędkości PAS (0.03 → τ≈16ms przy 2kHz)
+#define PAS_VTARGET_EMA_ALPHA   0.03f
+/// Mnożnik P11 → czas inicjalizacji PAS [ms]. P11 × 100 = delay.
+/// P11=1 → 100ms, P11=12 → 1200ms, P11=20 → 2000ms, P11=24 → 2400ms
+#define PAS_INIT_TIME_PER_P11_MS  100
 
 // Regeneracja — zmienne volatile dla ISR
 volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
@@ -519,6 +528,14 @@ static uint16_t calculatePasCadence() {
     return (uint16_t)cadence;
 }
 
+// === Stan maszyny PAS ===
+static uint32_t g_pas_prev_edge_count = 0;    ///< Snapshot licznika krawędzi z poprzedniej iteracji
+static uint32_t g_pas_init_start_ms = 0;      ///< Timestamp startu okna inicjalizacji [ms]
+static uint32_t g_pas_init_edge_snapshot = 0;  ///< Licznik krawędzi na początku init window
+static bool g_pas_pedaling = false;           ///< true = pedałowanie potwierdzone (po init delay)
+static float g_pas_vtarget_factor = 0.0f;     ///< EMA-filtrowany współczynnik mocy 0..1
+static float g_pas_vtarget_kmh = 0.0f;        ///< Aktualna prędkość docelowa PAS [km/h]
+
 /**
  * @brief Oblicza prędkość koła [km/h] z wheeltime_ms i rozmiaru koła P06.
  *
@@ -541,103 +558,142 @@ static float calculateWheelSpeedKmh() {
 }
 
 /**
- * @brief Oblicza duty PAS na podstawie kadencji, prędkości koła i wspomagania.
+ * @brief Oblicza duty PAS — maszyna stanów z opóźnieniem inicjalizacji.
  *
- * ## Algorytm: kadencja → prędkość docelowa → duty feedback
+ * ## Stany:
+ *   IDLE → INIT → ACTIVE → (timeout/reverse) → IDLE
  *
- * Problem: stary algorytm dawał pełne duty gdy kadencja > próg, więc koło
- * zawsze rozpędzało się do max niezależnie od szybkości kręcenia pedałami.
+ * ## IDLE:
+ *   Brak pedałowania lub za mało impulsów. Duty = 0.
  *
- * Nowy schemat ("Cadence PAS" z ebikes.ca):
+ * ## INIT:
+ *   Wykryto pierwszą krawędź PAS po pauzie. Okno inicjalizacji trwa
+ *   P11 × 100 ms (P11=20 → 2000ms). W tym czasie:
+ *   - Liczymy krawędzie PAS (średnia impulsów z okna)
+ *   - NIE dajemy duty (silnik nieaktywny)
+ *   - Po upływie okna: jeśli krawędzi >= magnets (1 pełen obrót tarczy)
+ *     I kierunek forward → przejście do ACTIVE
  *
- * 1. **Kadencja → prędkość docelowa** (target speed):
- *    target_kmh = (cadence / PAS_CADENCE_MAX_RPM) × speed_limit
- *    Wolne pedałowanie → niska prędkość docelowa.
- *    Szybkie pedałowanie → wyższa prędkość docelowa.
- *    P11 (czułość) przesuwa krzywe — wyższa czułość = więcej prędkości
- *    przy mniejszej kadencji.
+ * ## ACTIVE:
+ *   Pedałowanie potwierdzone. Duty sterowane prędkością:
+ *   V_target = 6 + raw_assist × (V_max − 6) / max_raw_assist
+ *   - V_curr < V_target − 1: pełna moc (PWM_MAX_DUTY)
+ *   - V_curr w strefie [V_target−1, V_target]: liniowy ramp-down
+ *   - V_curr >= V_target: duty = 0
+ *   Współczynnik filtrowany EMA (α=0.03) — eliminuje oscylacje.
  *
- * 2. **Speed feedback loop** (duty modulowane prędkością koła):
- *    - speed < target: duty = maxDuty (pełne przyspieszenie)
- *    - speed w strefie 80-100% target: liniowy spadek duty
- *    - speed >= target: duty = 0 (utrzymanie prędkości naturalnie)
- *    Efekt: koło przyspiesza do prędkości docelowej i stabilizuje się.
- *
- * 3. **Start Strength (P12)**: minimalne duty przy bardzo niskiej kadencji.
- *
- * @param maxDuty  Maksymalne duty z poziomu wspomagania (getAssistMaxDuty)
- * @return duty PAS 0–maxDuty
+ * @param maxDuty  Używane tylko do detekcji assist=0 (motor OFF)
+ * @return duty PAS 0–PWM_MAX_DUTY
  */
 static uint16_t calculatePasDuty(uint16_t maxDuty) {
-    if (maxDuty == 0) return 0;
+    // Assist level 0 → PAS wyłączony
+    if (maxDuty == 0) {
+        g_pas_pedaling = false;
+        g_pas_init_start_ms = 0;
+        g_pas_vtarget_factor = 0.0f;
+        return 0;
+    }
 
-    uint16_t cadence = g_bldc_state.pas_cadence_rpm;
-    if (cadence == 0) return 0;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t now_us = (uint32_t)esp_timer_get_time();
+    uint32_t edge_count = g_pas_edge_count;        // snapshot volatile
+    uint32_t last_pulse = g_pas_last_pulse_us;      // snapshot volatile
+    bool forward = g_pas_forward;                   // snapshot volatile
 
-    // --- 1. Prędkość docelowa z kadencji ---
-    // P11: czułość PAS 1-24 (domyślnie 12)
-    // Wyższa czułość = niższa kadencja potrzebna do osiągnięcia danej prędkości
-    uint8_t p11 = g_display.config.p11_pas_sensitivity;
-    if (p11 == 0) p11 = 12;
-    if (p11 > 24) p11 = 24;
+    // --- Timeout: brak impulsów PAS → stop ---
+    bool timed_out = (last_pulse == 0 || (now_us - last_pulse) > PAS_TIMEOUT_US);
+    if (timed_out) {
+        g_pas_pedaling = false;
+        g_pas_init_start_ms = 0;
+        g_pas_vtarget_factor = 0.0f;
+        return 0;
+    }
 
-    // Kadencja dla pełnej prędkości (RPM):
-    //   P11=1 (niska czułość)  → 100 RPM (trzeba bardzo szybko kręcić)
-    //   P11=12 (domyślna)      → 62 RPM
-    //   P11=24 (wysoka czułość) → 25 RPM (lekkie kręcenie = pełna prędkość)
-    uint16_t cadence_for_full = (uint16_t)map((long)p11, 1, 24, 100, 25);
-    if (cadence_for_full < 15) cadence_for_full = 15;
+    // Wykryj nowe krawędzie od ostatniego wywołania
+    bool new_edges = (edge_count != g_pas_prev_edge_count);
+    g_pas_prev_edge_count = edge_count;
 
-    // Limit prędkości [km/h] (P08, fallback 25 km/h)
-    uint8_t speed_limit_kmh = g_display.config.p08_speed_limit;
-    if (speed_limit_kmh == 0) speed_limit_kmh = 25;
+    // === Stan: NIE PEDAŁUJE (IDLE / INIT) ===
+    if (!g_pas_pedaling) {
+        if (g_pas_init_start_ms == 0) {
+            // IDLE: czekamy na pierwszą krawędź
+            if (new_edges) {
+                // Pierwsza krawędź → start okna inicjalizacji
+                g_pas_init_start_ms = now_ms;
+                g_pas_init_edge_snapshot = edge_count;
+            }
+            return 0;
+        }
 
-    // Target speed = (cadence / cadence_for_full) × speed_limit
-    // Nie ograniczamy do 1.0 — jeśli ktoś kręci szybciej niż cadence_for_full,
-    // target może przekroczyć speed_limit, ale speed feedback i tak uzetnie.
-    float cadence_ratio = (float)cadence / (float)cadence_for_full;
-    if (cadence_ratio > 1.0f) cadence_ratio = 1.0f;
-    float target_kmh = cadence_ratio * (float)speed_limit_kmh;
-    g_bldc_state.pas_target_kmh = target_kmh;
+        // INIT: okno inicjalizacji trwa
+        // Czas inicjalizacji = P11 × 100 ms (P11 = start_delay_pas / czułość PAS)
+        uint8_t p11 = g_display.config.p11_pas_sensitivity;
+        if (p11 == 0) p11 = 12;   // fallback: 1200ms
+        if (p11 > 24) p11 = 24;   // max: 2400ms
+        uint32_t init_time_ms = (uint32_t)p11 * PAS_INIT_TIME_PER_P11_MS;
 
-    // --- 2. Speed feedback: modulacja duty na podstawie aktualnej prędkości ---
-    float speed_kmh = g_bldc_state.wheel_speed_kmh;
-    float speed_factor;
+        uint32_t elapsed = now_ms - g_pas_init_start_ms;
+        if (elapsed < init_time_ms) {
+            return 0;  // Jeszcze w oknie init → brak duty
+        }
 
-    if (target_kmh <= 0.5f) {
-        // Bardzo niska prędkość docelowa — użyj liniowego skalowania kadencji
-        speed_factor = cadence_ratio;
-    } else if (speed_kmh >= target_kmh) {
-        // Osiągnięta lub przekroczona prędkość docelowa → wyłącz moc
-        speed_factor = 0.0f;
-    } else {
-        // Strefa ramp-down: 80% do 100% prędkości docelowej
-        float ramp_start = target_kmh * 0.8f;
-        if (speed_kmh <= ramp_start) {
-            speed_factor = 1.0f;  // pełne przyspieszenie
+        // Okno init zakończone — sprawdź warunki aktywacji
+        uint32_t edges_in_window = edge_count - g_pas_init_edge_snapshot;
+        uint8_t magnets = g_display.config.p13_pas_magnets;
+        if (magnets == 0) magnets = 12;
+
+        // Minimum: 4 krawędzie (2 pełne okresy PAS) — wystarczy żeby odrzucić szum.
+        // Przy wolnym pedałowaniu (15 RPM, 12 magnesów, CHANGE mode):
+        //   24 edges/rev × 0.25 rev/s = 6 edges/s → w 1200ms = 7.2 edges → OK dla progu 4
+        uint32_t min_edges = 4;
+        if (edges_in_window >= min_edges) {
+            g_pas_pedaling = true;
+            // Inicjalizuj factor od 0 — płynny start
+            g_pas_vtarget_factor = 0.0f;
         } else {
-            // Liniowy spadek od 1.0 (80% target) do 0.0 (100% target)
-            speed_factor = (target_kmh - speed_kmh) / (target_kmh - ramp_start);
+            // Za mało impulsów → reset
+            g_pas_init_start_ms = 0;
+            return 0;
         }
     }
 
-    // --- 3. Oblicz duty PAS ---
-    float pas_duty_f = speed_factor * (float)maxDuty;
+    // === Stan: ACTIVE — pedałowanie potwierdzone ===
+    // Brak natychmiastowej deaktywacji przez kierunek — detekcja kierunku bywa zaszumiona
+    // Deaktywacja następuje wyłącznie przez timeout (brak impulsów > PAS_TIMEOUT_US)
 
-    // --- 4. Start Strength (P12) — minimalne duty na starcie ---
-    // P12=0 → 0%, P12=1 → 4%, ..., P12=5 → 20% maxDuty
-    // Aktywne tylko przy niskiej prędkości (start z miejsca)
-    uint8_t p12 = g_display.config.p12_pas_start_strength;
-    if (p12 > 5) p12 = 5;
-    if (p12 > 0 && cadence > 0 && speed_kmh < 5.0f) {
-        float min_duty_f = (float)p12 * (float)maxDuty / 25.0f;
-        if (pas_duty_f < min_duty_f) {
-            pas_duty_f = min_duty_f;
-        }
+    // --- Oblicz V_target z poziomu wspomagania ---
+    // V_target = 6 + raw_assist × (V_max − 6) / max_raw_assist
+    uint8_t raw_assist = g_display.rx.assist_level;     // 0..15
+    const uint8_t max_raw_assist = 15;                  // S866: raw 0-15
+    uint8_t v_max = g_display.config.p08_speed_limit;
+    if (v_max == 0) v_max = 25;
+
+    float v_target = PAS_VTARGET_MIN_KMH
+                   + (float)raw_assist * ((float)v_max - PAS_VTARGET_MIN_KMH)
+                     / (float)max_raw_assist;
+    g_pas_vtarget_kmh = v_target;
+    g_bldc_state.pas_target_kmh = v_target;
+
+    // --- Speed control z ramp-down ---
+    float speed_kmh = g_bldc_state.wheel_speed_kmh;
+    float raw_factor;
+
+    if (speed_kmh >= v_target) {
+        raw_factor = 0.0f;                             // Osiągnięto V_target → odcięcie
+    } else if (speed_kmh >= v_target - PAS_RAMP_DOWN_KMH) {
+        raw_factor = (v_target - speed_kmh) / PAS_RAMP_DOWN_KMH;  // Ramp-down 1km/h
+    } else {
+        raw_factor = 1.0f;                             // Poniżej strefy → pełna moc
     }
 
-    uint16_t result = (uint16_t)pas_duty_f;
-    if (result > maxDuty) result = maxDuty;
+    // --- Filtr EMA na współczynnik mocy ---
+    // Zapobiega oscylacjom duty z zaszumionego pomiaru prędkości koła.
+    g_pas_vtarget_factor += PAS_VTARGET_EMA_ALPHA * (raw_factor - g_pas_vtarget_factor);
+    if (g_pas_vtarget_factor < 0.0f) g_pas_vtarget_factor = 0.0f;
+    if (g_pas_vtarget_factor > 1.0f) g_pas_vtarget_factor = 1.0f;
+
+    uint16_t result = (uint16_t)(g_pas_vtarget_factor * (float)PWM_MAX_DUTY);
+    if (result > PWM_MAX_DUTY) result = PWM_MAX_DUTY;
     return result;
 }
 
@@ -718,6 +774,7 @@ void IRAM_ATTR onPasPulse() {
         }
     }
     g_pas_last_pulse_us = now_us;
+    g_pas_edge_count++;  // licznik krawędzi dla detekcji pedałowania
 }
 
 // ============================================================================
@@ -1677,8 +1734,8 @@ void readDigitalInputs() {
         g_brake_debounce_count = 0;
     }
     g_bldc_state.brake_active = (g_brake_debounce_count >= BRAKE_DEBOUNCE_THRESHOLD);
-    // pas_active = ktoś pedałuje (kadencja > 0), ustalane w loop() przez calculatePasCadence()
-    g_bldc_state.pas_active = (g_bldc_state.pas_cadence_rpm > 0);
+    // pas_active = pedałowanie (potwierdzony PAS albo okno init)
+    g_bldc_state.pas_active = g_pas_pedaling;
     g_bldc_state.pas_forward = g_pas_forward;  // volatile → state
 }
 
@@ -1759,11 +1816,26 @@ void printDiagnostics() {
         g_bldc_state.pas_active ? "PAS " : "",
         g_bldc_state.fault ? "FAULT " : "");
 
-    // PAS: kadencja, kierunek i prędkość docelowa
-    if (g_bldc_state.pas_cadence_rpm > 0) {
+    // PAS: stan, duty%, V_target, speed_factor, raw_assist
+    if (g_pas_pedaling) {
         int pasDutyPct = (int)((uint32_t)g_bldc_state.pas_duty * 100 / PWM_MAX_DUTY);
-        Serial.printf("CAD:%u/%d%% T:%.0f ", g_bldc_state.pas_cadence_rpm, pasDutyPct,
-                      g_bldc_state.pas_target_kmh);
+        Serial.printf("PAS:ON %d%% vt:%.1f sf:%.2f sl:%.2f ",
+            pasDutyPct,
+            g_pas_vtarget_kmh,
+            g_pas_vtarget_factor,
+            g_speed_limit_factor);
+    } else if (g_pas_init_start_ms > 0) {
+        // Debug: pokaż postęp okna init
+        uint32_t edges_in = g_pas_edge_count - g_pas_init_edge_snapshot;
+        uint8_t mag = g_display.config.p13_pas_magnets;
+        if (mag == 0) mag = 12;
+        uint8_t p11d = g_display.config.p11_pas_sensitivity;
+        if (p11d == 0) p11d = 12;
+        uint32_t elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - g_pas_init_start_ms;
+        Serial.printf("PAS:INIT e:%lu/4 %lums/%ums fw:%d ",
+            (unsigned long)edges_in,
+            (unsigned long)elapsed_ms, (unsigned)(p11d * PAS_INIT_TIME_PER_P11_MS),
+            (int)g_pas_forward);
     } else if (!g_pas_forward) {
         Serial.print("PAS:REV ");
     }
@@ -1775,8 +1847,9 @@ void printDiagnostics() {
 
     // Informacje z wyświetlacza S866
     if (g_display.connected) {
-        Serial.printf("DISP:OK L%d %s%s",
+        Serial.printf("DISP:OK L%d(r%d) %s%s",
             g_display.rx.assist_level / 3,
+            g_display.rx.assist_level,
             g_display.rx.headlight ? "HL " : "",
             g_display.rx.cruise_control ? "CC " : "");
     } else {
