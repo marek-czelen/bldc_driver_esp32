@@ -324,6 +324,8 @@ static String serialBuffer = "";
 
 // Symulacja hamulca komendą Serial
 static bool g_brake_simulated = false;
+static uint8_t g_brake_debounce_count = 0;   ///< Licznik debounce hamulca
+#define BRAKE_DEBOUNCE_THRESHOLD  5           ///< Ile kolejnych LOW wymagane (~2.5ms przy 2kHz loop)
 
 // Rampa rozpędzania silnika
 static uint16_t g_duty_ramped = 0;                   ///< Aktualny duty po rampie
@@ -383,6 +385,46 @@ static uint16_t getAssistMaxDuty() {
     uint16_t maxDuty = (uint16_t)((uint32_t)g_display.rx.assist_level * PWM_MAX_DUTY / 15);
     if (maxDuty > PWM_MAX_DUTY) maxDuty = PWM_MAX_DUTY;
     return maxDuty;
+}
+
+/**
+ * @brief Pobiera limit prędkości [km/h] z parametru P08.
+ * @return Limit prędkości w km/h (fallback: 25 km/h)
+ */
+static uint8_t getSpeedLimitKmh() {
+    uint8_t limit = g_display.config.p08_speed_limit;
+    if (limit == 0) limit = 25;
+    return limit;
+}
+
+/**
+ * @brief Globalny limit prędkości z power fade.
+ *
+ * Redukuje duty_target w miarę zbliżania się do prędkości maksymalnej (P08).
+ * Strefa fade: 80%..100% limitu. Powyżej limitu: duty = 0 (coast).
+ *
+ * Dotyczy WSZYSTKICH trybów (BLOCK, SINUS, FOC) i źródeł duty (manetka, PAS).
+ *
+ * @param duty_in  Duty przed limitowaniem.
+ * @param speed_kmh Aktualna prędkość koła [km/h].
+ * @return Duty po limitowaniu.
+ */
+static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
+    if (duty_in == 0) return 0;
+    uint8_t limit_kmh = getSpeedLimitKmh();
+    float limit_f = (float)limit_kmh;
+
+    if (speed_kmh >= limit_f) {
+        return 0;  // powyżej limitu → coast
+    }
+    float fade_start = limit_f * 0.8f;
+    if (speed_kmh <= fade_start) {
+        return duty_in;  // poniżej 80% limitu → pełna moc
+    }
+    // Strefa fade: liniowy spadek 100%→0% w zakresie 80%..100% limitu
+    float factor = (limit_f - speed_kmh) / (limit_f - fade_start);
+    uint16_t result = (uint16_t)((float)duty_in * factor);
+    return result;
 }
 
 /**
@@ -916,27 +958,52 @@ void loop() {
         // --- Oblicz kadencję PAS i prędkość koła ---
         g_bldc_state.pas_cadence_rpm = calculatePasCadence();
         g_bldc_state.wheel_speed_kmh = calculateWheelSpeedKmh();
+        float speed_kmh = g_bldc_state.wheel_speed_kmh;
 
         // --- Throttle duty ---
-        uint16_t throttle_duty = mapThrottleToDuty(g_bldc_state.throttle_raw, maxDuty);
+        // Manetka ZAWSZE działa w pełnym zakresie mocy (0..PWM_MAX_DUTY),
+        // niezależnie od ustawionego poziomu wspomagania.
+        // Assist level ogranicza tylko PAS (wspomaganie pedałowania).
+        // Gdy assist_level == 0 → manetka też wyłączona (silnik OFF).
+        uint16_t throttle_duty = (maxDuty > 0)
+            ? mapThrottleToDuty(g_bldc_state.throttle_raw, PWM_MAX_DUTY)
+            : 0;
 
-        // --- PAS duty ---
+        // --- PAS duty (ograniczone assist level + wbudowany speed fade P08) ---
         uint16_t pas_duty = calculatePasDuty(maxDuty);
         g_bldc_state.pas_duty = pas_duty;
 
         // --- Kombinacja P10 ---
+        uint16_t combined_duty;
         uint8_t p10 = g_display.config.p10_drive_mode;
         switch (p10) {
             case 1:  // Tylko gaz (throttle only)
-                g_bldc_state.duty_target = throttle_duty;
+                combined_duty = throttle_duty;
                 break;
             case 2:  // Tylko PAS (pedal assist only)
-                g_bldc_state.duty_target = pas_duty;
+                combined_duty = pas_duty;
                 break;
             default: // 0 lub nierozpoznany: PAS + gaz (wyższy wygrywa)
-                g_bldc_state.duty_target = (throttle_duty > pas_duty) ? throttle_duty : pas_duty;
+                combined_duty = (throttle_duty > pas_duty) ? throttle_duty : pas_duty;
                 break;
         }
+
+        // --- Globalny limit prędkości P08 z power fade ---
+        // Dotyczy WSZYSTKICH źródeł duty (manetka + PAS).
+        // Moc maleje w strefie 80%..100% limitu, powyżej = 0 (coast).
+        // PAS ma własny speed fade wbudowany, ale globalny limit jest nadrzędny
+        // i dotyczy też manetki.
+        combined_duty = applyGlobalSpeedLimit(combined_duty, speed_kmh);
+
+        // --- Freewheel: jeśli rowerzysta jedzie szybciej niż max silnika ---
+        // Sprawdzamy efektywny limit prędkości dla aktualnego źródła:
+        //   Manetka: P08 (max speed) — zawsze pełny zakres
+        //   PAS: PAS target speed (zależy od assist level i kadencji)
+        // Jeśli prędkość koła >= efektywny limit → duty = 0 (coast)
+        // Motor zostanie ponownie włączony gdy prędkość spadnie < 80% limitu.
+        // (to jest już obsłużone przez applyGlobalSpeedLimit powyżej)
+
+        g_bldc_state.duty_target = combined_duty;
     }
 
     // Rampa rozpędzania: duty_cycle narasta płynnie w kierunku duty_target
@@ -1562,11 +1629,23 @@ void readHallSensors() {
  * @brief Odczytuje wejścia cyfrowe: hamulec i PAS.
  *
  * Hamulec: INPUT_PULLUP — aktywny sygnał = LOW (przycisk do GND).
- * PAS: pas_active wyznaczany z kadencji (nie z raw stanu pinu),
- *      bo czujnik Halla generuje impulsy — stan chwilowy nic nie mówi.
+ * Debounce: wymagaj BRAKE_DEBOUNCE_THRESHOLD kolejnych odczytów LOW
+ * zanim uzna hamulec za aktywny. Filtruje spike EMI z przełączania
+ * FETów (szczególnie w SINUS/FOC, gdzie 6 FETów przełącza jednocześnie).
+ * Bez debounce: spike EMI → brake_active=true → g_duty_ramped=0 →
+ * silnik gwałtownie zwalnia i rozpędza się ponownie.
  */
 void readDigitalInputs() {
-    g_bldc_state.brake_active = (digitalRead(PIN_BRAKE) == LOW) || g_brake_simulated;
+    // Debounce hamulca
+    bool brake_raw = (digitalRead(PIN_BRAKE) == LOW) || g_brake_simulated;
+    if (brake_raw) {
+        if (g_brake_debounce_count < BRAKE_DEBOUNCE_THRESHOLD) {
+            g_brake_debounce_count++;
+        }
+    } else {
+        g_brake_debounce_count = 0;
+    }
+    g_bldc_state.brake_active = (g_brake_debounce_count >= BRAKE_DEBOUNCE_THRESHOLD);
     // pas_active = ktoś pedałuje (kadencja > 0), ustalane w loop() przez calculatePasCadence()
     g_bldc_state.pas_active = (g_bldc_state.pas_cadence_rpm > 0);
     g_bldc_state.pas_forward = g_pas_forward;  // volatile → state
@@ -1878,6 +1957,18 @@ void IRAM_ATTR onCommutationTimer() {
     }
 
     uint16_t d = g_duty_isr;
+
+    // ── Explicit freewheel: duty == 0 → natychmiastowy wolnobieg ──
+    // Wszystkie MOSFETY na OFF (HS OFF, LS OFF).
+    // Guard niezależny od g_motor_enabled — eliminuje race condition
+    // (loop() ustawia g_duty_isr=0 PRZED g_motor_enabled=false;
+    // ISR może trafić w okno gdzie motor_enabled=true ale d=0).
+    // W BLOCK mode bez tego guardu: d=0 + LS ON = aktywne hamowanie EM
+    // zamiast wolnobiegu (phaseX_Low ustawia LS ON do GND).
+    if (d == 0) {
+        allMosfetsOff();
+        return;
+    }
 
     // SINUS safety fallback: gdy brak przejść Halla przez dłuższy czas → zeruj prędkość.
     // Timeout dynamiczny: max(400ms, 4*ostatni_hall_period + 20ms), aby uniknąć
