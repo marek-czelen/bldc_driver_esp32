@@ -35,6 +35,9 @@ static void config_apply_defaults() {
     g_config.drive_mode     = (uint8_t)DRIVE_MODE_BLOCK;   // Po starcie: tryb BLOCK
     g_config.ramp_time_ms   = 1200;                         // 1200 ms rampa
     g_config.regen_enabled  = 0;                             // Regen domyślnie wyłączony
+    g_config.pas_dir_invert = 0;                              // Kierunek PAS: normalny
+    g_config.pas_start_delay_ms = 2000;                        // 2s ciągłego pedałowania do aktywacji
+    g_config.pas_stop_delay_ms  = 1000;                        // 1s bez impulsów → stop
 }
 
 void config_init() {

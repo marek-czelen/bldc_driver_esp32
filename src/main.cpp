@@ -123,28 +123,15 @@ volatile uint32_t g_pas_falling_us = 0;       ///< Czas ostatniego FALLING edge
 volatile uint32_t g_pas_high_time_us = 0;     ///< Czas trwania stanu HIGH [µs]
 volatile uint32_t g_pas_low_time_us = 0;      ///< Czas trwania stanu LOW [µs]
 volatile bool g_pas_forward = true;           ///< Kierunek pedałowania (asymetria duty cycle)
+volatile int8_t g_pas_dir_confidence = 0;     ///< Licznik pewności kierunku: >0=fwd, <0=rev (histereza ISR)
+volatile bool g_pas_dir_invert_isr = false;   ///< Kopia pas_dir_invert dla ISR (ustawiana w setup/cmd)
 volatile uint32_t g_pas_edge_count = 0;       ///< Licznik krawędzi PAS (ISR inkrementuje)
 
-/// Timeout PAS: jeśli >1.5s bez impulsu → kadencja = 0 (użytkownik przestał pedałować)
-#define PAS_TIMEOUT_US          1500000
 /// Minimalny półokres PAS: odrzucaj krawędzie szybsze niż 5ms (debounce)
 #define PAS_MIN_HALFPERIOD_US   5000
-/// Maksymalna kadencja [RPM] zanim obetniemy (ochrona przed szumem)
-#define PAS_MAX_CADENCE_RPM     150
-/// Minimalna różnica duty cycle do detekcji kierunku (5% = 0.05)
+/// Minimalna różnica duty cycle do detekcji kierunku (%)
 /// Jeśli |HIGH-LOW| < 5% okresu → magnesy symetryczne, zakładamy forward
 #define PAS_DIR_MIN_ASYMMETRY   5
-
-// --- Nowy system PAS: maszyna stanów + V_target speed control ---
-/// Minimalna prędkość docelowa PAS [km/h] (przy assist_level > 0)
-#define PAS_VTARGET_MIN_KMH     6.0f
-/// Szerokość strefy ramp-down przed V_target [km/h]
-#define PAS_RAMP_DOWN_KMH       1.0f
-/// EMA α filtra współczynnika prędkości PAS (0.03 → τ≈16ms przy 2kHz)
-#define PAS_VTARGET_EMA_ALPHA   0.03f
-/// Mnożnik P11 → czas inicjalizacji PAS [ms]. P11 × 100 = delay.
-/// P11=1 → 100ms, P11=12 → 1200ms, P11=20 → 2000ms, P11=24 → 2400ms
-#define PAS_INIT_TIME_PER_P11_MS  100
 
 // Regeneracja — zmienne volatile dla ISR
 volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
@@ -498,9 +485,8 @@ static uint16_t mapThrottleToDuty(uint16_t throttle_raw, uint16_t maxDuty) {
  *
  * Kadencja [RPM] = 60 000 000 / (period_us × P13_magnets).
  * Timeout: jeśli > PAS_TIMEOUT_US od ostatniego impulsu → kadencja = 0.
- * Kierunek: jeśli pedałowanie do tyłu (g_pas_forward == false) → kadencja = 0.
  *
- * @return Kadencja w RPM (0 = nie pedałuje / timeout / pedałowanie wstecz)
+ * @return Kadencja w RPM (0 = nie pedałuje / timeout)
  */
 static uint16_t calculatePasCadence() {
     uint32_t period = g_pas_period_us;       // volatile → local copy
@@ -508,12 +494,8 @@ static uint16_t calculatePasCadence() {
     uint32_t now_us = (uint32_t)esp_timer_get_time();
 
     // Timeout: brak impulsu → nie pedałuje
-    if (last == 0 || period == 0 || (now_us - last) > PAS_TIMEOUT_US) {
-        return 0;
-    }
-
-    // Kierunek: pedałowanie wstecz → kadencja 0 (brak wspomagania)
-    if (!g_pas_forward) {
+    uint32_t stop_us = (uint32_t)config_get().pas_stop_delay_ms * 1000UL;
+    if (last == 0 || period == 0 || (now_us - last) > stop_us) {
         return 0;
     }
 
@@ -523,18 +505,16 @@ static uint16_t calculatePasCadence() {
 
     // cadence_rpm = 60_000_000 / (period_us × magnets)
     uint32_t cadence = 60000000UL / (period * (uint32_t)magnets);
-    if (cadence > PAS_MAX_CADENCE_RPM) cadence = PAS_MAX_CADENCE_RPM;
+    if (cadence > 150) cadence = 150;
 
     return (uint16_t)cadence;
 }
 
-// === Stan maszyny PAS ===
-static uint32_t g_pas_prev_edge_count = 0;    ///< Snapshot licznika krawędzi z poprzedniej iteracji
-static uint32_t g_pas_init_start_ms = 0;      ///< Timestamp startu okna inicjalizacji [ms]
-static uint32_t g_pas_init_edge_snapshot = 0;  ///< Licznik krawędzi na początku init window
-static bool g_pas_pedaling = false;           ///< true = pedałowanie potwierdzone (po init delay)
-static float g_pas_vtarget_factor = 0.0f;     ///< EMA-filtrowany współczynnik mocy 0..1
-static float g_pas_vtarget_kmh = 0.0f;        ///< Aktualna prędkość docelowa PAS [km/h]
+// === Stan PAS ===
+/// Timestamp [ms] od kiedy PAS kręci się w kierunku forward (0 = nie kręci)
+static uint32_t g_pas_fwd_since_ms = 0;
+/// Flaga: PAS aktywnie wspomaga (przeszedł start delay i kręci się forward)
+static bool g_pas_pedaling = false;
 
 /**
  * @brief Oblicza prędkość koła [km/h] z wheeltime_ms i rozmiaru koła P06.
@@ -558,143 +538,66 @@ static float calculateWheelSpeedKmh() {
 }
 
 /**
- * @brief Oblicza duty PAS — maszyna stanów z opóźnieniem inicjalizacji.
+ * @brief Oblicza duty PAS — uproszczona logika.
  *
- * ## Stany:
- *   IDLE → INIT → ACTIVE → (timeout/reverse) → IDLE
+ * Algorytm:
+ *   1. assist_level == 0 → duty = 0
+ *   2. Brak impulsów PAS przez pas_stop_delay_ms → duty = 0
+ *   3. Kierunek reverse → duty = 0 (resetuj timer forward)
+ *   4. Kierunek forward przez co najmniej pas_start_delay_ms → duty = PWM_MAX_DUTY
+ *   5. Jeszcze nie minął start delay → duty = 0
  *
- * ## IDLE:
- *   Brak pedałowania lub za mało impulsów. Duty = 0.
+ * Limit prędkości realizowany jest przez applyGlobalSpeedLimit() w loop().
  *
- * ## INIT:
- *   Wykryto pierwszą krawędź PAS po pauzie. Okno inicjalizacji trwa
- *   P11 × 100 ms (P11=20 → 2000ms). W tym czasie:
- *   - Liczymy krawędzie PAS (średnia impulsów z okna)
- *   - NIE dajemy duty (silnik nieaktywny)
- *   - Po upływie okna: jeśli krawędzi >= magnets (1 pełen obrót tarczy)
- *     I kierunek forward → przejście do ACTIVE
- *
- * ## ACTIVE:
- *   Pedałowanie potwierdzone. Duty sterowane prędkością:
- *   V_target = 6 + raw_assist × (V_max − 6) / max_raw_assist
- *   - V_curr < V_target − 1: pełna moc (PWM_MAX_DUTY)
- *   - V_curr w strefie [V_target−1, V_target]: liniowy ramp-down
- *   - V_curr >= V_target: duty = 0
- *   Współczynnik filtrowany EMA (α=0.03) — eliminuje oscylacje.
- *
- * @param maxDuty  Używane tylko do detekcji assist=0 (motor OFF)
- * @return duty PAS 0–PWM_MAX_DUTY
+ * @param maxDuty  Używane do detekcji assist=0 (motor OFF)
+ * @return duty PAS 0 lub PWM_MAX_DUTY
  */
 static uint16_t calculatePasDuty(uint16_t maxDuty) {
     // Assist level 0 → PAS wyłączony
     if (maxDuty == 0) {
         g_pas_pedaling = false;
-        g_pas_init_start_ms = 0;
-        g_pas_vtarget_factor = 0.0f;
+        g_pas_fwd_since_ms = 0;
         return 0;
     }
 
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t now_us = (uint32_t)esp_timer_get_time();
-    uint32_t edge_count = g_pas_edge_count;        // snapshot volatile
-    uint32_t last_pulse = g_pas_last_pulse_us;      // snapshot volatile
-    bool forward = g_pas_forward;                   // snapshot volatile
+    uint32_t now_ms = (uint32_t)(now_us / 1000);
+    uint32_t last_pulse = g_pas_last_pulse_us;  // snapshot volatile
 
-    // --- Timeout: brak impulsów PAS → stop ---
-    bool timed_out = (last_pulse == 0 || (now_us - last_pulse) > PAS_TIMEOUT_US);
-    if (timed_out) {
+    // Parametry z EEPROM
+    controller_config_t& cfg = config_get();
+    uint32_t stop_delay_us = (uint32_t)cfg.pas_stop_delay_ms * 1000UL;
+    uint32_t start_delay_ms = (uint32_t)cfg.pas_start_delay_ms;
+
+    // --- Brak impulsów PAS przez stop_delay → przestał pedałować ---
+    if (last_pulse == 0 || (now_us - last_pulse) > stop_delay_us) {
         g_pas_pedaling = false;
-        g_pas_init_start_ms = 0;
-        g_pas_vtarget_factor = 0.0f;
+        g_pas_fwd_since_ms = 0;
         return 0;
     }
 
-    // Wykryj nowe krawędzie od ostatniego wywołania
-    bool new_edges = (edge_count != g_pas_prev_edge_count);
-    g_pas_prev_edge_count = edge_count;
-
-    // === Stan: NIE PEDAŁUJE (IDLE / INIT) ===
-    if (!g_pas_pedaling) {
-        if (g_pas_init_start_ms == 0) {
-            // IDLE: czekamy na pierwszą krawędź
-            if (new_edges) {
-                // Pierwsza krawędź → start okna inicjalizacji
-                g_pas_init_start_ms = now_ms;
-                g_pas_init_edge_snapshot = edge_count;
-            }
-            return 0;
-        }
-
-        // INIT: okno inicjalizacji trwa
-        // Czas inicjalizacji = P11 × 100 ms (P11 = start_delay_pas / czułość PAS)
-        uint8_t p11 = g_display.config.p11_pas_sensitivity;
-        if (p11 == 0) p11 = 12;   // fallback: 1200ms
-        if (p11 > 24) p11 = 24;   // max: 2400ms
-        uint32_t init_time_ms = (uint32_t)p11 * PAS_INIT_TIME_PER_P11_MS;
-
-        uint32_t elapsed = now_ms - g_pas_init_start_ms;
-        if (elapsed < init_time_ms) {
-            return 0;  // Jeszcze w oknie init → brak duty
-        }
-
-        // Okno init zakończone — sprawdź warunki aktywacji
-        uint32_t edges_in_window = edge_count - g_pas_init_edge_snapshot;
-        uint8_t magnets = g_display.config.p13_pas_magnets;
-        if (magnets == 0) magnets = 12;
-
-        // Minimum: 4 krawędzie (2 pełne okresy PAS) — wystarczy żeby odrzucić szum.
-        // Przy wolnym pedałowaniu (15 RPM, 12 magnesów, CHANGE mode):
-        //   24 edges/rev × 0.25 rev/s = 6 edges/s → w 1200ms = 7.2 edges → OK dla progu 4
-        uint32_t min_edges = 4;
-        if (edges_in_window >= min_edges) {
-            g_pas_pedaling = true;
-            // Inicjalizuj factor od 0 — płynny start
-            g_pas_vtarget_factor = 0.0f;
-        } else {
-            // Za mało impulsów → reset
-            g_pas_init_start_ms = 0;
-            return 0;
-        }
+    // --- Kierunek: reverse → reset, nie wspomagaj ---
+    if (!g_pas_forward) {
+        g_pas_pedaling = false;
+        g_pas_fwd_since_ms = 0;
+        return 0;
     }
 
-    // === Stan: ACTIVE — pedałowanie potwierdzone ===
-    // Brak natychmiastowej deaktywacji przez kierunek — detekcja kierunku bywa zaszumiona
-    // Deaktywacja następuje wyłącznie przez timeout (brak impulsów > PAS_TIMEOUT_US)
-
-    // --- Oblicz V_target z poziomu wspomagania ---
-    // V_target = 6 + raw_assist × (V_max − 6) / max_raw_assist
-    uint8_t raw_assist = g_display.rx.assist_level;     // 0..15
-    const uint8_t max_raw_assist = 15;                  // S866: raw 0-15
-    uint8_t v_max = g_display.config.p08_speed_limit;
-    if (v_max == 0) v_max = 25;
-
-    float v_target = PAS_VTARGET_MIN_KMH
-                   + (float)raw_assist * ((float)v_max - PAS_VTARGET_MIN_KMH)
-                     / (float)max_raw_assist;
-    g_pas_vtarget_kmh = v_target;
-    g_bldc_state.pas_target_kmh = v_target;
-
-    // --- Speed control z ramp-down ---
-    float speed_kmh = g_bldc_state.wheel_speed_kmh;
-    float raw_factor;
-
-    if (speed_kmh >= v_target) {
-        raw_factor = 0.0f;                             // Osiągnięto V_target → odcięcie
-    } else if (speed_kmh >= v_target - PAS_RAMP_DOWN_KMH) {
-        raw_factor = (v_target - speed_kmh) / PAS_RAMP_DOWN_KMH;  // Ramp-down 1km/h
-    } else {
-        raw_factor = 1.0f;                             // Poniżej strefy → pełna moc
+    // --- Kierunek forward ---
+    // Zacznij liczyć czas forward jeśli jeszcze nie liczymy
+    if (g_pas_fwd_since_ms == 0) {
+        g_pas_fwd_since_ms = now_ms;
     }
 
-    // --- Filtr EMA na współczynnik mocy ---
-    // Zapobiega oscylacjom duty z zaszumionego pomiaru prędkości koła.
-    g_pas_vtarget_factor += PAS_VTARGET_EMA_ALPHA * (raw_factor - g_pas_vtarget_factor);
-    if (g_pas_vtarget_factor < 0.0f) g_pas_vtarget_factor = 0.0f;
-    if (g_pas_vtarget_factor > 1.0f) g_pas_vtarget_factor = 1.0f;
+    // Sprawdź czy minął start delay
+    uint32_t fwd_duration_ms = now_ms - g_pas_fwd_since_ms;
+    if (fwd_duration_ms >= start_delay_ms) {
+        g_pas_pedaling = true;
+        return PWM_MAX_DUTY;
+    }
 
-    uint16_t result = (uint16_t)(g_pas_vtarget_factor * (float)PWM_MAX_DUTY);
-    if (result > PWM_MAX_DUTY) result = PWM_MAX_DUTY;
-    return result;
+    // Jeszcze w start delay — nie wspomagaj
+    return 0;
 }
 
 // ============================================================================
@@ -768,9 +671,17 @@ void IRAM_ATTR onPasPulse() {
                           : (g_pas_low_time_us - g_pas_high_time_us);
             uint32_t threshold = period * PAS_DIR_MIN_ASYMMETRY / 100;
             if (diff > threshold) {
-                g_pas_forward = (g_pas_high_time_us > g_pas_low_time_us);
+                bool should_fwd = (g_pas_high_time_us > g_pas_low_time_us);
+                if (g_pas_dir_invert_isr) should_fwd = !should_fwd;
+                // Histereza: wymagaj kilku zgodnych krawędzi przed zmianą kierunku
+                if (should_fwd) {
+                    if (g_pas_dir_confidence < 5) g_pas_dir_confidence++;
+                } else {
+                    if (g_pas_dir_confidence > -5) g_pas_dir_confidence--;
+                }
+                g_pas_forward = (g_pas_dir_confidence > 0);
             }
-            // Jeśli diff <= threshold: magnesy symetryczne, nie zmieniaj g_pas_forward
+            // Jeśli diff <= threshold: magnesy symetryczne, nie zmieniaj kierunku
         }
     }
     g_pas_last_pulse_us = now_us;
@@ -808,6 +719,7 @@ void setup() {
     g_bldc_state.mode = DRIVE_MODE_DISABLED;  // tymczasowo — tryb docelowy ustawiony po init HW
     g_bldc_state.ramp_time_ms = cfg.ramp_time_ms;
     g_bldc_state.regen_enabled = (cfg.regen_enabled != 0);
+    g_pas_dir_invert_isr = (cfg.pas_dir_invert != 0);
 
     // Inicjalizacja regulatorów PI dla FOC
     g_foc_pi_d = {FOC_KP_DEFAULT, FOC_KI_DEFAULT, 0.0f, FOC_INTEGRAL_LIMIT};
@@ -1816,28 +1728,23 @@ void printDiagnostics() {
         g_bldc_state.pas_active ? "PAS " : "",
         g_bldc_state.fault ? "FAULT " : "");
 
-    // PAS: stan, duty%, V_target, speed_factor, raw_assist
+    // PAS: stan + timing
     if (g_pas_pedaling) {
         int pasDutyPct = (int)((uint32_t)g_bldc_state.pas_duty * 100 / PWM_MAX_DUTY);
-        Serial.printf("PAS:ON %d%% vt:%.1f sf:%.2f sl:%.2f ",
-            pasDutyPct,
-            g_pas_vtarget_kmh,
-            g_pas_vtarget_factor,
-            g_speed_limit_factor);
-    } else if (g_pas_init_start_ms > 0) {
-        // Debug: pokaż postęp okna init
-        uint32_t edges_in = g_pas_edge_count - g_pas_init_edge_snapshot;
-        uint8_t mag = g_display.config.p13_pas_magnets;
-        if (mag == 0) mag = 12;
-        uint8_t p11d = g_display.config.p11_pas_sensitivity;
-        if (p11d == 0) p11d = 12;
-        uint32_t elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - g_pas_init_start_ms;
-        Serial.printf("PAS:INIT e:%lu/4 %lums/%ums fw:%d ",
-            (unsigned long)edges_in,
-            (unsigned long)elapsed_ms, (unsigned)(p11d * PAS_INIT_TIME_PER_P11_MS),
-            (int)g_pas_forward);
+        Serial.printf("PAS:ON %d%% sl:%.2f ", pasDutyPct, g_speed_limit_factor);
+    } else if (g_pas_fwd_since_ms > 0) {
+        // W start delay — pedałuje forward ale jeszcze nie aktywny
+        uint32_t elapsed = (uint32_t)(esp_timer_get_time() / 1000) - g_pas_fwd_since_ms;
+        Serial.printf("PAS:WAIT %lums/%ums fw:%d H:%lu L:%lu ",
+            (unsigned long)elapsed,
+            (unsigned)config_get().pas_start_delay_ms,
+            (int)g_pas_forward,
+            (unsigned long)g_pas_high_time_us,
+            (unsigned long)g_pas_low_time_us);
     } else if (!g_pas_forward) {
-        Serial.print("PAS:REV ");
+        Serial.printf("PAS:REV H:%lu L:%lu ",
+            (unsigned long)g_pas_high_time_us,
+            (unsigned long)g_pas_low_time_us);
     }
 
     // Prędkość koła [km/h]
@@ -2874,6 +2781,11 @@ void printHelp() {
     Serial.println("cfg:mode:N    Tryb boot (1=BLOCK 2=SIN 3=FOC)");
     Serial.println("cfg:ramp:N    Czas rampy [ms] 0-10000");
     Serial.println("cfg:regen:N   Regeneracja boot (0/1)");
+    Serial.println("---------- PAS (Pedal Assist) ----------");
+    Serial.println("pasdir         Przełącz kierunek PAS (normal/odwrócony)");
+    Serial.println("passtart:N     Czas ciągłego pedałowania do aktywacji [ms]");
+    Serial.println("passtop:N      Timeout braku impulsów PAS [ms]");
+    Serial.println("pasdbg         Debug PAS (czasy, kierunek, stan)");
     Serial.println("===========================");
     Serial.println();
 }
@@ -3375,6 +3287,57 @@ static String executeCommand(const String& cmd) {
         printDisplayConfig();
         return "";
     }
+    if (cmd == "pasdir") {
+        controller_config_t& cfg = config_get();
+        cfg.pas_dir_invert = cfg.pas_dir_invert ? 0 : 1;
+        g_pas_dir_invert_isr = (cfg.pas_dir_invert != 0);
+        config_save();
+        return cfg.pas_dir_invert ? "PAS kierunek: ODWROCONY (H<L=forward)" : "PAS kierunek: NORMALNY (H>L=forward)";
+    }
+    if (cmd == "pasdbg") {
+        Serial.println();
+        Serial.println("========== PAS DEBUG ==========");
+        Serial.printf("HIGH time:  %lu us\n", (unsigned long)g_pas_high_time_us);
+        Serial.printf("LOW time:   %lu us\n", (unsigned long)g_pas_low_time_us);
+        Serial.printf("Period:     %lu us\n", (unsigned long)g_pas_period_us);
+        uint32_t ht = g_pas_high_time_us;
+        uint32_t lt = g_pas_low_time_us;
+        uint32_t sum = ht + lt;
+        if (sum > 0) {
+            Serial.printf("Duty H/L:   %lu%% / %lu%%\n", (unsigned long)(ht * 100 / sum), (unsigned long)(lt * 100 / sum));
+            uint32_t diff = (ht > lt) ? (ht - lt) : (lt - ht);
+            Serial.printf("Asymetria:  %lu%% (pr\xF3g: %d%%)\n", (unsigned long)(diff * 100 / sum), PAS_DIR_MIN_ASYMMETRY);
+        }
+        Serial.printf("g_pas_forward:    %d (confidence: %d)\n", (int)g_pas_forward, (int)g_pas_dir_confidence);
+        Serial.printf("edge_count:       %lu\n", (unsigned long)g_pas_edge_count);
+        Serial.printf("last_pulse:       %lu us ago\n", (unsigned long)((uint32_t)esp_timer_get_time() - g_pas_last_pulse_us));
+        Serial.printf("pas_pedaling:     %d\n", (int)g_pas_pedaling);
+        Serial.printf("fwd_since_ms:     %lu\n", (unsigned long)g_pas_fwd_since_ms);
+        Serial.printf("pas_dir_invert:   %d\n", (int)config_get().pas_dir_invert);
+        Serial.printf("pas_start_delay:  %u ms\n", (unsigned)config_get().pas_start_delay_ms);
+        Serial.printf("pas_stop_delay:   %u ms\n", (unsigned)config_get().pas_stop_delay_ms);
+        Serial.printf("P13 magnets:      %d\n", (int)g_display.config.p13_pas_magnets);
+        Serial.println("================================");
+        return "";
+    }
+    if (cmd.startsWith("passtart:")) {
+        int val = cmd.substring(9).toInt();
+        if (val >= 0 && val <= 10000) {
+            config_get().pas_start_delay_ms = (uint16_t)val;
+            config_save();
+            return "PAS start delay: " + String(val) + " ms";
+        }
+        return "Zakres 0-10000 ms";
+    }
+    if (cmd.startsWith("passtop:")) {
+        int val = cmd.substring(8).toInt();
+        if (val >= 100 && val <= 10000) {
+            config_get().pas_stop_delay_ms = (uint16_t)val;
+            config_save();
+            return "PAS stop delay: " + String(val) + " ms";
+        }
+        return "Zakres 100-10000 ms";
+    }
     if (cmd == "h") {
         printHelp();
         return "";
@@ -3409,6 +3372,9 @@ static String executeCommand(const String& cmd) {
         Serial.printf("drive_mode:    %d (%s)\n", cfg.drive_mode, modeName);
         Serial.printf("ramp_time_ms:  %d ms\n",   cfg.ramp_time_ms);
         Serial.printf("regen_enabled: %d (%s)\n", cfg.regen_enabled, cfg.regen_enabled ? "ON" : "OFF");
+        Serial.printf("pas_dir_inv:   %d (%s)\n", cfg.pas_dir_invert, cfg.pas_dir_invert ? "ODWR" : "NORM");
+        Serial.printf("pas_start_ms:  %u ms\n",  (unsigned)cfg.pas_start_delay_ms);
+        Serial.printf("pas_stop_ms:   %u ms\n",  (unsigned)cfg.pas_stop_delay_ms);
         Serial.printf("magic:         0x%08X %s\n", cfg.magic, (cfg.magic == CONFIG_MAGIC) ? "OK" : "BAD!");
         Serial.printf("version:       %d\n",      cfg.version);
         Serial.println("======================================");

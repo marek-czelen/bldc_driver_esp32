@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  1
+#define CONFIG_VERSION  3
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -46,9 +46,12 @@ typedef struct __attribute__((packed)) {
     uint8_t         drive_mode;         ///< Domyślny tryb sterowania (drive_mode_t) po starcie
     uint16_t        ramp_time_ms;       ///< Czas rampy rozpędzania 0→100% [ms]
     uint8_t         regen_enabled;      ///< Regeneracja ON/OFF (0/1)
+    uint8_t         pas_dir_invert;     ///< Odwróć konwencję kierunku PAS (0=normal, 1=odwrócony)
+    uint16_t        pas_start_delay_ms; ///< Opóźnienie startu PAS: czas ciągłego pedałowania forward [ms]
+    uint16_t        pas_stop_delay_ms;  ///< Timeout PAS: brak impulsów przez X ms → wyłącz wspomaganie [ms]
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[54];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[49];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)
