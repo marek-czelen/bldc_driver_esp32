@@ -2,6 +2,7 @@
 
 Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
 Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, **komutacja sinusoidalna** oraz **FOC (Field Oriented Control)**.  
+Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-startem i regulacją prędkości docelowej.  
 
 ---
 
@@ -12,19 +13,22 @@ Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, 
 3. [Układy pomiarowe](#układy-pomiarowe)
 4. [Architektura oprogramowania](#architektura-oprogramowania)
 5. [Komutacja blokowa — zasada działania](#komutacja-blokowa--zasada-działania)
-6. [Timer sprzętowy i ISR](#timer-sprzętowy-i-isr)
-7. [Wyświetlacz S866 — protokół 2](#wyświetlacz-s866--protokół-2)
-8. [Pomiar prędkości](#pomiar-prędkości)
-9. [Obliczanie mocy](#obliczanie-mocy)
-10. [Hamowanie regeneracyjne](#hamowanie-regeneracyjne)
-11. [Przepustnica i poziomy wspomagania](#przepustnica-i-poziomy-wspomagania)
-12. [Rampa rozpędzania](#rampa-rozpędzania)
-13. [Sterowanie przez UART/Serial](#sterowanie-przez-uartserial)
-14. [Kalibracja prądów](#kalibracja-prądów)
-15. [Konfiguracja NVS](#konfiguracja-nvs)
-16. [FOC — Field Oriented Control](#foc--field-oriented-control)
-17. [Znane problemy i uwagi](#znane-problemy-i-uwagi)
-18. [Rozbudowa projektu](#rozbudowa-projektu)
+6. [Komutacja sinusoidalna — zasada działania](#komutacja-sinusoidalna--zasada-działania)
+7. [Timer sprzętowy i ISR](#timer-sprzętowy-i-isr)
+8. [Wyświetlacz S866 — protokół 2](#wyświetlacz-s866--protokół-2)
+9. [Pomiar prędkości](#pomiar-prędkości)
+10. [Obliczanie mocy](#obliczanie-mocy)
+11. [Hamowanie regeneracyjne](#hamowanie-regeneracyjne)
+12. [Przepustnica i poziomy wspomagania](#przepustnica-i-poziomy-wspomagania)
+13. [Rampa rozpędzania](#rampa-rozpędzania)
+14. [PAS — Pedal Assist Sensor](#pas--pedal-assist-sensor)
+15. [Sterowanie przez UART/Serial](#sterowanie-przez-uartserial)
+16. [Kalibracja prądów](#kalibracja-prądów)
+17. [Konfiguracja NVS](#konfiguracja-nvs)
+18. [Diagnostyka MOSFET — tryb testowy](#diagnostyka-mosfet--tryb-testowy)
+19. [FOC — Field Oriented Control](#foc--field-oriented-control)
+20. [Rozbudowa projektu](#rozbudowa-projektu)
+21. [Konfiguracja PlatformIO](#konfiguracja-platformio)
 
 ---
 
@@ -760,6 +764,157 @@ Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
 
 ---
 
+## PAS — Pedal Assist Sensor
+
+System wspomagania pedałowania (PAS) wykrywa kierunek i aktywność pedałowania,
+a następnie steruje mocą silnika dążąc do prędkości docelowej zależnej od poziomu
+wspomagania ustawionego na wyświetlaczu.
+
+### Sprzęt
+
+- **Pin:** GPIO22 (INPUT_PULLUP), przerwanie oba zbocza (CHANGE)
+- **Czujnik:** Hall z asymetrycznym dyskiem magnesów (12 magnesów domyślnie, P13)
+- **Sygnał:** stan HIGH i LOW o różnym czasie trwania → detekcja kierunku
+
+### ISR — detekcja kierunku (`onPasPulse`)
+
+ISR mierzy czas trwania stanów HIGH i LOW na obu zboczach:
+- **RISING edge** → koniec okresu LOW, zapis `low_time`
+- **FALLING edge** → koniec okresu HIGH, zapis `high_time`, obliczenie kierunku
+
+Detekcja kierunku z histerezą:
+1. Oblicz asymetrię: `diff = |HIGH - LOW|`
+2. Jeśli `diff > 5%` okresu → kierunek jednoznaczny
+3. **Histereza:** licznik `confidence` (±5) — wymaga kilku zgodnych krawędzi przed zmianą `g_pas_forward`
+4. Jeśli `diff ≤ 5%` → magnesy symetryczne, kierunek nie zmieniany
+5. `pas_dir_invert` (NVS) — odwraca konwencję HIGH>LOW=forward
+
+Debounce: krawędzie krótsze niż 5 ms (`PAS_MIN_HALFPERIOD_US`) są odrzucane.
+
+### Algorytm sterowania (`calculatePasDuty`)
+
+```
+Wejścia:
+  isPedalingForward — flaga z ISR (kierunek + histereza)
+  Lx                — poziom wspomagania (raw 0–15 z wyświetlacza)
+  v_curr            — prędkość koła [km/h] (MA z 8 próbek)
+  v_max             — P08 limit prędkości [km/h]
+
+Stany:
+  IDLE  → brak impulsów lub reverse → duty = 0
+  WAIT  → forward, ale < pas_start_delay_ms → duty = 0
+  ACTIVE → forward >= pas_start_delay_ms → sterowanie mocą
+```
+
+**Sekwencja w stanie ACTIVE:**
+
+1. **Soft-start:** moc narasta liniowo 0→100% w czasie `pas_ramp_ms` (domyślnie 1500 ms)
+2. **V_target:** oblicz prędkość docelową z poziomu wspomagania:
+   ```
+   V_target = 6 + Lx × (v_max − 6) / 15
+   ```
+   | Poziom (wyśw.) | Raw Lx | V_target (v_max=25) |
+   |---|---|---|
+   | L0 | 0 | — (silnik OFF) |
+   | L1 | 3 | 9.8 km/h |
+   | L2 | 6 | 13.6 km/h |
+   | L3 | 9 | 17.4 km/h |
+   | L4 | 12 | 21.2 km/h |
+   | L5 | 15 | 25.0 km/h |
+
+3. **Speed ramp-down** (strefa 3 km/h):
+   - `v_curr < V_target − 3` → pełna moc (100%)
+   - `v_curr ∈ [V_target−3, V_target]` → liniowa redukcja 100%→0%
+   - `v_curr ≥ V_target` → duty = 0
+
+4. **Slew rate limiter:** duty zmienia się max ±30 PWM na wywołanie (~3% z 1023).
+   Przy ~2 kHz pętli = max ~60%/s. Zapobiega skokom duty.
+
+5. **Globalny limit P08:** stosowany osobno przez `applyGlobalSpeedLimit()` (dotyczy też manetki).
+
+### Filtracja prędkości (Moving Average)
+
+Surowy odczyt `wheel_speed_kmh` jest niestabilny (1 impuls/obrót → skoki wheeltime).
+PAS używa bufora kołowego 8 próbek ze średnią kroczącą:
+
+```
+speed_smooth = avg(speed_buf[0..7])
+```
+
+Zapobiega to oscylacjom duty w strefie ramp-down.
+
+### Forward holdoff (300 ms)
+
+Gdy ISR zgłosi reverse, PAS nie deaktywuje się natychmiast. Czeka 300 ms
+(`PAS_FWD_HOLDOFF_MS`) od ostatniego widzianego forward. Pojedyncze zaszumione
+odczyty kierunku nie przerywają wspomagania.
+
+Przy deaktywacji (timeout lub reverse) duty schodzi do zera z ograniczeniem
+slew rate — łagodne wygaszenie zamiast twardego odcięcia.
+
+### Kombinacja PAS + Manetka (P10)
+
+Parametr P10 z wyświetlacza S866 określa tryb jazdy:
+
+| P10 | Tryb | Duty |
+|-----|------|------|
+| 0   | PAS + gaz | `max(throttle_duty, pas_duty)` |
+| 1   | Tylko gaz | `throttle_duty` |
+| 2   | Tylko PAS | `pas_duty` |
+
+Manetka działa w pełnym zakresie 0–PWM_MAX_DUTY (niezależnie od assist level).
+PAS jest ograniczony przez V_target zależny od poziomu wspomagania.
+
+### Parametry NVS (konfigurowane komendami Serial)
+
+| Parametr | Domyślnie | Komenda | Opis |
+|---|---|---|---|
+| `pas_dir_invert` | 0 | `pasdir` | Odwróć konwencję kierunku (toggle) |
+| `pas_start_delay_ms` | 2000 | `passtart:N` | Czas ciągłego pedałowania forward do aktywacji [ms] |
+| `pas_stop_delay_ms` | 1000 | `passtop:N` | Timeout braku impulsów PAS → wyłącz wspomaganie [ms] |
+| `pas_ramp_ms` | 1500 | `pasramp:N` | Soft-start: czas narastania mocy 0→100% [ms] |
+
+### Diagnostyka
+
+**Status (auto-status):**
+- `PAS:ON 85% vt:14.9 sl:0.85` — aktywny, 85% duty, V_target=14.9 km/h, speed limit factor=0.85
+- `PAS:WAIT 850ms/2000ms fw:1 H:45000 L:32000` — w start delay, 850/2000 ms, forward=1, czasy H/L
+- `PAS:REV H:28000 L:35000` — kierunek reverse, czasy półokresów
+
+**Komenda `pasdbg`:**
+```
+========== PAS DEBUG ==========
+HIGH time:  45123 us
+LOW time:   32456 us
+Period:     77579 us
+Duty H/L:   58% / 42%
+Asymetria:  16% (próg: 5%)
+g_pas_forward:    1 (confidence: 4)
+edge_count:       1234
+last_pulse:       15234 us ago
+pas_pedaling:     1
+fwd_since_ms:     12345
+active_since_ms:  10345
+pas_dir_invert:   0
+pas_start_delay:  2000 ms
+pas_stop_delay:   1000 ms
+pas_ramp:         1500 ms
+P13 magnets:      12
+================================
+```
+
+### Stałe
+
+| Stała | Wartość | Opis |
+|---|---|---|
+| `PAS_MIN_HALFPERIOD_US` | 5000 µs | Debounce krawędzi (min 5 ms) |
+| `PAS_DIR_MIN_ASYMMETRY` | 5% | Próg asymetrii do detekcji kierunku |
+| `PAS_SPEED_MA_SIZE` | 8 | Próbek w buforze Moving Average prędkości |
+| `PAS_SLEW_RATE_MAX` | 30 | Max zmiana duty na wywołanie (~3% PWM) |
+| `PAS_FWD_HOLDOFF_MS` | 300 ms | Czas podtrzymania forward po szumie reverse |
+
+---
+
 ## Sterowanie przez UART/Serial
 
 **Prędkość:** 115200 baud  
@@ -809,6 +964,12 @@ Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
 | `fkpd:N.N`     | Ustaw Kp tylko osi d (0.0–100.0) |
 | `fkid:N.N`     | Ustaw Ki tylko osi d (0.0–1000.0) |
 | `fvolt`        | FOC voltage mode ON/OFF (Vq=duty, bez PI) |
+| **PAS** | |
+| `pasdir`       | Odwróć konwencję kierunku PAS (toggle, zapis NVS) |
+| `passtart:N`   | Ustaw opóźnienie startu PAS 0-10000 ms (zapis NVS) |
+| `passtop:N`    | Ustaw timeout PAS 100-10000 ms (zapis NVS) |
+| `pasramp:N`    | Ustaw czas soft-start PAS 0-10000 ms (zapis NVS) |
+| `pasdbg`       | Wyświetl pełną diagnostykę PAS (jednorazowo) |
 | **Konfiguracja NVS** | |
 | `cfg`          | Pokaż konfigurację NVS + runtime |
 | `cfg:mode:N` Enter | Tryb boot: 1=BLOCK, 2=SINUS, 3=FOC (zapis NVS) |
@@ -822,7 +983,7 @@ BLK CW D:35/80% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870) RPM:120
 ```
 
 | Pole    | Znaczenie |
-|---------|-----------||
+|---------|-----------|
 | `BLK`   | Tryb: OFF/BLK/SIN/FOC |
 | `CW`    | Kierunek: CW/CCW |
 | `D:35/80%` | Duty cycle: aktualny (po rampie) / docelowy (z przepustnicy) |
@@ -839,7 +1000,9 @@ BLK CW D:35/80% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870) RPM:120
 | `DISP:OK L3` | Wyświetlacz S866 podłączony, poziom wspomagania 3 |
 | `DISP:--` | Wyświetlacz nie podłączony |
 | `BRK`   | Hamulec aktywny |
-| `PAS`   | PAS aktywny |
+| `PAS:ON 85% vt:14.9 sl:0.85` | PAS aktywny: duty%, V_target, speed limit factor |
+| `PAS:WAIT 850ms/2000ms fw:1 H:45000 L:32000` | PAS w start delay: upłynęło/wymagane, forward, czasy H/L |
+| `PAS:REV H:28000 L:35000` | PAS — pedałowanie do tyłu (czasy półokresów) |
 | `FAULT` | Błąd czujników Halla |
 
 ---
@@ -870,11 +1033,15 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | Pole | Typ | Domyślnie | Opis |
 |---|---|---|---|
 | `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 1 | Wersja struktury |
+| `version` | uint16_t | 4 | Wersja struktury |
 | `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
 | `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
 | `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
-| `_reserved[54]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
+| `pas_dir_invert` | uint8_t | 0 | Odwróć konwencję kierunku PAS (0/1) |
+| `pas_start_delay_ms` | uint16_t | 2000 | Opóźnienie startu PAS [ms] |
+| `pas_stop_delay_ms` | uint16_t | 1000 | Timeout PAS — brak impulsów [ms] |
+| `pas_ramp_ms` | uint16_t | 1500 | Soft-start PAS: czas narastania 0→100% [ms] |
+| `_reserved[47]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
 
 ### Walidacja
 
@@ -890,23 +1057,31 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | `cfg:mode:N` | Zmienia tryb boot (1=BLOCK, 2=SINUS, 3=FOC), zapisuje NVS |
 | `cfg:ramp:N` | Zmienia czas rampy 0-10000 ms, **natychmiast aktualizuje runtime**, zapisuje NVS |
 | `cfg:regen:N` | Zmienia regen (0/1), **natychmiast aktualizuje runtime**, zapisuje NVS |
+| `pasdir` | Odwraca konwencję kierunku PAS (toggle), zapisuje NVS |
+| `passtart:N` | Opóźnienie startu PAS 0-10000 ms, zapisuje NVS |
+| `passtop:N` | Timeout PAS 100-10000 ms, zapisuje NVS |
+| `pasramp:N` | Soft-start PAS 0-10000 ms, zapisuje NVS |
 
 ### Przykład wyjścia `cfg`
 
 ```
 ========== KONFIGURACJA NVS ==========
-drive_mode:    2 (SINUS)
-ramp_time_ms:  1200 ms
-regen_enabled: 0 (OFF)
-magic:         0x424C4401 OK
-version:       1
+drive_mode:      2 (SINUS)
+ramp_time_ms:    1200 ms
+regen_enabled:   0 (OFF)
+pas_dir_invert:  0 (NORMAL)
+pas_start_delay: 2000 ms
+pas_stop_delay:  1000 ms
+pas_ramp:        1500 ms
+magic:           0x424C4401 OK
+version:         4
 ======================================
 --- Runtime (bieżące) ---
-mode:          SINUS
-ramp_time_ms:  1200 ms
-regen:         OFF
-direction:     CW
-sine_offset:   0 (0.0°)
+mode:            SINUS
+ramp_time_ms:    1200 ms
+regen:           OFF
+direction:       CW
+sine_offset:     0 (0.0°)
 ```
 
 > **Uwaga:** Komendy `cfg:ramp:N` i `cfg:regen:N` zmieniają zarówno NVS jak i bieżący
@@ -1235,12 +1410,21 @@ ale z ramą dq.
 - Pętla prądowa: INA180A2 → limit prądu regen z P14
 - Konfiguracja duty regen z wyświetlacza lub komend Serial
 
-### 5. ~~Konfiguracja przez UART~~ — **CZĘŚCIOWO ZAIMPLEMENTOWANE** ✓
+### 5. ~~PAS — Pedal Assist Sensor~~ — **ZAIMPLEMENTOWANE** ✓
+- Detekcja kierunku z histerezą ±5 w ISR, `pas_dir_invert` w NVS
+- Maszyna stanów IDLE→WAIT→ACTIVE z konfigurowalnymi opóźnieniami
+- V_target = 6 + Lx × (v_max − 6) / 15, soft-start, speed Moving Average (8 próbek)
+- Slew rate limiter (±30/call), forward holdoff 300 ms
+- Komendy Serial: `pasdir`, `passtart:N`, `passtop:N`, `pasramp:N`, `pasdbg`
+- Szczegóły: patrz sekcja **PAS — Pedal Assist Sensor**
+
+### 6. ~~Konfiguracja przez UART~~ — **CZĘŚCIOWO ZAIMPLEMENTOWANE** ✓
 - Komenda `cfg` — wyświetlanie konfiguracji NVS + runtime
 - Komendy `cfg:mode:N`, `cfg:ramp:N`, `cfg:regen:N` — zmiana i zapis do NVS
+- Komendy PAS: `pasdir`, `passtart:N`, `passtop:N`, `pasramp:N`
 - **Do rozbudowy:** zmiana `THROTTLE_DEAD_ZONE`, `THROTTLE_MAX_RAW` bez rekompilacji
 
-### 6. CAN bus / RS485
+### 7. CAN bus / RS485
 - Gotowy pin UART_EN (GPIO17) sugeruje planowany RS485 lub CAN
 - Zaimplementować protokół ramki np. `$CMD,VALUE\n`
 
@@ -1264,5 +1448,5 @@ board_build.partitions = default.csv
 
 ---
 
-*Dokumentacja wygenerowana: 2026-03-06*  
-*Wersja firmware: 0.3.0 (FOC)*
+*Dokumentacja wygenerowana: 2025-07-17*  
+*Wersja firmware: 0.4.0 (PAS + FOC)*
