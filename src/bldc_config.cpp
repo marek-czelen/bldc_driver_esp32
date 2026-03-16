@@ -38,6 +38,7 @@ static void config_apply_defaults() {
     g_config.pas_dir_invert = 0;                              // Kierunek PAS: normalny
     g_config.pas_start_delay_ms = 2000;                        // 2s ciągłego pedałowania do aktywacji
     g_config.pas_stop_delay_ms  = 1000;                        // 1s bez impulsów → stop
+    g_config.pas_ramp_ms        = 1500;                        // 1.5s soft-start 0→100%
 }
 
 void config_init() {
