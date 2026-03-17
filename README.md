@@ -978,6 +978,7 @@ P13 magnets:      12
 | `fkpd:N.N`     | Ustaw Kp tylko osi d (0.0–100.0) |
 | `fkid:N.N`     | Ustaw Ki tylko osi d (0.0–1000.0) |
 | `fvolt`        | FOC voltage mode ON/OFF (Vq=duty, bez PI) |
+| `fpitune`      | Auto-tuning PI metodą relay (Åström-Hägglund, ~5s) |
 | **PAS** | |
 | `pasdir`       | Odwróć konwencję kierunku PAS (toggle, zapis NVS) |
 | `passtart:N`   | Ustaw opóźnienie startu PAS 0-10000 ms (zapis NVS) |
@@ -1304,6 +1305,51 @@ Komenda `fvolt` przełącza FOC w **tryb napięciowy** (open-loop):
 | `fkpd:N.N` | Ustaw Kp tylko osi d (0.0–100.0) |
 | `fkid:N.N` | Ustaw Ki tylko osi d (0.0–1000.0) |
 | `fvolt` | Tryb napięciowy ON/OFF (Vq=duty, bez PI) |
+| `fpitune` | Auto-tuning PI metodą relay feedback (~5s) |
+
+### Regulator PI — co to jest Kp i Ki
+
+Regulator **PI (Proportional-Integral)** steruje prądem w osiach d i q silnika BLDC.
+Wyjście regulatora = **feedforward** (Vq = duty, natychmiastowe napięcie) **+ korekta PI** (±100 PWM max).
+
+| Parametr | Pełna nazwa | Rola | Efekt za małej wartości | Efekt za dużej wartości | Domyślnie |
+|----------|-------------|------|-------------------------|-------------------------|-----------|
+| **Kp** | Wzmocnienie proporcjonalne | Natychmiastowa reakcja na błąd prądu (Iq_target − Iq_meas) | Wolna reakcja, błąd ustalony | Oscylacje, niestabilność | 0.5 |
+| **Ki** | Wzmocnienie całkujące | Kumuluje błąd w czasie, eliminuje błąd ustalony | Wolne dochodzenie do celu | Przeregulowanie (overshoot), oscylacje | 5.0 |
+
+**Jednostki:** Kp [PWM/A], Ki [PWM/(A·s)].  
+**Anti-windup:** Całka ograniczona do ±pi_limit (= min(FOC_PI_CORR_LIMIT, feedforward)).
+
+### Auto-tuning PI (`fpitune`)
+
+Komenda `fpitune` implementuje automatyczne strojenie parametrów PI **metodą relay feedback
+(Åström-Hägglund, 1984)**. Jest to standardowa metoda strojenia PID w przemyśle.
+
+**Algorytm:**
+1. Zamiast regulatora PI, wyjście jest przełączane (relay): Vq = feedforward ± 30 PWM
+2. Gdy błąd Iq > 0 → wyjście = feedforward + relay_amp
+3. Gdy błąd Iq < 0 → wyjście = feedforward − relay_amp
+4. Mierzone są oscylacje prądu Iq (amplituda `a` i okres `Tu`)
+5. Z oscylacji obliczany jest **ultimate gain** Ku = 4·d / (π·a)
+6. Parametry PI wg **reguł Zieglera-Nicholsa**: Kp = 0.45·Ku, Ki = 0.54·Ku/Tu
+
+**Wymagania:**
+- Tryb FOC aktywny (komenda `F`)
+- Silnik pracuje (duty > 0)
+- Voltage mode wyłączony (`fvolt` = OFF)
+
+**Użycie:**
+```
+F              ← włącz FOC
+50             ← ustaw duty 50%
+fpitune        ← start auto-tune (~5s)
+               ← czekaj na wynik...
+fkp:X.XXX      ← zastosuj sugerowane Kp
+fki:X.XXX      ← zastosuj sugerowane Ki
+```
+
+**Uwaga:** Podczas testu silnik może lekko oscylować — to normalne zachowanie metody relay.
+Test trwa 5 sekund i kończy się automatycznie, wypisując sugerowane wartości Kp/Ki.
 
 ### Format debug (`fdbg`)
 
@@ -1467,4 +1513,4 @@ board_build.partitions = default.csv
 ---
 
 *Dokumentacja wygenerowana: 2025-07-17*  
-*Wersja firmware: 0.4.0 (PAS + FOC)*
+*Wersja firmware: 0.5.0 (PAS + FOC + PI auto-tune)*

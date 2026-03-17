@@ -98,6 +98,22 @@ static bool g_foc_voltage_mode = false;   ///< Tryb napięciowy: Vq = duty wpros
 static unsigned long g_foc_last_debug_ms = 0;
 static unsigned long g_foc_last_loop_us = 0;  ///< Timestamp ostatniej iteracji FOC loop
 
+// ── PI Auto-tune (metoda relay / Åström-Hägglund) ──
+// Relay feedback: zamiast PI, wyjście przełączane +/-relay_amp gdy błąd >/<0.
+// Mierzy oscylacje Iq → oblicza ultimate gain Ku, period Tu → Kp, Ki (Z-N PI).
+static bool     g_foc_at_active = false;     ///< Auto-tune w toku
+static float    g_foc_at_relay_amp = 30.0f;  ///< Amplituda relay [PWM] (± wokół feedforward)
+static uint32_t g_foc_at_start_ms = 0;       ///< Timestamp startu [ms]
+static uint32_t g_foc_at_duration_ms = 5000; ///< Czas trwania testu [ms]
+static float    g_foc_at_err_prev = 0.0f;    ///< Poprzedni błąd Iq (detekcja zero-crossing)
+static uint16_t g_foc_at_crossings = 0;      ///< Liczba przejść przez zero błędu
+static uint32_t g_foc_at_first_cross_ms = 0; ///< Timestamp pierwszego zero-crossing
+static uint32_t g_foc_at_last_cross_ms = 0;  ///< Timestamp ostatniego zero-crossing
+static float    g_foc_at_err_max = 0.0f;     ///< Max błąd w bieżącym pół-cyklu
+static float    g_foc_at_err_min = 0.0f;     ///< Min błąd w bieżącym pół-cyklu
+static float    g_foc_at_amp_sum = 0.0f;     ///< Suma amplitud oscylacji (do średniej)
+static uint16_t g_foc_at_amp_count = 0;      ///< Liczba zmierzonych amplitud
+
 // Debug sterowania sinusoidalnego (snapshot + liczniki zdarzeń ISR)
 volatile uint32_t g_dbg_hall_edges = 0;
 volatile uint32_t g_dbg_sine_enter_count = 0;
@@ -1269,6 +1285,83 @@ void loop() {
             g_foc_last_loop_us = now_foc_us;
             if (dt <= 0.0f || dt > 0.05f) dt = FOC_LOOP_DT;  // clamp (max 50ms)
 
+            float vd, vq;
+
+            if (g_foc_at_active) {
+                // ── PI Auto-tune: relay feedback (Åström-Hägglund) ──
+                // Vd = 0 (jak normalnie), relay tylko na osi q.
+                vd = ff_vd;
+
+                float err_q = g_foc_iq_target - iq;
+                uint32_t now_at_ms = (uint32_t)(millis());
+
+                // Detekcja przejścia przez zero błędu
+                if (g_foc_at_crossings > 0 || (g_foc_at_err_prev != 0.0f)) {
+                    if ((err_q > 0.0f && g_foc_at_err_prev <= 0.0f) ||
+                        (err_q < 0.0f && g_foc_at_err_prev >= 0.0f)) {
+                        // Zapisz amplitudę z zakończonego pół-cyklu
+                        if (g_foc_at_crossings > 0) {
+                            float amp = (g_foc_at_err_max - g_foc_at_err_min) / 2.0f;
+                            if (amp > 0.001f) {
+                                g_foc_at_amp_sum += amp;
+                                g_foc_at_amp_count++;
+                            }
+                        }
+                        g_foc_at_err_max = err_q;
+                        g_foc_at_err_min = err_q;
+                        g_foc_at_crossings++;
+                        if (g_foc_at_crossings == 1) g_foc_at_first_cross_ms = now_at_ms;
+                        g_foc_at_last_cross_ms = now_at_ms;
+                    }
+                }
+                // Śledzenie min/max błędu w bieżącym pół-cyklu
+                if (err_q > g_foc_at_err_max) g_foc_at_err_max = err_q;
+                if (err_q < g_foc_at_err_min) g_foc_at_err_min = err_q;
+                g_foc_at_err_prev = err_q;
+
+                // Wyjście relay: +/- relay_amp wokół feedforward
+                float relay_out = (err_q > 0.0f) ? g_foc_at_relay_amp : -g_foc_at_relay_amp;
+                vq = ff_vq + relay_out;
+
+                // Sprawdzenie zakończenia testu
+                if ((now_at_ms - g_foc_at_start_ms) >= g_foc_at_duration_ms) {
+                    g_foc_at_active = false;
+                    // Reset PI integratorów po relay
+                    g_foc_pi_d.integral = 0.0f;
+                    g_foc_pi_q.integral = 0.0f;
+
+                    // Oblicz wyniki
+                    Serial.println();
+                    Serial.println("[PI Auto-tune] Zakończony.");
+                    if (g_foc_at_crossings >= 4 && g_foc_at_amp_count > 0) {
+                        // Średnia amplituda oscylacji Iq [A]
+                        float avg_amp = g_foc_at_amp_sum / (float)g_foc_at_amp_count;
+                        // Okres oscylacji Tu [s]
+                        float tu_s = (float)(g_foc_at_last_cross_ms - g_foc_at_first_cross_ms)
+                                     / (float)(g_foc_at_crossings - 1) * 2.0f / 1000.0f;
+                        // Ultimate gain: Ku = 4*d/(π*a)
+                        float ku = 4.0f * g_foc_at_relay_amp / (3.14159f * avg_amp);
+
+                        // Ziegler-Nichols PI: Kp = 0.45*Ku, Ti = Tu/1.2, Ki = Kp/Ti
+                        float kp_new = 0.45f * ku;
+                        float ti = tu_s / 1.2f;
+                        float ki_new = (ti > 0.0001f) ? (kp_new / ti) : 0.0f;
+
+                        Serial.printf("  Oscylacje: %d przejsc, amplituda=%.3f A, Tu=%.4f s\n",
+                                      g_foc_at_crossings, avg_amp, tu_s);
+                        Serial.printf("  Ku=%.3f, Tu=%.4f s\n", ku, tu_s);
+                        Serial.printf("  >> Sugerowane: Kp=%.3f  Ki=%.3f\n", kp_new, ki_new);
+                        Serial.printf("  Zastosuj: fkp:%.3f  fki:%.3f\n", kp_new, ki_new);
+                        Serial.printf("  (aktualne: Kp=%.3f  Ki=%.3f)\n",
+                                      g_foc_pi_q.kp, g_foc_pi_q.ki);
+                    } else {
+                        Serial.printf("  Za malo oscylacji (%d crossings). Zwieksz duty lub relay_amp.\n",
+                                      g_foc_at_crossings);
+                    }
+                }
+            } else {
+                // ── Normalny tryb PI ──
+
             // 7. PI regulator osi d: target Id = 0 (MTPA — max torque per amp)
             float err_d = 0.0f - id;
             g_foc_pi_d.integral += g_foc_pi_d.ki * err_d * dt;
@@ -1277,7 +1370,7 @@ void loop() {
             float corr_d = g_foc_pi_d.kp * err_d + g_foc_pi_d.integral;
             if (corr_d >  pi_limit) corr_d =  pi_limit;
             if (corr_d < -pi_limit) corr_d = -pi_limit;
-            float vd = ff_vd + corr_d;  // feedforward + korekta
+            vd = ff_vd + corr_d;  // feedforward + korekta
 
             // 8. PI regulator osi q: target Iq z przepustnicy
             float err_q = g_foc_iq_target - iq;
@@ -1287,7 +1380,8 @@ void loop() {
             float corr_q = g_foc_pi_q.kp * err_q + g_foc_pi_q.integral;
             if (corr_q >  pi_limit) corr_q =  pi_limit;
             if (corr_q < -pi_limit) corr_q = -pi_limit;
-            float vq = ff_vq + corr_q;  // feedforward + korekta
+            vq = ff_vq + corr_q;  // feedforward + korekta
+            }  // koniec if/else (autotune / normalny PI)
 
             // 9. Clamp globalny: Vd,Vq do bezpiecznego zakresu
             float v_max = (float)SINE_SAFE_MAX_DUTY;
@@ -2879,62 +2973,119 @@ void blockCommutate(uint8_t hallState, uint16_t duty) {
 /** @brief Wypisuje tabelę dostępnych komend Serial na konsole. */
 void printHelp() {
     Serial.println();
-    Serial.println("========== KOMENDY (wszystkie wymagają Enter) ==========");
-    Serial.println("e          Włącz tryb BLOCK sterowania");
-    Serial.println("S          Włącz tryb SINUS sterowania");
-    Serial.println("m2         Włącz tryb SINUS (alternatywna)");
-    Serial.println("F          Włącz tryb FOC sterowania");
-    Serial.println("m3         Włącz tryb FOC (alternatywna)");
-    Serial.println("d          Wyłącz silnik (duty=0)");
-    Serial.println("r          Odwróć kierunek (CW/CCW) - tylko gdy wyłączony");
-    Serial.println("+/-        Zmień duty o ±5%");
-    Serial.println("0-100      Ustaw duty w procentach");
+    Serial.println("==================== KOMENDY (wszystkie wymagaja Enter) ====================");
+    Serial.println();
+    Serial.println("---------- Tryby sterowania silnika ----------");
+    Serial.println("e          Wlacz tryb BLOCK (6-krokowa komutacja trapezowa)");
+    Serial.println("             Prosty, niezawodny. Sygnaly Hall -> 6 stanow przelaczania.");
+    Serial.println("             Szum slyszalny, ale niskie wymagania obliczeniowe.");
+    Serial.println("S / m2     Wlacz tryb SINUS (plynna komutacja sinusoidalna)");
+    Serial.println("             Tablica sinusow 96 wpisow, interpolacja miedzy Hallami.");
+    Serial.println("             Cichszy niz BLOCK, plynniejszy moment obrotowy.");
+    Serial.println("F / m3     Wlacz tryb FOC (Field Oriented Control - sterowanie wektorowe)");
+    Serial.println("             Transformacja Clarke+Park, regulator PI osi d/q.");
+    Serial.println("             Feedforward + korekcja pradowa. Najlepsza sprawnosc.");
+    Serial.println("d          Wylacz silnik (duty=0, wszystkie MOSFET OFF = wolnobieg)");
+    Serial.println("r          Odwroc kierunek obrotow (CW<->CCW)");
+    Serial.println("             Dziala tylko gdy silnik wylaczony (d). Zmienia sekwencje faz.");
+    Serial.println();
+    Serial.println("---------- Sterowanie moca (duty cycle) ----------");
+    Serial.println("+          Zwieksz duty o 5% (wzgledem PWM_MAX_DUTY=1023)");
+    Serial.println("-          Zmniejsz duty o 5%");
+    Serial.println("0-100      Ustaw duty bezposrednio [%]. Np. '50' = 50% mocy.");
+    Serial.println("             0=wylaczony, 100=pelna moc. Dziala w trybie manual.");
+    Serial.println("man        Manual duty ON/OFF. Gdy ON: manetka (przepustnica) ignorowana,");
+    Serial.println("             duty sterowane tylko komendami +/-/0-100 z konsoli.");
     Serial.println("R          Regeneracja ON/OFF (hamowanie rekuperacyjne)");
-    Serial.println("b          Symulacja hamulca ON/OFF");
-    Serial.println("P          Pokaż parametry wyświetlacza P01-P20");
-    Serial.println("s          Pokaż status");
-    Serial.println("a          Auto-status co 1s ON/OFF");
-    Serial.println("man        Manual duty ON/OFF (manetka ignorowana gdy ON)");
-    Serial.println("gdbg       Debug SINUS/BLOCK ON/OFF (co 200ms)");
-    Serial.println("so         Pokaż aktualny sine phase offset");
-    Serial.println("so+        Offset +2 wpisy (+7.5°)");
-    Serial.println("so-        Offset -2 wpisy (-7.5°)");
-    Serial.println("so:N       Ustaw offset na N (-48..+48, 1=3.75°)");
-    Serial.println("sat        Auto-tune offsetu fazy (sweep -24..+24, ~25s)");
-    Serial.println("sat:M:N    Auto-tune zakres M..N  (np. sat:-16:16)");
+    Serial.println("             Gdy ON: przetwornica zwraca energie do baterii przy hamowaniu.");
+    Serial.println("             Wymaga predkosci > 50 RPM, Vbat < 42V (ochrona LiPo).");
+    Serial.println("b          Symulacja hamulca ON/OFF (natychmiastowe duty=0, nadrzedny)");
+    Serial.println();
+    Serial.println("---------- Status i diagnostyka ----------");
+    Serial.println("s          Pokaz pelny status: tryb, duty, predkosc, napiecie, prady,");
+    Serial.println("             PAS, assist level, throttle RAW, temperatura (jesli dostepna).");
+    Serial.println("a          Auto-status co 1s ON/OFF (cykliczne wypisywanie statusu)");
+    Serial.println("P          Pokaz parametry wyswietlacza S866 P01-P20:");
+    Serial.println("             P05=poziomy assist, P06=rozmiar kola, P07=magnesy/polpary,");
+    Serial.println("             P08=limit predkosci [km/h], P10=tryb jazdy, P13=magnesy PAS.");
+    Serial.println("gdbg       Debug SINUS/BLOCK ON/OFF (co 200ms: hall idx, predkosc, duty)");
+    Serial.println();
+    Serial.println("---------- Offset fazy sinusa (SINUS/FOC) ----------");
+    Serial.println("so         Pokaz aktualny offset fazy [-48..+48], 1 wpis = 3.75 deg el.");
+    Serial.println("so+        Offset +2 wpisy (+7.5 deg) - wiecej mocy w jednym kierunku");
+    Serial.println("so-        Offset -2 wpisy (-7.5 deg)");
+    Serial.println("so:N       Ustaw offset na N (zakres -48..+48). Dostraja fazowanie");
+    Serial.println("             miedzy Hallami a uzwojeniami. Zly offset = slaba moc/szarpanie.");
+    Serial.println("sat        Auto-tune offsetu fazy: sweep -24..+24 krok 2, mierzy prad.");
+    Serial.println("             Najlepszy offset = najwyzszy prad przy stalym duty (~25s).");
+    Serial.println("sat:M:N    Auto-tune zakres M..N (np. sat:-16:16)");
     Serial.println("sat:M:N:S  Auto-tune zakres M..N krok S (np. sat:-8:8:1)");
+    Serial.println();
     Serial.println("---------- FOC (Field Oriented Control) ----------");
-    Serial.println("foc        Pokaż status FOC (Vd/Vq, Id/Iq, PI)");
-    Serial.println("fdbg       Debug FOC ON/OFF (co 200ms)");
-    Serial.println("fkp:N.N    Ustaw Kp obu osi d/q (0.0-100.0)");
-    Serial.println("fki:N.N    Ustaw Ki obu osi d/q (0.0-1000.0)");
-    Serial.println("fkpd:N.N   Ustaw Kp tylko osi d (0.0-100.0)");
-    Serial.println("fkid:N.N   Ustaw Ki tylko osi d (0.0-1000.0)");
-    Serial.println("fvolt      FOC voltage mode ON/OFF (Vq=duty, bez PI)");
-    Serial.println("h          Pokaż tę pomoc");
+    Serial.println("  Regulator PI (Proportional-Integral) steruje pradem w osiach d/q.");
+    Serial.println("  Iq (os q) = moment obrotowy, Id (os d) = 0 (MTPA).");
+    Serial.println("  Wyjscie PI = feedforward (Vq=duty) + korekcja PI (+/-100 PWM max).");
+    Serial.println();
+    Serial.println("  Kp (proporcjonalny): natychmiastowa reakcja na blad pradu [PWM/A].");
+    Serial.println("    Za niskie Kp = wolna reakcja, blad ustalonego stanu.");
+    Serial.println("    Za wysokie Kp = oscylacje, niestabilnosc. Domyslnie: 0.5");
+    Serial.println("  Ki (calkujacy): eliminuje blad ustalony, kumuluje blad w czasie [PWM/(A*s)].");
+    Serial.println("    Za niskie Ki = wolne dochodzenie do celu, pozostaly blad.");
+    Serial.println("    Za wysokie Ki = przeregulowanie, oscylacje. Domyslnie: 5.0");
+    Serial.println("    Anti-windup: calka ograniczona do +/-pi_limit.");
+    Serial.println();
+    Serial.println("foc        Pokaz status FOC: Vd/Vq [PWM], Id/Iq [A], Kp/Ki, integral");
+    Serial.println("fdbg       Debug FOC ON/OFF (co 200ms: prady, napiecia, blad PI)");
+    Serial.println("fkp:N.N    Ustaw Kp obu osi d i q (zakres 0.0-100.0). Np. fkp:0.8");
+    Serial.println("fki:N.N    Ustaw Ki obu osi d i q (zakres 0.0-1000.0). Np. fki:10.0");
+    Serial.println("fkpd:N.N   Ustaw Kp TYLKO osi d (zakres 0.0-100.0)");
+    Serial.println("fkid:N.N   Ustaw Ki TYLKO osi d (zakres 0.0-1000.0)");
+    Serial.println("fvolt      FOC voltage mode ON/OFF: Vq=duty wprost, bez regulatora PI.");
+    Serial.println("             Do diagnostyki: porownanie SINUS vs FOC bez wplywu PI.");
+    Serial.println("fpitune    Auto-tuning PI metoda Astrom-Hagglund (relay feedback).");
+    Serial.println("             Wymaga: tryb FOC, silnik pracuje (duty>0). Czas: ~5s.");
+    Serial.println("             Przejsciowo zastepuje PI sterowaniem ON/OFF (relay),");
+    Serial.println("             mierzy oscylacje pradu Iq, oblicza optymalne Kp/Ki.");
+    Serial.println();
     Serial.println("---------- Test MOSFET (diagnostyka) ----------");
-    Serial.println("tAH        Test faza A HIGH-side");
-    Serial.println("tAL        Test faza A LOW-side");
-    Serial.println("tBH        Test faza B HIGH-side");
-    Serial.println("tBL        Test faza B LOW-side");
-    Serial.println("tCH        Test faza C HIGH-side");
-    Serial.println("tCL        Test faza C LOW-side");
-    Serial.println("tp:N       Ustaw duty testowe na N% (1-50)");
-    Serial.println("t0         Wyłącz test MOSFET (wszystkie OFF)");
-    Serial.println("t          Pokaż pomoc trybu testowego");
-    Serial.println("---------- Konfiguracja NVS ----------");
-    Serial.println("cfg            Poka\u017c aktualn\u0105 konfiguracj\u0119 NVS");
-    Serial.println("cfg:mode:N    Tryb boot (1=BLOCK 2=SIN 3=FOC)");
-    Serial.println("cfg:ramp:N    Czas rampy [ms] 0-10000");
-    Serial.println("cfg:regen:N   Regeneracja boot (0/1)");
-    Serial.println("cfg:step:N    Max zmiana duty na krok [%] 1-100 (0=bez limitu)");
-    Serial.println("---------- PAS (Pedal Assist) ----------");
-    Serial.println("pasdir         Przełącz kierunek PAS (normal/odwrócony)");
-    Serial.println("passtart:N     Czas ciągłego pedałowania do aktywacji [ms]");
-    Serial.println("passtop:N      Timeout braku impulsów PAS [ms]");
-    Serial.println("pasramp:N      Soft-start: czas narastania mocy 0->100% [ms]");
-    Serial.println("pasdbg         Debug PAS (czasy, kierunek, stan)");
-    Serial.println("===========================");
+    Serial.println("t          Pokaz pomoc trybu testowego");
+    Serial.println("tAH/tBH/tCH  Wlacz tranzystor HIGH-side fazy A/B/C (PWM testowe)");
+    Serial.println("tAL/tBL/tCL  Wlacz tranzystor LOW-side fazy A/B/C");
+    Serial.println("tp:N       Ustaw duty testowe na N% (zakres 1-50, bezpieczenstwo)");
+    Serial.println("t0         Wylacz test MOSFET (wszystkie tranzystory OFF)");
+    Serial.println();
+    Serial.println("---------- Konfiguracja NVS (EEPROM, zachowana po restarcie) ----------");
+    Serial.println("cfg        Pokaz aktualna konfiguracje NVS + wartosc runtime");
+    Serial.println("cfg:mode:N Tryb po restarcie: 0=wylaczony, 1=BLOCK, 2=SINUS, 3=FOC");
+    Serial.println("cfg:ramp:N Czas rampy duty 0->100% [ms], zakres 0-10000. 0=natychmiastowy.");
+    Serial.println("             Rampa dziala w OBU kierunkach (przyspieszanie i zwalnianie).");
+    Serial.println("cfg:regen:N  Regeneracja po restarcie: 0=wyl, 1=wl");
+    Serial.println("cfg:step:N Max zmiana duty na krok petli glownej [%], zakres 1-100.");
+    Serial.println("             0=bez limitu. Domyslnie 5%. Ogranicza szarpniecia mocy.");
+    Serial.println("             Dziala razem z rampa (bardziej restrykcyjny wygrywa).");
+    Serial.println();
+    Serial.println("---------- PAS (Pedal Assist Sensor) ----------");
+    Serial.println("  Czujnik na GPIO22, dysk magnesow na wale korbowym.");
+    Serial.println("  Detekcja kierunku: asymetria HIGH/LOW (histereza +/-5 impulsow).");
+    Serial.println("  V_target z poziomu assist: 6 + Lx*(Vmax-6)/15 km/h, wygladzony.");
+    Serial.println("  Freewheel: gdy Vkola >= Vtarget, duty=0 (motor nie przeszkadza).");
+    Serial.println();
+    Serial.println("pasdir       Przelacz kierunek PAS normal/odwrocony (zapisuje do NVS).");
+    Serial.println("               Jesli silnik krecisie wstecz przy pedalowaniu, uzyj tego.");
+    Serial.println("passtart:N   Opoznienie startu [ms] (zakres 0-10000, domyslnie 2000).");
+    Serial.println("               Czas ciaglego pedalowania do przodu wymagany do aktywacji.");
+    Serial.println("               Zapobiega przypadkowemu wlaczeniu silnika.");
+    Serial.println("passtop:N    Timeout stopu [ms] (zakres 100-10000, domyslnie 1000).");
+    Serial.println("               Czas bez impulsow PAS po ktorym silnik wylacza wspomaganie.");
+    Serial.println("               Nizsza wartosc = szybsza reakcja na stop pedalowania.");
+    Serial.println("pasramp:N    Soft-start [ms] (zakres 0-10000, domyslnie 1500).");
+    Serial.println("               Czas narastania mocy 0->100% po aktywacji PAS.");
+    Serial.println("               0=natychmiastowy start, 1500=lagodne narastanie ~1.5s.");
+    Serial.println("pasdbg       Debug PAS ON/OFF: kierunek, kadencja RPM, V_target,");
+    Serial.println("               V_smooth, speed_MA, duty, soft-start, stan automatu.");
+    Serial.println();
+    Serial.println("h          Pokaz te pomoc");
+    Serial.println("==========================================================================");
     Serial.println();
 }
 
@@ -3359,6 +3510,35 @@ static String executeCommand(const String& cmd) {
         return g_foc_voltage_mode
             ? "FOC Voltage mode: ON (Vq=duty, bez PI — jak SINUS w ramie dq)"
             : "FOC Voltage mode: OFF (PI closed-loop)";
+    }
+    if (cmd == "fpitune") {
+        if (g_bldc_state.mode != DRIVE_MODE_FOC) {
+            return "Blad: wymaga trybu FOC (wpisz F)";
+        }
+        if (g_bldc_state.duty_cycle == 0) {
+            return "Blad: silnik musi pracowac (duty > 0)";
+        }
+        if (g_foc_voltage_mode) {
+            return "Blad: wylacz voltage mode (fvolt) przed auto-tune";
+        }
+        if (g_foc_at_active) {
+            return "Auto-tune juz w toku...";
+        }
+        // Inicjalizacja stanu auto-tune
+        g_foc_at_relay_amp = 30.0f;
+        g_foc_at_start_ms = (uint32_t)millis();
+        g_foc_at_crossings = 0;
+        g_foc_at_first_cross_ms = 0;
+        g_foc_at_last_cross_ms = 0;
+        g_foc_at_err_prev = 0.0f;
+        g_foc_at_err_max = 0.0f;
+        g_foc_at_err_min = 0.0f;
+        g_foc_at_amp_sum = 0.0f;
+        g_foc_at_amp_count = 0;
+        g_foc_pi_d.integral = 0.0f;
+        g_foc_pi_q.integral = 0.0f;
+        g_foc_at_active = true;
+        return "[PI Auto-tune] START — relay feedback 5s. Silnik moze oscylowac.";
     }
     if (cmd == "man") {
         g_manual_duty_override = !g_manual_duty_override;
