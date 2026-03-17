@@ -721,7 +721,7 @@ Komendy UART (`+`, `-`, liczba%) ustawiają `duty_target` i natychmiast synchron
 
 ## Rampa rozpędzania
 
-Silnik nigdy nie otrzyma natychmiastowego skoku duty z 0% do 100%. Zaimplementowana rampa ogranicza szybkość narastania `duty_cycle` w czasie.
+Silnik nigdy nie otrzyma natychmiastowego skoku duty. Zaimplementowana rampa ogranicza szybkość zmiany `duty_cycle` w czasie — zarówno w górę jak i w dół.
 
 ### Zasada działania
 
@@ -736,16 +736,18 @@ Przepustnica → duty_target (docelowe)
 ```
 
 - **Wzrost (rozpędzanie):** duty_cycle narasta płynnie, ograniczone czasem rampy
-- **Spadek (zwalnianie):** **natychmiastowy** — puszczenie gazu od razu zmniejsza moc (bezpieczeństwo)
+- **Spadek (zwalnianie):** duty_cycle maleje płynnie, tą samą rampą (symetrycznie)
 - **Hamulec aktywny:** rampa jest **zerowana** (`g_duty_ramped = 0`) — po puszczeniu hamulca silnik startuje od 0 z pełną rampą rozpędzania, bez nagłego skoku mocy
+- **Dodatkowy limit:** `duty_max_step_pct` (EEPROM, domyślnie 5%) — max % zmiany duty na jedno wywołanie loop()
 
 ### Parametry
 
 | Parametr | Wartość | Opis |
 |---|---|---|
-| `ramp_time_ms` | 1200 ms (domyślnie) | Czas przejścia 0→100% duty |
-| Krok rampy | obliczany z dt | `max_step = PWM_MAX_DUTY × dt_us / (ramp_time_ms × 1000)` |
-| `ramp_time_ms = 0` | — | Rampa wyłączona (natychmiastowy skok) |
+| `ramp_time_ms` | 1200 ms (domyślnie) | Czas przejścia 0→100% duty (i 100%→0%) |
+| `duty_max_step_pct` | 5% (EEPROM) | Max zmiana duty na wywołanie [% PWM_MAX] (0=brak limitu) |
+| Krok rampy | obliczany z dt | `max_step = min(ramp_step, pct_step)` |
+| `ramp_time_ms = 0` | — | Rampa wyłączona (duty_max_step_pct dalej aktywny) |
 
 Rampa jest oparta na rzeczywistym czasie (`micros()`), więc działa poprawnie niezależnie od szybkości `loop()`.
 
@@ -759,6 +761,7 @@ Po puszczeniu hamulca, jeśli przepustnica jest wciśnięta, silnik rozpędza si
 
 Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
 - `D:35/80%` — rampa w trakcie narastania (35% aktualnie, docelowo 80%)
+- `D:80/30%` — rampa w trakcie spadku (80% aktualnie, docelowo 30%)
 - `D:80/80%` — rampa osiągnęła cel
 - `D:0/0%` — silnik wyłączony
 
@@ -851,6 +854,17 @@ odczyty kierunku nie przerywają wspomagania.
 
 Przy deaktywacji (timeout lub reverse) duty schodzi do zera z ograniczeniem
 slew rate — łagodne wygaszenie zamiast twardego odcięcia.
+
+### Wygładzone V_target (smooth transition)
+
+Gdy użytkownik zmienia poziom wspomagania w trakcie jazdy (np. L5→L3),
+V_target nie skacze natychmiast z 25 na 17.4 km/h. Zamiast tego przechodzi
+płynnie z prędkością ~10 km/h/s (stała `VTARGET_SLEW = 0.005 km/h` na wywołanie).
+
+Bez tego wygładzenia nagły spadek V_target powodował natychmiastowe
+zerowanie duty (bo speed > new_v_target), a następnie ponowne rozpędzanie
+po spadku prędkości — odczuwalne jako „uderzenie”. Z wygładzeniem duty maleje
+stopniowo, a prędkość koła płynnie dostosowuje się do nowej wartości docelowej.
 
 ### Kombinacja PAS + Manetka (P10)
 
@@ -975,6 +989,7 @@ P13 magnets:      12
 | `cfg:mode:N` Enter | Tryb boot: 1=BLOCK, 2=SINUS, 3=FOC (zapis NVS) |
 | `cfg:ramp:N` Enter | Czas rampy 0-10000 ms (zapis NVS + natychmiast runtime) |
 | `cfg:regen:N` Enter | Regeneracja boot: 0=OFF, 1=ON (zapis NVS + natychmiast runtime) |
+| `cfg:step:N` Enter | Max zmiana duty na krok: 0-100% (0=brak limitu, zapis NVS) |
 
 ### Format statusu (jedna linia)
 
@@ -1033,7 +1048,7 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | Pole | Typ | Domyślnie | Opis |
 |---|---|---|---|
 | `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 4 | Wersja struktury |
+| `version` | uint16_t | 5 | Wersja struktury |
 | `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
 | `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
 | `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
@@ -1041,7 +1056,8 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | `pas_start_delay_ms` | uint16_t | 2000 | Opóźnienie startu PAS [ms] |
 | `pas_stop_delay_ms` | uint16_t | 1000 | Timeout PAS — brak impulsów [ms] |
 | `pas_ramp_ms` | uint16_t | 1500 | Soft-start PAS: czas narastania 0→100% [ms] |
-| `_reserved[47]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
+| `duty_max_step_pct` | uint8_t | 5 | Max zmiana duty na wywołanie [% PWM_MAX] |
+| `_reserved[46]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
 
 ### Walidacja
 
@@ -1061,6 +1077,7 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | `passtart:N` | Opóźnienie startu PAS 0-10000 ms, zapisuje NVS |
 | `passtop:N` | Timeout PAS 100-10000 ms, zapisuje NVS |
 | `pasramp:N` | Soft-start PAS 0-10000 ms, zapisuje NVS |
+| `cfg:step:N` | Max zmiana duty 0-100% na krok, zapisuje NVS |
 
 ### Przykład wyjścia `cfg`
 
@@ -1073,8 +1090,9 @@ pas_dir_invert:  0 (NORMAL)
 pas_start_delay: 2000 ms
 pas_stop_delay:  1000 ms
 pas_ramp:        1500 ms
+duty_step:       5 %
 magic:           0x424C4401 OK
-version:         4
+version:         5
 ======================================
 --- Runtime (bieżące) ---
 mode:            SINUS

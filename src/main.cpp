@@ -521,6 +521,8 @@ static bool g_pas_pedaling = false;
 static uint16_t g_pas_prev_duty = 0;
 /// Timestamp [ms] ostatniego widzianego g_pas_forward==true — holdoff reverse
 static uint32_t g_pas_last_fwd_ms = 0;
+/// Wygładzona prędkość docelowa PAS — zapobiega szarpnięciom przy zmianie poziomu
+static float g_pas_vtarget_smooth = 0.0f;
 
 // --- Bufor średniej kroczącej prędkości koła (Moving Average) ---
 #define PAS_SPEED_MA_SIZE  8
@@ -584,6 +586,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_fwd_since_ms = 0;
         g_pas_active_since_ms = 0;
         g_pas_prev_duty = 0;
+        g_pas_vtarget_smooth = 0.0f;
         return 0;
     }
 
@@ -602,6 +605,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_pedaling = false;
         g_pas_fwd_since_ms = 0;
         g_pas_active_since_ms = 0;
+        g_pas_vtarget_smooth = 0.0f;
         // Slew rate w dół: łagodne wygaszenie zamiast twardego 0
         if (g_pas_prev_duty > PAS_SLEW_RATE_MAX) {
             g_pas_prev_duty -= PAS_SLEW_RATE_MAX;
@@ -624,6 +628,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_pedaling = false;
         g_pas_fwd_since_ms = 0;
         g_pas_active_since_ms = 0;
+        g_pas_vtarget_smooth = 0.0f;
         if (g_pas_prev_duty > PAS_SLEW_RATE_MAX) {
             g_pas_prev_duty -= PAS_SLEW_RATE_MAX;
             return g_pas_prev_duty;
@@ -658,11 +663,25 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         }
     }
 
-    // --- V_target z poziomu wspomagania ---
+    // --- V_target z poziomu wspomagania (z wygładzeniem) ---
     uint8_t raw_assist = g_display.rx.assist_level;     // 0..15
     uint8_t v_max = g_display.config.p08_speed_limit;
     if (v_max == 0) v_max = 25;
-    float v_target = 6.0f + (float)raw_assist * ((float)v_max - 6.0f) / 15.0f;
+    float v_target_raw = 6.0f + (float)raw_assist * ((float)v_max - 6.0f) / 15.0f;
+
+    // Smooth V_target: zapobiega szarpnięciom przy zmianie assist level w trakcie jazdy.
+    // Slew rate ~10 km/h/s (0.005 km/h na wywołanie przy ~2kHz loop).
+    // Zmiana L5→L3 (25→17.4 km/h) trwa ~0.76s zamiast natychmiast.
+    if (g_pas_vtarget_smooth <= 0.0f) {
+        g_pas_vtarget_smooth = v_target_raw;  // pierwszy start: snap
+    } else {
+        const float VTARGET_SLEW = 0.005f;  // km/h na wywołanie (~10 km/h/s)
+        float vdiff = v_target_raw - g_pas_vtarget_smooth;
+        if (vdiff > VTARGET_SLEW) vdiff = VTARGET_SLEW;
+        if (vdiff < -VTARGET_SLEW) vdiff = -VTARGET_SLEW;
+        g_pas_vtarget_smooth += vdiff;
+    }
+    float v_target = g_pas_vtarget_smooth;
 
     // --- Średnia krocząca prędkości (Moving Average, 8 próbek) ---
     float raw_speed = g_bldc_state.wheel_speed_kmh;
@@ -1117,9 +1136,10 @@ void loop() {
         g_bldc_state.duty_target = combined_duty;
     }
 
-    // Rampa rozpędzania: duty_cycle narasta płynnie w kierunku duty_target
-    // Czas rampy = ramp_time_ms dla przejścia 0→100%.
-    // Spadek (hamowanie przepustnicą) jest natychmiastowy — rampa działa tylko w górę.
+    // Rampa dwukierunkowa: duty zmienia się płynnie w OBU kierunkach.
+    // Czas rampy = ramp_time_ms (0→100% i 100%→0%).
+    // Dodatkowy limit: duty_max_step_pct (max % zmiany na wywołanie, EEPROM).
+    // Hamulec = natychmiastowe zerowanie (safety override).
     {
         uint16_t target = g_bldc_state.duty_target;
         unsigned long now_us = micros();
@@ -1129,24 +1149,34 @@ void loop() {
         if (g_bldc_state.brake_active) {
             // Hamulec → zeruj rampę (po puszczeniu hamulca silnik startuje płynnie od 0)
             g_duty_ramped = 0;
-        } else if (target <= g_duty_ramped) {
-            // Spadek — natychmiastowy (bezpieczeństwo: szybkie zwolnienie gazu)
-            g_duty_ramped = target;
-        } else if (g_bldc_state.ramp_time_ms > 0) {
-            // Wzrost — ograniczony rampą
-            // max_step = PWM_MAX_DUTY × dt_us / (ramp_time_ms × 1000)
-            uint32_t max_step = (uint32_t)PWM_MAX_DUTY * dt_us
-                                / ((uint32_t)g_bldc_state.ramp_time_ms * 1000UL);
-            if (max_step < 1) max_step = 1;
-            uint16_t diff = target - g_duty_ramped;
-            if (diff > max_step) {
-                g_duty_ramped += (uint16_t)max_step;
+        } else if (target != g_duty_ramped) {
+            // Oblicz max krok z ramp_time_ms (time-based)
+            uint32_t ramp_step;
+            if (g_bldc_state.ramp_time_ms > 0) {
+                ramp_step = (uint32_t)PWM_MAX_DUTY * dt_us
+                            / ((uint32_t)g_bldc_state.ramp_time_ms * 1000UL);
+                if (ramp_step < 1) ramp_step = 1;
             } else {
-                g_duty_ramped = target;
+                ramp_step = PWM_MAX_DUTY;  // ramp wyłączony
             }
-        } else {
-            // ramp_time_ms == 0 → rampa wyłączona
-            g_duty_ramped = target;
+
+            // Oblicz max krok z duty_max_step_pct (per-call clamp, EEPROM)
+            uint8_t pct = config_get().duty_max_step_pct;
+            uint32_t pct_step = (pct > 0 && pct <= 100)
+                ? ((uint32_t)PWM_MAX_DUTY * pct / 100)
+                : PWM_MAX_DUTY;  // 0 lub >100 → brak limitu
+
+            // Użyj bardziej restrykcyjnego limitu
+            uint32_t max_step = (ramp_step < pct_step) ? ramp_step : pct_step;
+            if (max_step < 1) max_step = 1;
+
+            if (target > g_duty_ramped) {
+                uint16_t diff = target - g_duty_ramped;
+                g_duty_ramped += (diff > max_step) ? (uint16_t)max_step : diff;
+            } else {
+                uint16_t diff = g_duty_ramped - target;
+                g_duty_ramped -= (diff > max_step) ? (uint16_t)max_step : diff;
+            }
         }
         g_bldc_state.duty_cycle = g_duty_ramped;
     }
@@ -2897,6 +2927,7 @@ void printHelp() {
     Serial.println("cfg:mode:N    Tryb boot (1=BLOCK 2=SIN 3=FOC)");
     Serial.println("cfg:ramp:N    Czas rampy [ms] 0-10000");
     Serial.println("cfg:regen:N   Regeneracja boot (0/1)");
+    Serial.println("cfg:step:N    Max zmiana duty na krok [%] 1-100 (0=bez limitu)");
     Serial.println("---------- PAS (Pedal Assist) ----------");
     Serial.println("pasdir         Przełącz kierunek PAS (normal/odwrócony)");
     Serial.println("passtart:N     Czas ciągłego pedałowania do aktywacji [ms]");
@@ -3504,6 +3535,7 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_start_ms:  %u ms\n",  (unsigned)cfg.pas_start_delay_ms);
         Serial.printf("pas_stop_ms:   %u ms\n",  (unsigned)cfg.pas_stop_delay_ms);
         Serial.printf("pas_ramp_ms:   %u ms\n",  (unsigned)cfg.pas_ramp_ms);
+        Serial.printf("duty_step:     %d %%\n",   cfg.duty_max_step_pct);
         Serial.printf("magic:         0x%08X %s\n", cfg.magic, (cfg.magic == CONFIG_MAGIC) ? "OK" : "BAD!");
         Serial.printf("version:       %d\n",      cfg.version);
         Serial.println("======================================");
@@ -3551,6 +3583,15 @@ static String executeCommand(const String& cmd) {
             }
             config_save();
             return val ? "Regen: ON" : "Regen: OFF";
+        }
+        if (cmd.startsWith("cfg:step:")) {
+            int val = cmd.substring(9).toInt();
+            if (val >= 0 && val <= 100) {
+                cfg.duty_max_step_pct = (uint8_t)val;
+                config_save();
+                return "Duty max step: " + String(val) + "%";
+            }
+            return "Zakres 0-100 %";
         }
         return "Nieznany parametr cfg";
     }
