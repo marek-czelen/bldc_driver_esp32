@@ -430,6 +430,10 @@ so           ← sprawdź jaki offset został wybrany
 Opcjonalnie można podać zakres: `sat:-8:8:1` (od -8 do +8, krok 1).
 Wysyłane ponownie `sat` podczas pracy anuluje strojenie i przywraca poprzedni offset.
 
+Opcja `sat` działa również w trybie **FOC** — offset fazy jest tak samo ważny dla poprawnego mapowania Hall→kąt w transformacie Parka.
+
+Wynik i bieżący offset są automatycznie **zapisywane do NVS** po zakończeniu auto-tune. Komendy `so+`, `so-`, `so:N` również zapisują do NVS.
+
 Całkowity czas: ~25 kroków × 1s = ~25 sekund (domyślne).
 
 ### Stałe sinusoidalne
@@ -876,6 +880,20 @@ Parametr P10 z wyświetlacza S866 określa tryb jazdy:
 Manetka działa w pełnym zakresie 0–PWM_MAX_DUTY (niezależnie od assist level).
 PAS jest ograniczony przez V_target zależny od poziomu wspomagania.
 
+### Zatrzymanie czujnika na magnesie (fix)
+
+Problęm: gdy magnes zatrzyma się tuż przy czujniku Halla, generowane są krótkie szpilki (~17 ms) co kilkanaście sekund. `since` resetuje się do ~17 ms po każdej szpilce, więc timeout (`pas_stop_delay_ms = 1000 ms`) nigdy nie zachodzi — silnik jest nadal napędzany mimo braku pedałowania.
+
+Rozwiązanie: dwa warunki stopu zamiast jednego:
+```
+timed_out    = (since > stop_delay_us)
+period_too_long = (period_us > stop_delay_us)   // NOWE
+stop = timed_out || period_too_long
+```
+Jeśli ostatni zmierzony **okres** jest dłuższy niż stop_delay — to nie jest realne pedałowanie, nawet jeśli ISR widział impulsy.
+
+> **Uwaga:** Przy wolnym pedałowaniu (np. 5 RPM, 1 magnes, period=12s) `stop_delay_ms` musi być ustawiony odpowiednio duże: `passtop:13000`.
+
 ### Parametry NVS (konfigurowane komendami Serial)
 
 | Parametr | Domyślnie | Komenda | Opis |
@@ -891,6 +909,26 @@ PAS jest ograniczony przez V_target zależny od poziomu wspomagania.
 - `PAS:ON 85% vt:14.9 sl:0.85` — aktywny, 85% duty, V_target=14.9 km/h, speed limit factor=0.85
 - `PAS:WAIT 850ms/2000ms fw:1 H:45000 L:32000` — w start delay, 850/2000 ms, forward=1, czasy H/L
 - `PAS:REV H:28000 L:35000` — kierunek reverse, czasy półokresów
+
+**Status (auto-status)** — linia `[PAS]` wyświetlana zawsze:
+```
+  [PAS] st:ON edges:3657 since:2ms H:124ms L:83ms asym:20% conf:5 fwd:1 rpm:23 fwd_ms:2350/2000 ped:1 inv:0 d:61% vt:22.8 sl:1.00
+```
+
+| Pole | Opis |
+|------|------|
+| `st:` | Stan: `STOP`/`WAIT`/`ON`/`REV` |
+| `edges:` | Licznik krawędzi ISR (róśnie przy pedałowaniu) |
+| `since:` | ms od ostatniego impulsu |
+| `H:/L:` | Czasy HIGH/LOW w ms |
+| `asym:` | Asymetria % (musi być >5% dla detekcji kierunku) |
+| `conf:` | Pewność kierunku -5..+5 |
+| `fwd:` | Aktualny kierunek (0=wstecz, 1=wprzód) |
+| `rpm:` | Wyliczona kadencja [RPM] |
+| `fwd_ms:/` | Czas pedałowania forward / wymagany start_delay |
+| `ped:` | Czy logika uznała pedałowanie za aktywne |
+| `inv:` | Czy kierunek odwrócony (`pasdir`) |
+| `d:/vt:/sl:` | (tylko gdy ON) duty%, V_target, speed-limit factor |
 
 **Komenda `pasdbg`:**
 ```
@@ -986,7 +1024,11 @@ P13 magnets:      12
 | `cfg:mode:N` Enter | Tryb boot: 1=BLOCK, 2=SINUS, 3=FOC (zapis NVS) |
 | `cfg:ramp:N` Enter | Czas rampy 0-10000 ms (zapis NVS + natychmiast runtime) |
 | `cfg:regen:N` Enter | Regeneracja boot: 0=OFF, 1=ON (zapis NVS + natychmiast runtime) |
+| `cfg:rev:N` Enter | Kierunek obrotów: 0=CW, 1=CCW (zapis NVS + natychmiast runtime) |
 | `cfg:step:N` Enter | Max zmiana duty na krok: 0-100% (0=brak limitu, zapis NVS) |
+| `cfg:defaults` | Zaladuj wartości domyślne do runtime (bez zapisu EEPROM) |
+| `cfg:save` | Zapisz aktualne wartości runtime do EEPROM |
+| `cfg:reload` | Wczytaj wartości z EEPROM i zastosuj do runtime (w tym tryb silnika) |
 
 ### Format statusu (jedna linia)
 
@@ -1016,6 +1058,13 @@ BLK D:35/80% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870) RPM:120 WT
 | `PAS:REV H:28000 L:35000` | PAS — pedałowanie do tyłu (czasy półokresów) |
 | `FAULT` | Błąd czujników Halla |
 
+Linia `[PAS]` wyświetlana jest zawsze (niezależnie od stanu PAS) — patrz sekcja [PAS — diagnostyka](#pas--pedal-assist-sensor).
+
+Linia `[DBG]` wyświetlana jest w trybach SINUS i FOC:
+```
+  [DBG] ang:62 spd:37025 hdir:1 sec:3 h:100 hs:4 hp:1500us err:-1 snp:5 cor:26138 fb:1 d:556 vq:58 iq:0.27 tgt:0.50
+```
+
 ---
 
 ## Kalibracja prądów
@@ -1044,7 +1093,7 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | Pole | Typ | Domyślnie | Opis |
 |---|---|---|---|
 | `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 5 | Wersja struktury |
+| `version` | uint16_t | 7 | Wersja struktury |
 | `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
 | `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
 | `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
@@ -1053,7 +1102,13 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | `pas_stop_delay_ms` | uint16_t | 1000 | Timeout PAS — brak impulsów [ms] |
 | `pas_ramp_ms` | uint16_t | 1500 | Soft-start PAS: czas narastania 0→100% [ms] |
 | `duty_max_step_pct` | uint8_t | 5 | Max zmiana duty na wywołanie [% PWM_MAX] |
-| `_reserved[46]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
+| `motor_reverse` | uint8_t | 0 | Kierunek obrotów (0=CW, 1=CCW) |
+| `sine_hall_offset` | int8_t | 0 | Offset fazy Hall→sinus [-48..+48 wpisów], wynik `sat`/`so:N` |
+| `foc_kp_q` | float | 0.5 | FOC PI Kp osi q [PWM/A], wynik `fpitune`/`fkp:` |
+| `foc_ki_q` | float | 5.0 | FOC PI Ki osi q [PWM/(A·s)], wynik `fpitune`/`fki:` |
+| `foc_kp_d` | float | 0.5 | FOC PI Kp osi d [PWM/A], wynik `fkpd:` |
+| `foc_ki_d` | float | 5.0 | FOC PI Ki osi d [PWM/(A·s)], wynik `fkid:` |
+| `_reserved[28]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
 
 ### Walidacja
 
@@ -1069,32 +1124,47 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | `cfg:mode:N` | Zmienia tryb boot (1=BLOCK, 2=SINUS, 3=FOC), zapisuje NVS |
 | `cfg:ramp:N` | Zmienia czas rampy 0-10000 ms, **natychmiast aktualizuje runtime**, zapisuje NVS |
 | `cfg:regen:N` | Zmienia regen (0/1), **natychmiast aktualizuje runtime**, zapisuje NVS |
+| `cfg:rev:N` | Kierunek obrotów: 0=CW, 1=CCW, zapisuje NVS |
+| `cfg:step:N` | Max zmiana duty 0-100% na krok, zapisuje NVS |
+| `cfg:defaults` | Ładuje wartości domyślne do runtime i config struct **(bez zapisu NVS)** |
+| `cfg:save` | Synchronizuje runtime → NVS (zapisuje aktualny stan) |
+| `cfg:reload` | Wczytuje NVS → runtime + przełącza tryb silnika jeśli zmieniony |
 | `pasdir` | Odwraca konwencję kierunku PAS (toggle), zapisuje NVS |
 | `passtart:N` | Opóźnienie startu PAS 0-10000 ms, zapisuje NVS |
 | `passtop:N` | Timeout PAS 100-10000 ms, zapisuje NVS |
 | `pasramp:N` | Soft-start PAS 0-10000 ms, zapisuje NVS |
-| `cfg:step:N` | Max zmiana duty 0-100% na krok, zapisuje NVS |
 
 ### Przykład wyjścia `cfg`
 
 ```
 ========== KONFIGURACJA NVS ==========
-drive_mode:      2 (SINUS)
-ramp_time_ms:    1200 ms
-regen_enabled:   0 (OFF)
-pas_dir_invert:  0 (NORMAL)
-pas_start_delay: 2000 ms
-pas_stop_delay:  1000 ms
-pas_ramp:        1500 ms
-duty_step:       5 %
-magic:           0x424C4401 OK
-version:         5
+drive_mode:    3 (FOC)
+ramp_time_ms:  1200 ms
+regen_enabled: 0 (OFF)
+pas_dir_inv:   0 (NORM)
+pas_start_ms:  2000 ms
+pas_stop_ms:   1000 ms
+pas_ramp_ms:   1500 ms
+duty_step:     5 %
+motor_rev:     0 (CW)
+sine_offset:   -6 (-22.5 deg)
+foc_kp_q:      0.450
+foc_ki_q:      12.345
+foc_kp_d:      0.450
+foc_ki_d:      12.345
+magic:         0x424C4401 OK
+version:       7
 ======================================
 --- Runtime (bieżące) ---
-mode:            SINUS
-ramp_time_ms:    1200 ms
-regen:           OFF
-sine_offset:     0 (0.0°)
+mode:          FOC
+ramp_time_ms:  1200 ms
+regen:         OFF
+direction:     CW
+sine_offset:   -6 (-22.5 deg)
+foc_kp_q:      0.450
+foc_ki_q:      12.345
+foc_kp_d:      0.450
+foc_ki_d:      12.345
 ```
 
 > **Uwaga:** Komendy `cfg:ramp:N` i `cfg:regen:N` zmieniają zarówno NVS jak i bieżący

@@ -501,8 +501,8 @@ static uint8_t getSpeedLimitKmh() {
  */
 static float g_speed_limit_factor = 1.0f;           ///< EMA-filtrowany współczynnik mocy 0..1
 #define SPEED_LIMIT_ALPHA_DOWN    0.03f              ///< EMA α spadek (over-speed → szybka redukcja duty)
-#define SPEED_LIMIT_ALPHA_UP      0.005f             ///< EMA α wzrost (under-speed → wolne narastanie duty)
-#define SPEED_LIMIT_FADE_START    0.65f              ///< Fade zaczyna się od 65% limitu
+#define SPEED_LIMIT_ALPHA_UP      0.02f              ///< EMA α wzrost (under-speed → narastanie duty)
+#define SPEED_LIMIT_FADE_BAND_KMH 3.0f              ///< Strefa liniowego fade przed limitem [km/h]
 
 static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
     if (duty_in == 0) {
@@ -513,16 +513,18 @@ static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
     float limit_f = (float)limit_kmh;
 
     // Oblicz surowy współczynnik mocy (0.0 .. 1.0)
+    // Fade zaczyna się SPEED_LIMIT_FADE_BAND_KMH km/h przed limitem (stałe okno, niezależne od limitu)
     float raw_factor;
     if (speed_kmh >= limit_f) {
         raw_factor = 0.0f;  // powyżej limitu → zero mocy
     } else {
-        float fade_start = limit_f * SPEED_LIMIT_FADE_START;
+        float fade_start = limit_f - SPEED_LIMIT_FADE_BAND_KMH;
+        if (fade_start < 0.0f) fade_start = 0.0f;
         if (speed_kmh <= fade_start) {
             raw_factor = 1.0f;  // poniżej strefy fade → pełna moc
         } else {
-            // Liniowy spadek 1.0→0.0 w strefie fade
-            raw_factor = (limit_f - speed_kmh) / (limit_f - fade_start);
+            // Liniowy spadek 1.0→0.0 w strefie fade (ostatnie 3 km/h przed limitem)
+            raw_factor = (limit_f - speed_kmh) / SPEED_LIMIT_FADE_BAND_KMH;
         }
     }
 
@@ -3909,6 +3911,21 @@ static String executeCommand(const String& cmd) {
             g_foc_pi_d.kp = c.foc_kp_d;  g_foc_pi_d.ki = c.foc_ki_d;
             g_foc_pi_q.kp = c.foc_kp_q;  g_foc_pi_q.ki = c.foc_ki_q;
             g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
+            // Przełącz tryb silnika jeśli skonfigurowany tryb rozni się od bieżącego
+            drive_mode_t target_mode = (drive_mode_t)c.drive_mode;
+            if (target_mode >= DRIVE_MODE_BLOCK && target_mode <= DRIVE_MODE_FOC
+                && target_mode != g_bldc_state.mode) {
+                g_bldc_state.mode  = target_mode;
+                g_bldc_state.fault = false;
+                g_foc_vd_i = 0; g_foc_vq_i = 0;
+                g_foc_vd_dbg = 0.0f; g_foc_vq_dbg = 0.0f;
+                g_foc_iq_target = 0.0f;
+                g_foc_ia_ema = g_foc_ib_ema = g_foc_ic_ema = 0.0f;
+                g_foc_last_loop_us = micros();
+                resetSineTracking(g_bldc_state.hall_state);
+                const char* mnames[] = {"DISABLED","BLOCK","SINUS","FOC"};
+                Serial.printf("[CFG] Tryb przełączony na: %s\n", mnames[target_mode]);
+            }
             return "[CFG] Wartosci z EEPROM zaladowane do runtime.";
         }
         return "Nieznany parametr cfg";
