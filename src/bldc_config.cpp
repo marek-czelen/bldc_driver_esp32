@@ -40,6 +40,12 @@ static void config_apply_defaults() {
     g_config.pas_stop_delay_ms  = 1000;                        // 1s bez impulsów → stop
     g_config.pas_ramp_ms        = 1500;                        // 1.5s soft-start 0→100%
     g_config.duty_max_step_pct  = 5;                           // Max 5% duty change per loop call
+    g_config.motor_reverse      = 0;                             // Kierunek: 0=CW (domyślny), 1=CCW
+    g_config.sine_hall_offset   = 0;                             // Offset Hall→sine: 0 wpisów (0°)
+    g_config.foc_kp_q           = 0.5f;                          // FOC Kp domyślne (PWM/A)
+    g_config.foc_ki_q           = 5.0f;                          // FOC Ki domyślne (PWM/A/s)
+    g_config.foc_kp_d           = 0.5f;                          // FOC Kp_d domyślne
+    g_config.foc_ki_d           = 5.0f;                          // FOC Ki_d domyślne
 }
 
 void config_init() {

@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  5
+#define CONFIG_VERSION  7
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -51,9 +51,15 @@ typedef struct __attribute__((packed)) {
     uint16_t        pas_stop_delay_ms;  ///< Timeout PAS: brak impulsów przez X ms → wyłącz wspomaganie [ms]
     uint16_t        pas_ramp_ms;        ///< Soft-start PAS: czas narastania mocy 0→100% [ms]
     uint8_t         duty_max_step_pct;  ///< Max zmiana duty na wywołanie [% PWM_MAX] (0=brak limitu)
+    uint8_t         motor_reverse;      ///< Odwrócenie kierunku obrotów (0=CW, 1=CCW)
+    int8_t          sine_hall_offset;   ///< Offset fazowy Hall→sine [wpisy], wynik komendy 'sat'
+    float           foc_kp_q;           ///< FOC PI Kp osi q, wynik komendy 'fpitune' / 'fkp:'
+    float           foc_ki_q;           ///< FOC PI Ki osi q, wynik komendy 'fpitune' / 'fki:'
+    float           foc_kp_d;           ///< FOC PI Kp osi d, wynik komend 'fpitune' / 'fkpd:'
+    float           foc_ki_d;           ///< FOC PI Ki osi d, wynik komend 'fpitune' / 'fkid:'
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[46];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[28];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)

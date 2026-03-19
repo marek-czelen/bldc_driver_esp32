@@ -161,6 +161,9 @@ static uint16_t g_mosfet_test_duty = PWM_MAX_DUTY * 10 / 100;  ///< Duty testowe
 static char g_mosfet_test_phase = 0;           ///< Aktualnie testowana faza ('A','B','C') lub 0
 static char g_mosfet_test_side  = 0;           ///< Aktualnie testowana strona ('H','L') lub 0
 
+// Odwrócenie kierunku obrotów (software switch CW/CCW)
+volatile bool g_reverse_isr = false;           ///< Kierunek: false=CW (domyślny), true=CCW
+
 // ============================================================================
 // Sterowanie sinusoidalne — port z bldc_driver_v2 (STM32, sprawdzony algorytm)
 // ============================================================================
@@ -217,6 +220,56 @@ static const DRAM_ATTR int8_t g_hall_to_sector[8] = {
     -1      // 7 = invalid
 };
 
+/**
+ * @brief Mapowanie Hall→Hall dla odwróconego kierunku (CCW).
+ *
+ * Zamiana źródła i ujścia w komutacji blokowej: 1↔6, 3↔4, 2↔5.
+ * Wartości 0 i 7 (nieprawidłowe) bez zmian.
+ */
+static const DRAM_ATTR uint8_t g_hall_reverse_map[8] = {
+    0,  // 0 = invalid → invalid
+    6,  // 1 (A+B-) → 6 (B+A-)
+    5,  // 2 (B+C-) → 5 (C+B-)
+    4,  // 3 (A+C-) → 4 (C+A-)
+    3,  // 4 (C+A-) → 3 (A+C-)
+    2,  // 5 (C+B-) → 2 (B+C-)
+    1,  // 6 (B+A-) → 1 (A+B-)
+    7   // 7 = invalid → invalid
+};
+
+/**
+ * @brief Mapowanie Hall→sektor dla CCW (SINUS/FOC), bez zamiany faz.
+ *
+ * Wyprowadzenie z pierwszych zasad (poprawne):
+ *   Bez zamiany B↔C: kąt pola = θ° - 90°
+ *   CW empirycznie: Hall=001 wejście przy wirniku=0°, θ=8 → pole=300° = wirnik-60° → moment CW
+ *   CCW wejście w Hall=001 następuje przy wirniku=60° (nie 0°)!
+ *   Dla momentu CCW: pole = wirnik+60° = 60°+60° = 120° → θ=210°=56 wpisów = sektor 3
+ *   Reguła: CCW_sector = (CW_sector + 3) mod 6  — pole odwrócone o 180° = odwrócony moment
+ *   CW tabela: {0,2,1,4,5,3} dla hall 1-6
+ *   CCW = CW+3 mod 6: {3,5,4,1,2,0} dla hall 1-6
+ *   Sekwencja CCW: 001→101→100→110→010→011 → sektory 3→2→1→0→5→4 (maleje -1 ✓)
+ */
+static const DRAM_ATTR int8_t g_hall_to_sector_ccw[8] = {
+    -1,     // 0 = invalid
+     3,     // 1 (001) → sector 3  (θ snap=56)
+     5,     // 2 (010) → sector 5  (θ snap=88)
+     4,     // 3 (011) → sector 4  (θ snap=72)
+     1,     // 4 (100) → sector 1  (θ snap=24)
+     2,     // 5 (101) → sector 2  (θ snap=40)
+     0,     // 6 (110) → sector 0  (θ snap=8)
+    -1      // 7 = invalid
+};
+
+/**
+ * @brief Zwraca sektor (0-5) dla danego stanu Halla, z uwzględnieniem kierunku.
+ * W CCW używa dedykowanej tabeli dla fizycznej sekwencji CCW rotora.
+ */
+static inline int8_t hallToSector(uint8_t hall) {
+    if (hall == 0 || hall == 7) return -1;
+    return g_reverse_isr ? g_hall_to_sector_ccw[hall] : g_hall_to_sector[hall];
+}
+
 // Stałe sinusoidalne (identyczne z bldc_driver_v2)
 #define SINE_TABLE_SIZE         96
 #define SINE_TABLE_Q16_FULL     (96UL << 16)   // 6291456
@@ -238,6 +291,25 @@ static const DRAM_ATTR int8_t g_hall_to_sector[8] = {
 #define SINE_START_MAX_HALL_US  30000           // max okres Halla (min prędkość) do wejścia w SINUS
 #define SINE_PHASE_CORR_SHIFT   2               // korekcja 1/4 błędu na przejście Halla
 #define SINE_SPEED_FILTER_SHIFT 1               // filtr prędkości: 1/2 new + 1/2 old
+
+/**
+ * @brief Resetuje tracker kąta SINUS/FOC do środka aktualnego sektora Halla.
+ */
+static void resetSineTracking(uint8_t hall_state) {
+    int8_t sector = hallToSector(hall_state);
+    if (sector < 0) sector = 0;
+    int32_t init_entry = (int32_t)sector * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
+    if (init_entry < 0) init_entry += SINE_TABLE_SIZE;
+    if (init_entry >= SINE_TABLE_SIZE) init_entry -= SINE_TABLE_SIZE;
+
+    g_sine_startup_count = 0;
+    g_sine_last_hall_idx = -1;
+    g_sine_speed_q16 = 0;
+    g_sine_dir = 1;
+    g_sine_last_hall_ms = (uint32_t)esp_timer_get_time() / 1000;
+    g_sine_angle_q16 = (uint32_t)init_entry << 16;
+    g_sine_running = 1;
+}
 #define SINE_SNAP_THRESHOLD     (24 << 16)       // błąd > 1/4 obrotu elektr. → pełny snap kąta
 #define SINE_SAFE_MAX_DUTY      (PWM_MAX_DUTY * 75 / 100)  // SVPWM: liniowy do 58%, overmod do 75%, powyżej szkodliwe harmoniczne
 #define SINE_MIN_AMPLITUDE      15              // poniżej tego coast (center-aligned 50% = hamowanie)
@@ -869,10 +941,12 @@ void setup() {
     g_bldc_state.ramp_time_ms = cfg.ramp_time_ms;
     g_bldc_state.regen_enabled = (cfg.regen_enabled != 0);
     g_pas_dir_invert_isr = (cfg.pas_dir_invert != 0);
+    g_reverse_isr = (cfg.motor_reverse != 0);
 
-    // Inicjalizacja regulatorów PI dla FOC
-    g_foc_pi_d = {FOC_KP_DEFAULT, FOC_KI_DEFAULT, 0.0f, FOC_INTEGRAL_LIMIT};
-    g_foc_pi_q = {FOC_KP_DEFAULT, FOC_KI_DEFAULT, 0.0f, FOC_INTEGRAL_LIMIT};
+    // Inicjalizacja regulatorów PI dla FOC — z wartościami zapisanymi w NVS
+    g_sine_hall_phase_offset = cfg.sine_hall_offset;
+    g_foc_pi_d = {cfg.foc_kp_d, cfg.foc_ki_d, 0.0f, FOC_INTEGRAL_LIMIT};
+    g_foc_pi_q = {cfg.foc_kp_q, cfg.foc_ki_q, 0.0f, FOC_INTEGRAL_LIMIT};
 
     // Inicjalizacja GPIO
     initGPIO();
@@ -1040,13 +1114,17 @@ static void autoTuneStep() {
         // Zastosuj najlepszy offset
         g_sine_hall_phase_offset = g_atune_best_ofs;
 
+        // Zapisz do NVS
+        config_get().sine_hall_offset = g_atune_best_ofs;
+        config_save();
+
         Serial.println("[SAT] ==============================");
         Serial.println("[SAT] Najlepszy offset: " + String((int)g_atune_best_ofs)
                        + " (" + String((float)g_atune_best_ofs * 3.75f, 1) + "°)"
                        + "  avg_I=" + String(g_atune_best_current, 3) + " A");
         Serial.println("[SAT] Poprzedni offset: " + String((int)g_atune_saved_offset)
                        + " (" + String((float)g_atune_saved_offset * 3.75f, 1) + "°)");
-        Serial.println("[SAT] Auto-tune zakończony. Offset zastosowany.");
+        Serial.println("[SAT] Auto-tune zakończony. Offset zapisany do EEPROM.");
         Serial.println("[SAT] Użyj so/so+/so- do ręcznej korekty.");
 
         // Przywróć duty — manetka przejmie kontrolę
@@ -1249,6 +1327,8 @@ void loop() {
             // Użyj EMA-filtrowanych prądów (wygładzone z niesynchr. ADC).
             // Czujnik klipuje prąd ujemny do ~0V. Kirchhoff: Ia+Ib+Ic=0,
             // więc faza z najmniejszym odczytem = -(suma pozostałych dwóch).
+            // ADC mierzy fizyczne fazy. Brak zamiany B↔C – Park działa
+            // bezpośrednio na pomiarach fizycznych w obu kierunkach.
             float ia = g_foc_ia_ema;
             float ib = g_foc_ib_ema;
             float ic = g_foc_ic_ema;
@@ -1353,10 +1433,15 @@ void loop() {
                         Serial.printf("  Oscylacje: %d przejsc, amplituda=%.3f A, Tu=%.4f s\n",
                                       g_foc_at_crossings, avg_amp, tu_s);
                         Serial.printf("  Ku=%.3f, Tu=%.4f s\n", ku, tu_s);
-                        Serial.printf("  >> Sugerowane: Kp=%.3f  Ki=%.3f\n", kp_new, ki_new);
-                        Serial.printf("  Zastosuj: fkp:%.3f  fki:%.3f\n", kp_new, ki_new);
-                        Serial.printf("  (aktualne: Kp=%.3f  Ki=%.3f)\n",
-                                      g_foc_pi_q.kp, g_foc_pi_q.ki);
+                        Serial.printf("  >> Zastosowane: Kp=%.3f  Ki=%.3f\n", kp_new, ki_new);
+
+                        // Zastosuj obliczone wartości i zapisz do EEPROM
+                        g_foc_pi_d.kp = kp_new;  g_foc_pi_d.ki = ki_new;
+                        g_foc_pi_q.kp = kp_new;  g_foc_pi_q.ki = ki_new;
+                        config_get().foc_kp_q = kp_new;  config_get().foc_ki_q = ki_new;
+                        config_get().foc_kp_d = kp_new;  config_get().foc_ki_d = ki_new;
+                        config_save();
+                        Serial.println("  [PI Auto-tune] Wartości zapisane do EEPROM.");
                     } else {
                         Serial.printf("  Za malo oscylacji (%d crossings). Zwieksz duty lub relay_amp.\n",
                                       g_foc_at_crossings);
@@ -1430,6 +1515,9 @@ void loop() {
         (g_bldc_state.duty_cycle > 0 || g_bldc_state.mode == DRIVE_MODE_SINUS || g_bldc_state.mode == DRIVE_MODE_FOC);
     g_brake_isr = g_bldc_state.brake_active;
     g_mode_isr = g_bldc_state.mode;
+
+    // Sync kierunku obrotów z konfiguracji NVS do ISR
+    g_reverse_isr = (config_get().motor_reverse != 0);
 
     // Prędkość sinusoidalna (speed_q16) jest teraz obliczana bezpośrednio
     // w ISR (onCommutationTimer) na przejściu Halla — bez opóźnienia loop().
@@ -1928,8 +2016,9 @@ void printDiagnostics() {
         if (thrPct > 100) thrPct = 100;
     }
 
-    Serial.printf("%s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
+    Serial.printf("%s%s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
         modeNames[g_bldc_state.mode],
+        g_reverse_isr ? "<" : ">",
         dutyPct, targetPct,
         g_bldc_state.battery_voltage,
         g_bldc_state.phase_current[0],
@@ -1998,17 +2087,29 @@ void printDiagnostics() {
         uint32_t ang = g_sine_angle_q16;
         int32_t ang_entry = (int32_t)(ang >> 16);
         int32_t hall_err_entry = g_dbg_last_hall_err >> 16;  // w wpisach tabeli (1=3.75°)
-        Serial.printf("\n  [DBG] ang:%ld spd:%lu hdir:%d sec:%d hp:%luus err:%ld snp:%lu cor:%lu fb:%lu d:%u",
+        uint8_t hall_raw = g_bldc_state.hall_state;
+        int8_t hall_sec = hallToSector(hall_raw);
+        Serial.printf("\n  [DBG] ang:%ld spd:%lu hdir:%d sec:%d h:%d%d%d hs:%d hp:%luus err:%ld snp:%lu cor:%lu fb:%lu d:%u",
             (long)ang_entry,
             (unsigned long)g_sine_speed_q16,
             (int)g_sine_dir,
             (int)g_sine_last_hall_idx,
+            (hall_raw >> 2) & 1,
+            (hall_raw >> 1) & 1,
+            hall_raw & 1,
+            (int)hall_sec,
             (unsigned long)g_hall_period_us,
             (long)hall_err_entry,
             (unsigned long)g_dbg_snap_count,
             (unsigned long)g_dbg_corr_count,
             (unsigned long)g_dbg_sine_fallback_count,
             (unsigned)g_bldc_state.duty_cycle);
+        if (g_bldc_state.mode == DRIVE_MODE_FOC) {
+            Serial.printf(" vq:%ld iq:%.2f tgt:%.2f",
+                (long)g_foc_vq_i,
+                g_foc_iq_meas,
+                g_foc_iq_target);
+        }
     }
 
     // Informacje z wyświetlacza S866
@@ -2121,7 +2222,7 @@ void IRAM_ATTR onCommutationTimer() {
             // FOC współdzieli angle tracking z SINUS (ten sam algorytm Q16)
             if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
 
-                int8_t new_idx = g_hall_to_sector[hall];
+                int8_t new_idx = hallToSector(hall);
                 if (new_idx >= 0) {
 
                     int8_t old_idx = g_sine_last_hall_idx;
@@ -2286,7 +2387,10 @@ void IRAM_ATTR onCommutationTimer() {
             return;
     }
 
-    switch (hall) {
+    // Odwrócenie kierunku: remap Hall przed tabelą komutacji blokowej
+    uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+
+    switch (bh) {
         case 1:
             ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
             ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
@@ -2412,13 +2516,23 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle ──
-    // Kąt ZAWSZE rośnie (+= speed).
+    // CW: θ rośnie. CCW: θ maleje.
+    // Tabela g_hall_to_sector_ccw wyznacza malejace sektory dla CCW,
+    // wiec snap zawsze trafia poprawnie przy każdym przejsciu Halla.
     if (!stalled) {
         uint32_t spd = real_speed;
         if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        g_sine_angle_q16 += spd;
-        if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
-            g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+        if (g_reverse_isr) {
+            if (g_sine_angle_q16 >= spd) {
+                g_sine_angle_q16 -= spd;
+            } else {
+                g_sine_angle_q16 = g_sine_angle_q16 + SINE_TABLE_Q16_FULL - spd;
+            }
+        } else {
+            g_sine_angle_q16 += spd;
+            if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+                g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+            }
         }
     }
 
@@ -2493,10 +2607,8 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
         if (dc < 0) dc = 0;
         if (dc > (int32_t)PWM_MAX_DUTY) dc = (int32_t)PWM_MAX_DUTY;
 
-        // Faza A zawsze bez zmian.
         ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
         ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
-
         ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
         ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
         ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc);
@@ -2542,13 +2654,20 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
     bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle (identycznie jak SINUS) ──
-    // Kąt ZAWSZE rośnie — remapowane sektory + zamiana faz na wyjściu.
     if (!stalled) {
         uint32_t spd = real_speed;
         if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        g_sine_angle_q16 += spd;
-        if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
-            g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+        if (g_reverse_isr) {
+            if (g_sine_angle_q16 >= spd) {
+                g_sine_angle_q16 -= spd;
+            } else {
+                g_sine_angle_q16 = g_sine_angle_q16 + SINE_TABLE_Q16_FULL - spd;
+            }
+        } else {
+            g_sine_angle_q16 += spd;
+            if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+                g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+            }
         }
     }
 
@@ -2616,10 +2735,8 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
         if (dc_duty < 0) dc_duty = 0;
         if (dc_duty > (int32_t)PWM_MAX_DUTY) dc_duty = (int32_t)PWM_MAX_DUTY;
 
-        // Faza A zawsze bez zmian.
         ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
         ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
-
         ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
         ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
         ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc_duty);
@@ -2752,7 +2869,10 @@ static inline void IRAM_ATTR phaseC_RegenPWM(uint16_t duty) {
  * @warning Nigdy duty 100% — brak fazy OFF = brak transferu do baterii (tylko ciepło).
  */
 static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty) {
-    switch (hall) {
+    // Odwrócenie kierunku: remap Hall
+    uint8_t rh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+
+    switch (rh) {
         case 1:  // motoring: A+ B-  →  regen: A=LS_PWM, B=LS_ON, C=float
             phaseA_RegenPWM(regen_duty);
             phaseB_Low();
@@ -2812,8 +2932,11 @@ void blockCommutate(uint8_t hallState, uint16_t duty) {
 
     if (g_bldc_state.mode == DRIVE_MODE_DISABLED) return;  // safety
 
+    // Odwrócenie kierunku: remap Hall
+    uint8_t h = g_reverse_isr ? g_hall_reverse_map[hallState] : hallState;
+
     // Komutacja
-    switch (hallState) {
+    switch (h) {
         case 1: // Hall 001: A+ B-
             phaseA_PWM(duty);
             phaseB_Low();
@@ -2881,6 +3004,8 @@ void printHelp() {
     Serial.println("R          Regeneracja ON/OFF (hamowanie rekuperacyjne)");
     Serial.println("             Gdy ON: przetwornica zwraca energie do baterii przy hamowaniu.");
     Serial.println("             Wymaga predkosci > 50 RPM, Vbat < 42V (ochrona LiPo).");
+    Serial.println("rev        Przelacz kierunek obrotow CW/CCW (zapisuje do NVS).");
+    Serial.println("             Softwarowa zamiana faz — dziala we wszystkich trybach.");
     Serial.println("b          Symulacja hamulca ON/OFF (natychmiastowe duty=0, nadrzedny)");
     Serial.println();
     Serial.println("---------- Status i diagnostyka ----------");
@@ -2945,6 +3070,7 @@ void printHelp() {
     Serial.println("cfg:step:N Max zmiana duty na krok petli glownej [%], zakres 1-100.");
     Serial.println("             0=bez limitu. Domyslnie 5%. Ogranicza szarpniecia mocy.");
     Serial.println("             Dziala razem z rampa (bardziej restrykcyjny wygrywa).");
+    Serial.println("cfg:rev:N  Kierunek obrotow po restarcie: 0=CW (normalny), 1=CCW (odwrocony)");
     Serial.println();
     Serial.println("---------- PAS (Pedal Assist Sensor) ----------");
     Serial.println("  Czujnik na GPIO22, dysk magnesow na wale korbowym.");
@@ -3213,20 +3339,7 @@ static String executeCommand(const String& cmd) {
         g_manual_duty_override = false;
         g_bldc_state.mode = DRIVE_MODE_SINUS;
         g_bldc_state.fault = false;
-        // Reset stanu sinusoidalnego — natychmiastowy start sinusa
-        g_sine_startup_count = 0;
-        g_sine_last_hall_idx = -1;
-        g_sine_speed_q16 = 0;
-        g_sine_dir = 1;
-        g_sine_last_hall_ms = (uint32_t)esp_timer_get_time() / 1000;
-        // Snap kąta do środka aktualnego sektora Halla
-        uint8_t hall_now = g_bldc_state.hall_state;
-        int8_t sector = (hall_now >= 1 && hall_now <= 6) ? g_hall_to_sector[hall_now] : 0;
-        int32_t init_entry = (int32_t)sector * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
-        if (init_entry < 0) init_entry += SINE_TABLE_SIZE;
-        if (init_entry >= SINE_TABLE_SIZE) init_entry -= SINE_TABLE_SIZE;
-        g_sine_angle_q16 = (uint32_t)init_entry << 16;
-        g_sine_running = 1;  // od razu sinus, bez block startup
+        resetSineTracking(g_bldc_state.hall_state);
         return "SINUS ON";
     }
     if (cmd == "F" || cmd == "m3") {
@@ -3248,20 +3361,7 @@ static String executeCommand(const String& cmd) {
         g_foc_ia_ema = 0.0f;
         g_foc_ib_ema = 0.0f;
         g_foc_ic_ema = 0.0f;
-        // Reset angle tracking (współdzielone z SINUS)
-        g_sine_startup_count = 0;
-        g_sine_last_hall_idx = -1;
-        g_sine_speed_q16 = 0;
-        g_sine_dir = 1;
-        g_sine_last_hall_ms = (uint32_t)esp_timer_get_time() / 1000;
-        // Snap kąta do środka aktualnego sektora Halla
-        uint8_t hall_foc = g_bldc_state.hall_state;
-        int8_t sec_foc = (hall_foc >= 1 && hall_foc <= 6) ? g_hall_to_sector[hall_foc] : 0;
-        int32_t init_foc = (int32_t)sec_foc * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
-        if (init_foc < 0) init_foc += SINE_TABLE_SIZE;
-        if (init_foc >= SINE_TABLE_SIZE) init_foc -= SINE_TABLE_SIZE;
-        g_sine_angle_q16 = (uint32_t)init_foc << 16;
-        g_sine_running = 1;
+        resetSineTracking(g_bldc_state.hall_state);
         return "FOC ON";
     }
     if (cmd == "d") {
@@ -3302,6 +3402,18 @@ static String executeCommand(const String& cmd) {
         config_get().regen_enabled = g_bldc_state.regen_enabled ? 1 : 0;
         config_save();
         return g_bldc_state.regen_enabled ? "Regen: ON" : "Regen: OFF";
+    }
+    if (cmd == "rev") {
+        controller_config_t& cfg = config_get();
+        cfg.motor_reverse = cfg.motor_reverse ? 0 : 1;
+        g_reverse_isr = (cfg.motor_reverse != 0);
+        if (g_bldc_state.mode == DRIVE_MODE_SINUS || g_bldc_state.mode == DRIVE_MODE_FOC) {
+            resetSineTracking(g_bldc_state.hall_state);
+            g_foc_pi_d.integral = 0.0f;
+            g_foc_pi_q.integral = 0.0f;
+        }
+        config_save();
+        return cfg.motor_reverse ? "Kierunek: CCW (odwrocony)" : "Kierunek: CW (normalny)";
     }
     if (cmd == "b") {
         g_brake_simulated = !g_brake_simulated;
@@ -3345,7 +3457,10 @@ static String executeCommand(const String& cmd) {
         if (val >= 0.0f && val <= 100.0f) {
             g_foc_pi_d.kp = val;
             g_foc_pi_q.kp = val;
-            return "FOC Kp: " + String(val, 2);
+            config_get().foc_kp_q = val;
+            config_get().foc_kp_d = val;
+            config_save();
+            return "FOC Kp: " + String(val, 2) + " (zapisano)";
         }
         return "Zakres: 0.0-100.0";
     }
@@ -3354,7 +3469,10 @@ static String executeCommand(const String& cmd) {
         if (val >= 0.0f && val <= 1000.0f) {
             g_foc_pi_d.ki = val;
             g_foc_pi_q.ki = val;
-            return "FOC Ki: " + String(val, 1);
+            config_get().foc_ki_q = val;
+            config_get().foc_ki_d = val;
+            config_save();
+            return "FOC Ki: " + String(val, 1) + " (zapisano)";
         }
         return "Zakres: 0.0-1000.0";
     }
@@ -3362,7 +3480,9 @@ static String executeCommand(const String& cmd) {
         float val = cmd.substring(5).toFloat();
         if (val >= 0.0f && val <= 100.0f) {
             g_foc_pi_d.kp = val;
-            return "FOC Kp_d: " + String(val, 2);
+            config_get().foc_kp_d = val;
+            config_save();
+            return "FOC Kp_d: " + String(val, 2) + " (zapisano)";
         }
         return "Zakres: 0.0-100.0";
     }
@@ -3370,7 +3490,9 @@ static String executeCommand(const String& cmd) {
         float val = cmd.substring(5).toFloat();
         if (val >= 0.0f && val <= 1000.0f) {
             g_foc_pi_d.ki = val;
-            return "FOC Ki_d: " + String(val, 1);
+            config_get().foc_ki_d = val;
+            config_save();
+            return "FOC Ki_d: " + String(val, 1) + " (zapisano)";
         }
         return "Zakres: 0.0-1000.0";
     }
@@ -3426,19 +3548,25 @@ static String executeCommand(const String& cmd) {
         int8_t o = g_sine_hall_phase_offset;
         if (o < 47) o += 2;
         g_sine_hall_phase_offset = o;
-        return "Sine offset: " + String((int)o) + " (" + String((float)o * 3.75f, 1) + "°)";
+        config_get().sine_hall_offset = o;
+        config_save();
+        return "Sine offset: " + String((int)o) + " (" + String((float)o * 3.75f, 1) + "°) (zapisano)";
     }
     if (cmd == "so-") {
         int8_t o = g_sine_hall_phase_offset;
         if (o > -47) o -= 2;
         g_sine_hall_phase_offset = o;
-        return "Sine offset: " + String((int)o) + " (" + String((float)o * 3.75f, 1) + "°)";
+        config_get().sine_hall_offset = o;
+        config_save();
+        return "Sine offset: " + String((int)o) + " (" + String((float)o * 3.75f, 1) + "°) (zapisano)";
     }
     if (cmd.startsWith("so:")) {
         int val = cmd.substring(3).toInt();
         if (val < -48 || val > 48) return "Zakres: -48..+48 (1 wpis = 3.75°)";
         g_sine_hall_phase_offset = (int8_t)val;
-        return "Sine offset: " + String(val) + " (" + String((float)val * 3.75f, 1) + "°)";
+        config_get().sine_hall_offset = (int8_t)val;
+        config_save();
+        return "Sine offset: " + String(val) + " (" + String((float)val * 3.75f, 1) + "°) (zapisano)";
     }
     // Auto-tune fazy sinusoidalnej
     if (cmd == "sat" || cmd.startsWith("sat:")) {
@@ -3590,6 +3718,7 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_stop_ms:   %u ms\n",  (unsigned)cfg.pas_stop_delay_ms);
         Serial.printf("pas_ramp_ms:   %u ms\n",  (unsigned)cfg.pas_ramp_ms);
         Serial.printf("duty_step:     %d %%\n",   cfg.duty_max_step_pct);
+        Serial.printf("motor_rev:     %d (%s)\n", cfg.motor_reverse, cfg.motor_reverse ? "CCW" : "CW");
         Serial.printf("magic:         0x%08X %s\n", cfg.magic, (cfg.magic == CONFIG_MAGIC) ? "OK" : "BAD!");
         Serial.printf("version:       %d\n",      cfg.version);
         Serial.println("======================================");
@@ -3599,7 +3728,8 @@ static String executeCommand(const String& cmd) {
         Serial.printf("mode:          %s\n", rtMode);
         Serial.printf("ramp_time_ms:  %d ms\n", g_bldc_state.ramp_time_ms);
         Serial.printf("regen:         %s\n", g_bldc_state.regen_enabled ? "ON" : "OFF");
-        Serial.printf("sine_offset:   %d (%.1f\u00b0)\n", (int)g_sine_hall_phase_offset, (float)g_sine_hall_phase_offset * 3.75f);
+        Serial.printf("direction:     %s\n", g_reverse_isr ? "CCW" : "CW");
+        Serial.printf("sine_offset:   %d (%.1f°)\n", (int)g_sine_hall_phase_offset, (float)g_sine_hall_phase_offset * 3.75f);
         Serial.println();
         return "";
     }
@@ -3645,6 +3775,18 @@ static String executeCommand(const String& cmd) {
                 return "Duty max step: " + String(val) + "%";
             }
             return "Zakres 0-100 %";
+        }
+        if (cmd.startsWith("cfg:rev:")) {
+            int val = cmd.substring(8).toInt();
+            cfg.motor_reverse = val ? 1 : 0;
+            g_reverse_isr = (cfg.motor_reverse != 0);
+            if (g_bldc_state.mode == DRIVE_MODE_SINUS || g_bldc_state.mode == DRIVE_MODE_FOC) {
+                resetSineTracking(g_bldc_state.hall_state);
+                g_foc_pi_d.integral = 0.0f;
+                g_foc_pi_q.integral = 0.0f;
+            }
+            config_save();
+            return cfg.motor_reverse ? "Kierunek boot: CCW (odwrocony)" : "Kierunek boot: CW (normalny)";
         }
         return "Nieznany parametr cfg";
     }
