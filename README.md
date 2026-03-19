@@ -83,6 +83,9 @@ Wszystkie definicje pinów znajdują się w `include/pinout.h`.
 | 15   | Temperatura silnika   | ADC2_CH3  |
 | 12   | Temperatura FET       | ADC2_CH5  |
 
+> **Uwaga ADC2 — konflikt z WiFi:**  
+> Piny ADC2 (GPIO2, GPIO12, GPIO15) **nie mogą być czytane przez `analogRead()` gdy WiFi jest włączone** — sterownik ESP32 zgłasza `ESP_ERR_TIMEOUT: ADC2 is in use by Wi-Fi`. Dlatego podczas aktywnego WiFi (P17=1) odczyty tych pinów są pomijane, a silnik jest wyłączony (bez ADC2 i tak nie ma przepustnicy). Gdy podłączysz `PIN_FET_TEMP` (GPIO12), dodaj w `readAnalogInputs()` guard `if (!g_wifi_active)` przed `analogRead(PIN_FET_TEMP)` — szkielet komentarza jest już w kodzie.
+
 > **Uwaga GPIO12 (MTDI):**  
 > GPIO12 jest pinem strap ESP32. Jeśli ma pull-up przy starcie, zmienia napięcie VDD_SDIO z 3.3 V na 1.8 V, co uniemożliwia programowanie flash. **Nie podłączać pull-up do GPIO12**; stosować pull-down lub pozostawić floating.
 
@@ -1083,6 +1086,53 @@ Aktualny offset nie jest wyświetlany w statusie. Aby go sprawdzić, można tymc
 
 ---
 
+## WiFi — interfejs konfiguracyjny WWW
+
+Sterownik udostępnia responsywny interfejs webowy przez WiFi Access Point. Aktywacja przez parametr P17 wyświetlacza S866 (repurposed — nie implementuje tempomatu).
+
+### Włączanie / wyłączanie
+
+| P17 | Stan | Opis |
+|-----|------|------|
+| **1** | WiFi ON, silnik OFF | Uruchamia AP + HTTP, wyłącza wszystkie tranzystory |
+| **0** | WiFi OFF, silnik dostępny | Zatrzymuje AP, wykonuje opcjonalną komendę z kolejki |
+
+Przejście P17: 1→0 jest jedynym momentem kiedy kolejka trybu (`B`, `S`, `F`) jest wykonywana.
+
+### Dane połączenia
+
+| Parametr | Wartość |
+|----------|---------|
+| SSID | `BLDC_Config` |
+| Hasło | `bldc1234` |
+| IP | `192.168.4.1` |
+| Port | 80 |
+
+### REST API
+
+| Endpoint | Metoda | Opis |
+|----------|--------|------|
+| `/` | GET | Strona HTML (cały interfejs) |
+| `/api/config` | GET | JSON z konfiguracją NVS + stanem runtime |
+| `/api/cmd` | POST | Wykonaj komendę Serial natychmiast (pole `cmd`) |
+| `/api/queue` | POST | Ustaw komendę do wykonania po WiFi OFF (pole `cmd`) |
+
+> **Ograniczenie `/api/cmd`:** komendy startujące silnik (`B`, `S`, `F`, `e`, `m2`, `m3`) są odrzucane z HTTP 403 gdy WiFi aktywne. Użyj `/api/queue` — komenda wykona się po P17→0.
+
+### Konflikt ADC2 / WiFi
+
+ESP32 posiada dwa przetworniki ADC. ADC2 jest współdzielony z kontrolerem WiFi — nie można go używać jednocześnie (błąd `ESP_ERR_TIMEOUT`).
+
+| GPIO | Funkcja | ADC | Zachowanie podczas WiFi |
+|------|---------|-----|--------------------------|
+| 2 | Przepustnica | ADC2_CH2 | Pominięty — `throttle_raw = 0` |
+| 15 | Temp. silnika | ADC2_CH3 | Pominięty — ostatnia znana wartość |
+| 12 | Temp. FET *(niepodłączony)* | ADC2_CH5 | Guard w kodzie przygotowany |
+
+> **Gdy podłączysz czujnik FET (GPIO12):** W `readAnalogInputs()` w pliku `main.cpp` jest szkielet komentarza z gotową instrukcją jak dodać guard `if (!g_wifi_active)` przed `analogRead(PIN_FET_TEMP)`. Pamiętaj też o zakazie pull-up (pin STRAP).
+
+---
+
 ## Konfiguracja NVS
 
 Sterownik zapisuje konfigurację w pamięci nieulotnej ESP32 (NVS — Non-Volatile Storage).
@@ -1546,7 +1596,16 @@ ale z ramą dq.
 - Komendy Serial: `pasdir`, `passtart:N`, `passtop:N`, `pasramp:N`, `pasdbg`
 - Szczegóły: patrz sekcja **PAS — Pedal Assist Sensor**
 
-### 6. ~~Konfiguracja przez UART~~ — **CZĘŚCIOWO ZAIMPLEMENTOWANE** ✓
+### 6. ~~WiFi — interfejs konfiguracyjny WWW~~ — **ZAIMPLEMENTOWANE** ✓
+- P17=1 w menu wyświetlacza S866 → uruchamia WiFi AP + serwer HTTP, wyłącza silnik
+- P17=0 → zatrzymuje WiFi (ADC2 ponownie dostępne), wykonuje komendę z kolejki, silnik wraca do użytku
+- SSID: `BLDC_Config`, hasło: `bldc1234`, IP: `192.168.4.1`, port 80
+- Responsive UI: stan systemu, konfiguracja silnika, PAS, FOC, EEPROM, kolejka trybu
+- REST API: `GET /api/config` (JSON), `POST /api/cmd` (natychmiastowe komendy), `POST /api/queue` (kolejka trybu)
+- Komendy startujące silnik (`B`, `S`, `F`) przez `/api/cmd` zablokowane gdy WiFi aktywne — użyj kolejki
+- Szczegóły: patrz sekcja **WiFi — interfejs konfiguracyjny WWW**
+
+### 7. ~~Konfiguracja przez UART~~ — **CZĘŚCIOWO ZAIMPLEMENTOWANE** ✓
 - Komenda `cfg` — wyświetlanie konfiguracji NVS + runtime
 - Komendy `cfg:mode:N`, `cfg:ramp:N`, `cfg:regen:N` — zmiana i zapis do NVS
 - Komendy PAS: `pasdir`, `passtart:N`, `passtop:N`, `pasramp:N`

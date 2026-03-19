@@ -35,6 +35,8 @@
 #include "bldc_types.h"
 #include "display_s866.h"
 #include "bldc_config.h"
+#include <WiFi.h>
+#include <WebServer.h>
 
 // ============================================================================
 // Zmienne globalne
@@ -373,6 +375,9 @@ static void printSineDebug();
 static String executeCommand(const String& cmd);
 static String mosfetTestSet(const String& which);
 static void mosfetTestPrintHelp();
+static void webConfigInit();
+static void webConfigStop();
+static void webConfigHandle();
 
 // Dzielnik napięcia VBAT: 1M (góra) / 33k (dół)
 static const float kVbatRTop = 1130000.0f;
@@ -444,6 +449,11 @@ static const unsigned long ATUNE_MEASURE_MS = 600;  ///< Czas pomiaru [ms]
 
 // Wyświetlacz S866 (zawsze aktywny na Serial2)
 static s866_display_t g_display;
+
+// ── Serwer WWW konfiguracji WiFi (aktywny gdy P17=1) ──
+static WebServer* g_web_server     = nullptr;  ///< Instancja serwera HTTP (nullptr gdy wy\u0142\u0105czony)
+static String     g_web_queued_cmd = "";        ///< Komenda silnika do wykonania po wy\u0142\u0105czeniu WiFi
+static bool       g_wifi_active    = false;     ///< Flaga: WiFi AP aktywne
 
 // ============================================================================
 // Algorytm przepustnicy — wspólny dla BLOCK / SINUS / FOC
@@ -956,6 +966,7 @@ void setup() {
     g_sine_hall_phase_offset = cfg.sine_hall_offset;
     g_foc_pi_d = {cfg.foc_kp_d, cfg.foc_ki_d, 0.0f, FOC_INTEGRAL_LIMIT};
     g_foc_pi_q = {cfg.foc_kp_q, cfg.foc_ki_q, 0.0f, FOC_INTEGRAL_LIMIT};
+    g_foc_voltage_mode = (cfg.foc_voltage_mode != 0);
 
     // Inicjalizacja GPIO
     initGPIO();
@@ -1645,6 +1656,32 @@ void loop() {
     // Obsługa komend USB Serial (zawsze aktywna)
     processSerialCommands();
 
+    // Serwer WWW konfiguracji: P17=1 → WiFi+HTTP ON, silnik OFF; P17=0 → WiFi OFF, wykonaj kolejkę
+    {
+        static uint8_t s_prev_p17 = 0xFF;
+        const uint8_t p17 = g_display.config.p17_cruise_control;
+        if (p17 != s_prev_p17) {
+            s_prev_p17 = p17;
+            if (p17 != 0) {
+                webConfigInit();
+            } else {
+                webConfigStop();
+                // Zawsze przeladuj config z EEPROM po wyjsciu z WiFi —
+                // przywraca tryb silnika, wszystkie parametry runtime.
+                executeCommand("cfg:reload");
+                // Dopiero teraz wykonaj skoljkowana komende (silnik jest juz w trybie z EEPROM)
+                if (g_web_queued_cmd.length() > 0) {
+                    String qr = executeCommand(g_web_queued_cmd);
+                    Serial.printf("[WEB-Q] '%s' -> %s\n", g_web_queued_cmd.c_str(), qr.c_str());
+                    g_web_queued_cmd = "";
+                }
+            }
+        }
+        if (g_wifi_active) {
+            webConfigHandle();
+        }
+    }
+
     // Auto-status co 1s
     if (g_autoStatus && (millis() - g_lastAutoStatusMs >= AUTO_STATUS_INTERVAL_MS)) {
         g_lastAutoStatusMs = millis();
@@ -1866,7 +1903,9 @@ void readAnalogInputs() {
 
     // Przepustnica: odczyt + filtr EMA (ADC2/GPIO2 jest podatny na szumy
     // od PWM silnika — bez filtra pojedyncza szpilka <400 daje duty=0 i stall)
-    {
+    // Pomijamy odczyt gdy WiFi aktywne — ADC2 jest zajęty przez WiFi (błąd ESP_ERR_TIMEOUT).
+    // Gdy WiFi jest ON silnik jest i tak wyłączony, więc wartość przepustnicy nie ma znaczenia.
+    if (!g_wifi_active) {
         uint16_t thr_raw = analogRead(PIN_THROTTLE);
         static float thr_ema = 0.0f;
         static bool  thr_init = false;
@@ -1877,14 +1916,24 @@ void readAnalogInputs() {
             thr_ema += kThrottleFilterAlpha * ((float)thr_raw - thr_ema);
         }
         g_bldc_state.throttle_raw = (uint16_t)(thr_ema + 0.5f);
+    } else {
+        g_bldc_state.throttle_raw = 0;  // WiFi ON: silnik wyłączony, przepustnica zignorowana
     }
 
     // Odczyt prądów fazowych
     uint16_t phaseB_raw = analogRead(PIN_PHASE_B_CURRENT);
     uint16_t phaseC_raw = analogRead(PIN_PHASE_C_CURRENT);
 
-    // Odczyt temperatur
-    uint16_t motorTempRaw = analogRead(PIN_MOTOR_TEMP);
+    // Odczyt temperatury silnika (ADC2/GPIO15) — pomijamy gdy WiFi aktywne
+    uint16_t motorTempRaw = g_wifi_active ? (uint16_t)g_bldc_state.motor_temperature
+                                          : analogRead(PIN_MOTOR_TEMP);
+
+    // Odczyt temperatury FET (ADC2_CH5/GPIO12) — PIN_FET_TEMP
+    // UWAGA: GPIO12 jest pinem STRAP i ADC2 — gdy podłączysz czujnik FET:
+    //   1. Nie stosuj pull-up (STRAP: VDD_SDIO 1.8V → brak uploadu flash)
+    //   2. Dodaj tu guard: analogRead(PIN_FET_TEMP) tylko gdy !g_wifi_active
+    //      (ADC2 zajęty przez WiFi → ESP_ERR_TIMEOUT gdy g_wifi_active)
+    // Aktualnie PIN_FET_TEMP NIE jest czytany (czujnik niepodłączony).
 
     // Surowe wartości ADC
     const float batteryAdcV = batteryRaw * (3.3f / 4095.0f);
@@ -3564,9 +3613,11 @@ static String executeCommand(const String& cmd) {
         g_foc_pi_q.integral = 0.0f;
         g_foc_vd_i = 0;
         g_foc_vq_i = 0;
+        config_get().foc_voltage_mode = g_foc_voltage_mode ? 1 : 0;
+        config_save();
         return g_foc_voltage_mode
-            ? "FOC Voltage mode: ON (Vq=duty, bez PI — jak SINUS w ramie dq)"
-            : "FOC Voltage mode: OFF (PI closed-loop)";
+            ? "FOC Voltage mode: ON (Vq=duty, bez PI) [zapisano]"
+            : "FOC Voltage mode: OFF (PI closed-loop) [zapisano]";
     }
     if (cmd == "fpitune") {
         if (g_bldc_state.mode != DRIVE_MODE_FOC) {
@@ -3872,6 +3923,7 @@ static String executeCommand(const String& cmd) {
             cfg.sine_hall_offset    = 0;
             cfg.foc_kp_q = cfg.foc_kp_d = FOC_KP_DEFAULT;
             cfg.foc_ki_q = cfg.foc_ki_d = FOC_KI_DEFAULT;
+            cfg.foc_voltage_mode    = 0;
             // Zastosuj do runtime
             g_bldc_state.ramp_time_ms   = cfg.ramp_time_ms;
             g_bldc_state.regen_enabled  = false;
@@ -3881,6 +3933,7 @@ static String executeCommand(const String& cmd) {
             g_foc_pi_d.kp = g_foc_pi_q.kp = FOC_KP_DEFAULT;
             g_foc_pi_d.ki = g_foc_pi_q.ki = FOC_KI_DEFAULT;
             g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
+            g_foc_voltage_mode      = false;
             Serial.println("[CFG] Wartosci domyslne zaladowane do runtime (nie zapisano do EEPROM).");
             Serial.println("[CFG] Uzyj cfg:save aby zapisac do EEPROM.");
             return "";
@@ -3896,6 +3949,7 @@ static String executeCommand(const String& cmd) {
             cfg.foc_ki_q           = g_foc_pi_q.ki;
             cfg.foc_kp_d           = g_foc_pi_d.kp;
             cfg.foc_ki_d           = g_foc_pi_d.ki;
+            cfg.foc_voltage_mode   = g_foc_voltage_mode ? 1 : 0;
             config_save();
             return "[CFG] Aktualne wartosci runtime zapisane do EEPROM.";
         }
@@ -3911,6 +3965,7 @@ static String executeCommand(const String& cmd) {
             g_foc_pi_d.kp = c.foc_kp_d;  g_foc_pi_d.ki = c.foc_ki_d;
             g_foc_pi_q.kp = c.foc_kp_q;  g_foc_pi_q.ki = c.foc_ki_q;
             g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
+            g_foc_voltage_mode = (c.foc_voltage_mode != 0);
             // Przełącz tryb silnika jeśli skonfigurowany tryb rozni się od bieżącego
             drive_mode_t target_mode = (drive_mode_t)c.drive_mode;
             if (target_mode >= DRIVE_MODE_BLOCK && target_mode <= DRIVE_MODE_FOC
@@ -3947,6 +4002,252 @@ static String executeCommand(const String& cmd) {
     }
 
     return "Nieznana komenda: " + cmd;
+}
+
+// ============================================================================
+// Serwer WWW konfiguracji przez WiFi
+// Aktywny gdy P17=1 w menu wyswietlacza S866.
+// WiFi AP: SSID="BLDC_Config", haslo="bldc1234", IP=192.168.4.1
+// Silnik wylaczony gdy WiFi wlaczone (ADC2 koliduje z WiFi).
+// ============================================================================
+
+static const char BLDC_WIFI_SSID[] = "BLDC_Config";
+static const char BLDC_WIFI_PASS[] = "bldc1234";
+
+// Strona HTML w pamieci flash (PROGMEM)
+static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLDC Config</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding-bottom:52px}h1{padding:10px 14px;background:#161b22;font-size:.92em;border-bottom:2px solid #238636;line-height:1.5}details{border-bottom:1px solid #21262d}summary{padding:9px 14px;cursor:pointer;list-style:none;background:#161b22;font-size:.88em;font-weight:600;color:#e6edf3}summary::-webkit-details-marker{display:none}.card{padding:10px 14px}.row{display:flex;align-items:center;gap:6px;margin:5px 0;flex-wrap:wrap}label{min-width:195px;font-size:.8em;color:#8b949e}input[type=number],input[type=text],select{flex:1;min-width:70px;padding:5px 7px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;font-size:.85em}button{padding:5px 11px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.8em;white-space:nowrap}button:hover{filter:brightness(1.15)}button.w{background:#5a5a60}button.r{background:#b62324}.sg{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:.82em}.sl{color:#8b949e}.sv{font-weight:600;color:#58a6ff}hr{border:0;border-top:1px solid #21262d;margin:8px 0}p.hint{font-size:.78em;color:#8b949e;margin:0 0 8px}#notif{position:fixed;bottom:0;left:0;right:0;padding:8px 14px;background:#161b22;font-size:.78em;color:#3fb950;border-top:1px solid #238636;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}</style>
+</head><body>
+<h1>&#9889; BLDC ESP32 Konfigurator &#8212; WiFi: <b>BLDC_Config</b> / bldc1234 &#8212; 192.168.4.1</h1>
+<details open><summary>&#128202; Stan systemu</summary><div class="card">
+<div class="sg"><span class="sl">Tryb:</span><span class="sv" id="s_mode">-</span><span class="sl">Pr&#281;dko&#347;&#263;:</span><span class="sv" id="s_spd">-</span><span class="sl">Bateria:</span><span class="sv" id="s_vbat">-</span><span class="sl">Duty:</span><span class="sv" id="s_dty">-</span><span class="sl">Fault:</span><span class="sv" id="s_flt">-</span><span class="sl">FOC Vmode (RT):</span><span class="sv" id="s_fvolt">-</span><span class="sl">Offset Hall (RT):</span><span class="sv" id="s_soff">-</span><span class="sl">Kolejka:</span><span class="sv" id="s_q" style="color:#f0883e">brak</span></div>
+<div class="row" style="margin-top:8px"><button onclick="loadCfg()">&#128260; Od&#347;wie&#380;</button></div>
+</div></details>
+<details open><summary>&#9881; Silnik</summary><div class="card">
+<div class="row"><label>Tryb startu (boot)</label><select id="drv_m"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option></select><button onclick="cmd('cfg:mode:'+v('drv_m'))">Ustaw</button></div>
+<div class="row"><label>Rampa 0&#8594;100% (ms)</label><input type="number" id="ramp_ms" min="0" max="10000" step="100"><button onclick="cmd('cfg:ramp:'+v('ramp_ms'))">Ustaw</button></div>
+<div class="row"><label>Regen hamowanie</label><select id="regen_e"><option value="0">OFF</option><option value="1">ON</option></select><button onclick="cmd('cfg:regen:'+v('regen_e'))">Ustaw</button></div>
+<div class="row"><label>Max krok duty (%)</label><input type="number" id="duty_s" min="0" max="100"><button onclick="cmd('cfg:step:'+v('duty_s'))">Ustaw</button></div>
+<div class="row"><label>Kierunek silnika</label><select id="mot_rev"><option value="0">CW (normalny)</option><option value="1">CCW (odwr&#243;cony)</option></select><button onclick="cmd('cfg:rev:'+v('mot_rev'))">Ustaw</button></div>
+<div class="row"><label>Offset fazy Hall</label><select id="sin_off"></select><button onclick="cmd('so:'+v('sin_off'))">Ustaw</button></div>
+</div></details>
+<details><summary>&#128690; Asystent PAS</summary><div class="card">
+<div class="row"><label>Op&#243;&#378;nienie startu (ms)</label><input type="number" id="pas_s" min="0" max="10000" step="100"><button onclick="cmd('passtart:'+v('pas_s'))">Ustaw</button></div>
+<div class="row"><label>Op&#243;&#378;nienie stopu (ms)</label><input type="number" id="pas_t" min="100" max="10000" step="100"><button onclick="cmd('passtop:'+v('pas_t'))">Ustaw</button></div>
+<div class="row"><label>Rampa PAS (ms)</label><input type="number" id="pas_r" min="0" max="10000" step="100"><button onclick="cmd('pasramp:'+v('pas_r'))">Ustaw</button></div>
+<div class="row"><label>Kierunek PAS</label><select id="pas_d"><option value="0">Normalny</option><option value="1">Odwr&#243;cony</option></select><button onclick="setPasDir()">Ustaw</button></div>
+</div></details>
+<details><summary>&#128260; Parametry FOC</summary><div class="card">
+<div class="row"><label>Tryb napi&#281;ciowy (fvolt)</label><span id="fvolt_st" class="sv">-</span><button onclick="doFvolt()">Prze&#322;&#261;cz fvolt</button><button class="w" onclick="queueCmd('fpitune')">&#10141; Kolejka: fpitune</button></div>
+<div class="row"><label>Kp o&#347; Q (torque) + D</label><input type="number" id="fkp_q" min="0" max="100" step="0.01"><button onclick="cmd('fkp:'+v('fkp_q'))">Ustaw Q+D</button></div>
+<div class="row"><label>Ki o&#347; Q (torque) + D</label><input type="number" id="fki_q" min="0" max="1000" step="0.1"><button onclick="cmd('fki:'+v('fki_q'))">Ustaw Q+D</button></div>
+<div class="row"><label>Kp_d o&#347; D (flux)</label><input type="number" id="fkp_d" min="0" max="100" step="0.01"><button onclick="cmd('fkpd:'+v('fkp_d'))">Ustaw D</button></div>
+<div class="row"><label>Ki_d o&#347; D (flux)</label><input type="number" id="fki_d" min="0" max="1000" step="0.1"><button onclick="cmd('fkid:'+v('fki_d'))">Ustaw D</button></div>
+</div></details>
+<details><summary>&#128190; EEPROM / NVS</summary><div class="card">
+<div class="row"><button onclick="sendR('cfg:save')">&#128190; Zapisz do EEPROM</button><button class="w" onclick="sendR('cfg:reload')">&#128194; Wczytaj z EEPROM</button><button class="r" onclick="cfgDef()">&#9888; Domy&#347;lne</button></div>
+<hr><p class="hint">Warto&#347;ci zapisane w NVS (EEPROM):</p>
+<div class="sg"><span class="sl">Tryb boot:</span><span class="sv" id="n_dm">-</span><span class="sl">Rampa:</span><span class="sv" id="n_ramp">-</span><span class="sl">Regen:</span><span class="sv" id="n_regen">-</span><span class="sl">Max krok duty:</span><span class="sv" id="n_step">-</span><span class="sl">Kierunek:</span><span class="sv" id="n_rev">-</span><span class="sl">Offset Hall:</span><span class="sv" id="n_soff">-</span><span class="sl">FOC Vmode:</span><span class="sv" id="n_fvolt">-</span><span class="sl">Kp_q / Ki_q:</span><span class="sv" id="n_focq">-</span><span class="sl">Kp_d / Ki_d:</span><span class="sv" id="n_focd">-</span></div>
+</div></details>
+<details><summary>&#127919; Kolejka &#183; Komendy</summary><div class="card">
+<p class="hint">Komenda wykonana gdy P17&#8594;0 (WiFi wy&#322;&#261;czone, silnik dost&#281;pny)</p>
+<div class="row"><select id="q_m"><option value="">-- brak zmiany --</option><option value="d">&#9940; OFF (d)</option><option value="B">&#128309; BLOCK</option><option value="S">&#126; SINUS</option><option value="F">&#127744; FOC</option><option value="sat">&#128269; SAT (auto-tune offsetu fazy)</option><option value="fpitune">&#10024; FOC PI Auto-tune</option><option value="man">&#9757; man (manual duty toggle)</option></select><button onclick="qMode()">Do kolejki</button><button class="r" onclick="clrQ()">Wyczy&#347;&#263;</button></div>
+<hr>
+<p class="hint">Dowolna komenda Serial (natychmiastowa, dzia&#322;a podczas WiFi):</p>
+<div class="row"><input type="text" id="dcmd" placeholder="np. cfg, foc, so:4, pasdbg..." onkeydown="if(event.key==='Enter')doDirect()"><button onclick="doDirect()">Wy&#347;lij</button></div>
+</div></details>
+<div id="notif">&#8987; &#321;adowanie konfiguracji...</div>
+<script>
+const v=id=>document.getElementById(id).value;
+const el=id=>document.getElementById(id);
+const MODES=['DISABLED','BLOCK','SINUS','FOC'];
+let _c={};
+(function(){const s=el('sin_off');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'\u00b0)';s.appendChild(o);}})();
+function notif(m,e){const n=el('notif');n.textContent=m;n.style.color=e?'#f85149':'#3fb950';n.style.borderTopColor=e?'#b62324':'#238636';}
+async function cmd(c){
+  try{const fd=new FormData();fd.append('cmd',c);const r=await fetch('/api/cmd',{method:'POST',body:fd});const t=await r.text();notif((t||'OK')+' \u2190 '+c);return t;}
+  catch(e){notif('B\u0142\u0105d: '+e,1);}
+}
+async function sendR(c){await cmd(c);loadCfg();}
+async function queueCmd(c){
+  try{const fd=new FormData();fd.append('cmd',c);await fetch('/api/queue',{method:'POST',body:fd});el('s_q').textContent=c||'brak';notif(c?'Kolejka: '+c:'Kolejka wyczyszczona');}
+  catch(e){notif('B\u0142\u0105d: '+e,1);}
+}
+function qMode(){const c=v('q_m');if(!c){notif('Wybierz komend\u0119');return;}queueCmd(c);}
+function clrQ(){queueCmd('');}
+function cfgDef(){if(confirm('Za\u0142adowa\u0107 warto\u015bci domy\u015blne?\n(nie zapisuje do EEPROM)'))sendR('cfg:defaults');}
+function setPasDir(){const d=parseInt(v('pas_d'));const cur=(_c.pas_dir_invert||0);if(d!==cur)cmd('pasdir');else notif('Kierunek PAS bez zmian');}
+function doDirect(){const i=el('dcmd');const c=i.value.trim();if(!c)return;cmd(c).then(()=>{i.value='';});}
+async function doFvolt(){await cmd('fvolt');loadCfg();}
+async function loadCfg(){
+  try{
+    const r=await fetch('/api/config');_c=await r.json();
+    el('s_mode').textContent=MODES[_c.rt_mode]||String(_c.rt_mode);
+    el('s_spd').textContent=_c.rt_speed.toFixed(1)+' km/h';
+    el('s_vbat').textContent=_c.rt_vbat.toFixed(1)+' V';
+    el('s_dty').textContent=_c.rt_duty+'%';
+    el('s_flt').textContent=_c.rt_fault?'\u26a0\ufe0f FAULT':'OK';
+    el('s_flt').style.color=_c.rt_fault?'#f85149':'#3fb950';
+    const fvOn=_c.rt_fvolt;
+    el('s_fvolt').textContent=fvOn?'ON (Vmode)':'OFF (PI)';
+    el('s_fvolt').style.color=fvOn?'#f0883e':'#3fb950';
+    el('s_soff').textContent=_c.rt_sine_offset+' ('+(_c.rt_sine_offset*3.75).toFixed(1)+'\u00b0)';
+    el('s_q').textContent=_c.queued_cmd||'brak';
+    el('drv_m').value=_c.drive_mode;el('ramp_ms').value=_c.ramp_time_ms;
+    el('regen_e').value=_c.regen_enabled;el('duty_s').value=_c.duty_max_step_pct;
+    el('mot_rev').value=_c.motor_reverse;el('sin_off').value=_c.sine_hall_offset;
+    el('pas_s').value=_c.pas_start_delay_ms;el('pas_t').value=_c.pas_stop_delay_ms;
+    el('pas_r').value=_c.pas_ramp_ms;el('pas_d').value=_c.pas_dir_invert;
+    el('fkp_q').value=(_c.foc_kp_q||0).toFixed(3);el('fki_q').value=(_c.foc_ki_q||0).toFixed(3);
+    el('fkp_d').value=(_c.foc_kp_d||0).toFixed(3);el('fki_d').value=(_c.foc_ki_d||0).toFixed(3);
+    const fvSt=el('fvolt_st');fvSt.textContent=fvOn?'ON (fvolt)':'OFF (PI)';fvSt.style.color=fvOn?'#f0883e':'#3fb950';
+    const DM=['?','BLOCK','SINUS','FOC'];
+    el('n_dm').textContent=DM[_c.drive_mode]||String(_c.drive_mode);
+    el('n_ramp').textContent=_c.ramp_time_ms+' ms';
+    el('n_regen').textContent=_c.regen_enabled?'ON':'OFF';
+    el('n_step').textContent=_c.duty_max_step_pct+'%';
+    el('n_rev').textContent=_c.motor_reverse?'CCW':'CW';
+    el('n_soff').textContent=_c.sine_hall_offset+' ('+(_c.sine_hall_offset*3.75).toFixed(1)+'\u00b0)';
+    el('n_fvolt').textContent=_c.foc_voltage_mode?'ON':'OFF';el('n_fvolt').style.color=_c.foc_voltage_mode?'#f0883e':'#3fb950';
+    el('n_focq').textContent=(_c.foc_kp_q||0).toFixed(3)+' / '+(_c.foc_ki_q||0).toFixed(3);
+    el('n_focd').textContent=(_c.foc_kp_d||0).toFixed(3)+' / '+(_c.foc_ki_d||0).toFixed(3);
+    notif('OK \u2013 '+new Date().toLocaleTimeString());
+  }catch(e){notif('B\u0142\u0105d ładowania: '+e,1);}
+}
+setInterval(loadCfg,5000);loadCfg();
+</script></body></html>)bldc_html";
+
+// --- Handlery HTTP ---
+
+static void webHandleRoot() {
+    if (g_web_server) g_web_server->send_P(200, "text/html", BLDC_WEB_HTML);
+}
+
+static void webHandleApiConfig() {
+    if (!g_web_server) return;
+    controller_config_t& cfg = config_get();
+    char buf[1536];
+    snprintf(buf, sizeof(buf),
+        "{\"drive_mode\":%d,\"ramp_time_ms\":%d,\"regen_enabled\":%d,"
+        "\"pas_dir_invert\":%d,\"pas_start_delay_ms\":%d,"
+        "\"pas_stop_delay_ms\":%d,\"pas_ramp_ms\":%d,"
+        "\"duty_max_step_pct\":%d,\"motor_reverse\":%d,"
+        "\"sine_hall_offset\":%d,\"foc_voltage_mode\":%d,"
+        "\"foc_kp_q\":%.4f,\"foc_ki_q\":%.4f,"
+        "\"foc_kp_d\":%.4f,\"foc_ki_d\":%.4f,"
+        "\"rt_mode\":%d,\"rt_speed\":%.2f,\"rt_vbat\":%.2f,"
+        "\"rt_duty\":%u,\"rt_fault\":%s,"
+        "\"rt_fvolt\":%s,\"rt_sine_offset\":%d,"
+        "\"queued_cmd\":\"%s\"}",
+        (int)cfg.drive_mode, (int)cfg.ramp_time_ms, (int)cfg.regen_enabled,
+        (int)cfg.pas_dir_invert, (int)cfg.pas_start_delay_ms,
+        (int)cfg.pas_stop_delay_ms, (int)cfg.pas_ramp_ms,
+        (int)cfg.duty_max_step_pct, (int)cfg.motor_reverse,
+        (int)cfg.sine_hall_offset, (int)cfg.foc_voltage_mode,
+        cfg.foc_kp_q, cfg.foc_ki_q, cfg.foc_kp_d, cfg.foc_ki_d,
+        (int)g_bldc_state.mode,
+        g_bldc_state.wheel_speed_kmh,
+        g_bldc_state.battery_voltage,
+        (unsigned int)((uint32_t)g_bldc_state.duty_cycle * 100u / PWM_MAX_DUTY),
+        g_bldc_state.fault ? "true" : "false",
+        g_foc_voltage_mode ? "true" : "false",
+        (int)g_sine_hall_phase_offset,
+        g_web_queued_cmd.c_str()
+    );
+    g_web_server->send(200, "application/json", buf);
+}
+
+static void webHandleApiCmd() {
+    if (!g_web_server) return;
+    if (!g_web_server->hasArg("cmd")) {
+        g_web_server->send(400, "text/plain", "Brak cmd");
+        return;
+    }
+    String c = g_web_server->arg("cmd");
+    c.trim();
+    if (c.length() == 0) {
+        g_web_server->send(400, "text/plain", "Pusta komenda");
+        return;
+    }
+    // Blokuj komendy wlaczajace silnik gdy WiFi aktywne (ADC2 konflikt)
+    if (c == "B" || c == "e" || c == "S" || c == "m2" || c == "F" || c == "m3") {
+        g_web_server->send(403, "text/plain",
+            "Silnik zablokowany (WiFi aktywne). Uzyj kolejki lub wylacz WiFi (P17=0).");
+        return;
+    }
+    String result = executeCommand(c);
+    g_web_server->send(200, "text/plain", result.length() > 0 ? result : "OK");
+}
+
+static void webHandleApiQueue() {
+    if (!g_web_server) return;
+    if (!g_web_server->hasArg("cmd")) {
+        g_web_server->send(400, "text/plain", "Brak cmd");
+        return;
+    }
+    g_web_queued_cmd = g_web_server->arg("cmd");
+    g_web_queued_cmd.trim();
+    Serial.printf("[WEB] Kolejka: '%s'\n", g_web_queued_cmd.c_str());
+    g_web_server->send(200, "text/plain",
+        g_web_queued_cmd.length() > 0 ? "OK: " + g_web_queued_cmd : "Kolejka wyczyszczona");
+}
+
+static void webHandleNotFound() {
+    if (g_web_server) g_web_server->send(404, "text/plain", "404 Not Found");
+}
+
+/**
+ * @brief Uruchamia WiFi AP i serwer HTTP na porcie 80.
+ * Wylacza silnik przed wlaczeniem WiFi (ADC2 - przepustnica/temp koliduje z WiFi).
+ */
+static void webConfigInit() {
+    if (g_wifi_active) return;
+
+    // Wylacz silnik — ADC2 (przepustnica, temperatury) koliduje z WiFi
+    g_bldc_state.mode       = DRIVE_MODE_DISABLED;
+    g_bldc_state.duty_cycle  = 0;
+    g_bldc_state.duty_target = 0;
+    g_duty_ramped            = 0;
+    allMosfetsOff();
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(BLDC_WIFI_SSID, BLDC_WIFI_PASS);
+    Serial.printf("[WiFi] AP '%s' uruchomiony, IP: %s\n",
+                  BLDC_WIFI_SSID, WiFi.softAPIP().toString().c_str());
+
+    g_web_server = new WebServer(80);
+    g_web_server->on("/",           HTTP_GET,  webHandleRoot);
+    g_web_server->on("/api/config", HTTP_GET,  webHandleApiConfig);
+    g_web_server->on("/api/cmd",    HTTP_POST, webHandleApiCmd);
+    g_web_server->on("/api/queue",  HTTP_POST, webHandleApiQueue);
+    g_web_server->onNotFound(webHandleNotFound);
+    g_web_server->begin();
+    g_wifi_active = true;
+    Serial.printf("[WiFi] HTTP port 80. Polacz z '%s' (haslo: '%s'), otworz http://192.168.4.1\n",
+                   BLDC_WIFI_SSID, BLDC_WIFI_PASS);
+}
+
+/**
+ * @brief Zatrzymuje serwer HTTP i wylacza WiFi (ADC2 dostepne po powrocie).
+ */
+static void webConfigStop() {
+    if (!g_wifi_active) return;
+    if (g_web_server) {
+        g_web_server->stop();
+        delete g_web_server;
+        g_web_server = nullptr;
+    }
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    g_wifi_active = false;
+    Serial.println("[WiFi] AP zatrzymany, WiFi OFF.");
+}
+
+/**
+ * @brief Wywolywany w loop() gdy WiFi aktywne — obsluguje klientow HTTP.
+ */
+static void webConfigHandle() {
+    if (g_web_server) g_web_server->handleClient();
 }
 
 

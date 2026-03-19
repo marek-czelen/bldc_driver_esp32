@@ -46,6 +46,7 @@ static void config_apply_defaults() {
     g_config.foc_ki_q           = 5.0f;                          // FOC Ki domyślne (PWM/A/s)
     g_config.foc_kp_d           = 0.5f;                          // FOC Kp_d domyślne
     g_config.foc_ki_d           = 5.0f;                          // FOC Ki_d domyślne
+    g_config.foc_voltage_mode   = 0;                              // FOC Voltage mode domyślnie OFF
 }
 
 void config_init() {

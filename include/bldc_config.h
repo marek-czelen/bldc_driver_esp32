@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  7
+#define CONFIG_VERSION  8
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -57,9 +57,10 @@ typedef struct __attribute__((packed)) {
     float           foc_ki_q;           ///< FOC PI Ki osi q, wynik komendy 'fpitune' / 'fki:'
     float           foc_kp_d;           ///< FOC PI Kp osi d, wynik komend 'fpitune' / 'fkpd:'
     float           foc_ki_d;           ///< FOC PI Ki osi d, wynik komend 'fpitune' / 'fkid:'
+    uint8_t         foc_voltage_mode;   ///< FOC tryb napięciowy: 1=Vmode (fvolt ON), 0=PI closed-loop
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[28];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[27];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)
