@@ -3719,6 +3719,11 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_ramp_ms:   %u ms\n",  (unsigned)cfg.pas_ramp_ms);
         Serial.printf("duty_step:     %d %%\n",   cfg.duty_max_step_pct);
         Serial.printf("motor_rev:     %d (%s)\n", cfg.motor_reverse, cfg.motor_reverse ? "CCW" : "CW");
+        Serial.printf("sine_offset:   %d (%.1f deg)\n", (int)cfg.sine_hall_offset, (float)cfg.sine_hall_offset * 3.75f);
+        Serial.printf("foc_kp_q:      %.3f\n", cfg.foc_kp_q);
+        Serial.printf("foc_ki_q:      %.3f\n", cfg.foc_ki_q);
+        Serial.printf("foc_kp_d:      %.3f\n", cfg.foc_kp_d);
+        Serial.printf("foc_ki_d:      %.3f\n", cfg.foc_ki_d);
         Serial.printf("magic:         0x%08X %s\n", cfg.magic, (cfg.magic == CONFIG_MAGIC) ? "OK" : "BAD!");
         Serial.printf("version:       %d\n",      cfg.version);
         Serial.println("======================================");
@@ -3729,7 +3734,11 @@ static String executeCommand(const String& cmd) {
         Serial.printf("ramp_time_ms:  %d ms\n", g_bldc_state.ramp_time_ms);
         Serial.printf("regen:         %s\n", g_bldc_state.regen_enabled ? "ON" : "OFF");
         Serial.printf("direction:     %s\n", g_reverse_isr ? "CCW" : "CW");
-        Serial.printf("sine_offset:   %d (%.1f°)\n", (int)g_sine_hall_phase_offset, (float)g_sine_hall_phase_offset * 3.75f);
+        Serial.printf("sine_offset:   %d (%.1f deg)\n", (int)g_sine_hall_phase_offset, (float)g_sine_hall_phase_offset * 3.75f);
+        Serial.printf("foc_kp_q:      %.3f\n", g_foc_pi_q.kp);
+        Serial.printf("foc_ki_q:      %.3f\n", g_foc_pi_q.ki);
+        Serial.printf("foc_kp_d:      %.3f\n", g_foc_pi_d.kp);
+        Serial.printf("foc_ki_d:      %.3f\n", g_foc_pi_d.ki);
         Serial.println();
         return "";
     }
