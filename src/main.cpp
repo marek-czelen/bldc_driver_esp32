@@ -692,7 +692,14 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     uint32_t ramp_ms = (uint32_t)cfg.pas_ramp_ms;
 
     // --- Brak impulsów PAS przez stop_delay → przestał pedałować ---
-    if (last_pulse == 0 || (now_us - last_pulse) > stop_delay_us) {
+    // Warunek 1: cisza — brak krawędzi od stop_delay_us
+    // Warunek 2: zmierzony okres > stop_delay — magnesy zatrzymane generują sporadyczne
+    //            szpilki (17ms LOW co kilkanaście sekund), które resetują 'since', ale
+    //            zmierzony OKRES (H+L) jest wielokrotnie dłuższy niż stop_delay.
+    uint32_t period_us = g_pas_period_us;
+    bool timed_out = (last_pulse == 0) || ((now_us - last_pulse) > stop_delay_us);
+    bool period_too_long = (period_us > 0) && (period_us > stop_delay_us);
+    if (timed_out || period_too_long) {
         g_pas_pedaling = false;
         g_pas_fwd_since_ms = 0;
         g_pas_active_since_ms = 0;
@@ -1013,7 +1020,7 @@ void setup() {
  * Na każdym kroku: 400ms stabilizacja + 600ms pomiar średniego prądu.
  * Optymalny offset = minimum prądu (najlepsza sprawność, najmniej strat).
  *
- * Uruchamiany komendą 'sat'. Wymaga trybu SINUS i działającego silnika.
+ * Uruchamiany komendą 'sat'. Wymaga trybu SINUS lub FOC i działającego silnika.
  * Podczas strojenia przepustnica jest ignorowana (g_manual_duty_override).
  *
  * Całkowity czas: ~25 kroków × 1s = ~25 sekund.
@@ -2053,28 +2060,77 @@ void printDiagnostics() {
         g_bldc_state.pas_active ? "PAS " : "",
         g_bldc_state.fault ? "FAULT " : "");
 
-    // PAS: stan + timing
-    if (g_pas_pedaling) {
-        int pasDutyPct = (int)((uint32_t)g_bldc_state.pas_duty * 100 / PWM_MAX_DUTY);
-        // Oblicz V_target do wyświetlenia
-        uint8_t ra = g_display.rx.assist_level;
-        uint8_t vm = g_display.config.p08_speed_limit;
-        if (vm == 0) vm = 25;
-        float vt = 6.0f + (float)ra * ((float)vm - 6.0f) / 15.0f;
-        Serial.printf("PAS:ON %d%% vt:%.1f sl:%.2f ", pasDutyPct, vt, g_speed_limit_factor);
-    } else if (g_pas_fwd_since_ms > 0) {
-        // W start delay — pedałuje forward ale jeszcze nie aktywny
-        uint32_t elapsed = (uint32_t)(esp_timer_get_time() / 1000) - g_pas_fwd_since_ms;
-        Serial.printf("PAS:WAIT %lums/%ums fw:%d H:%lu L:%lu ",
-            (unsigned long)elapsed,
-            (unsigned)config_get().pas_start_delay_ms,
+    // PAS: linia diagnostyczna — zawsze wyświetlana
+    {
+        uint32_t now_us = (uint32_t)esp_timer_get_time();
+        uint32_t since_us = (g_pas_last_pulse_us > 0) ? (now_us - g_pas_last_pulse_us) : 0xFFFFFFFFUL;
+        uint32_t ht = g_pas_high_time_us;
+        uint32_t lt = g_pas_low_time_us;
+        uint32_t period = ht + lt;
+
+        // Asymetria [%]
+        uint8_t asym_pct = 0;
+        if (period > 0) {
+            uint32_t diff = (ht > lt) ? (ht - lt) : (lt - ht);
+            asym_pct = (uint8_t)(diff * 100UL / period);
+        }
+
+        // Kadencja [RPM] z okresu PAS i liczby magnesów
+        float cadence_rpm = 0.0f;
+        uint8_t magnets = g_display.config.p13_pas_magnets;
+        if (magnets == 0) magnets = 1;
+        if (period > 0 && since_us < 2000000UL) {
+            cadence_rpm = 60000000.0f / ((float)period * (float)magnets);
+        }
+
+        // Stan słowny
+        const char* pas_state;
+        if (since_us > (uint32_t)config_get().pas_stop_delay_ms * 1000UL || since_us == 0xFFFFFFFFUL) {
+            pas_state = "STOP";
+        } else if (g_pas_pedaling) {
+            pas_state = "ON";
+        } else if (!g_pas_forward && g_pas_fwd_since_ms == 0) {
+            pas_state = "REV";
+        } else {
+            pas_state = "WAIT";
+        }
+
+        // Czas od ostatniego impulsu [ms]
+        uint32_t since_ms = (since_us == 0xFFFFFFFFUL) ? 9999 : (since_us / 1000);
+        if (since_ms > 9999) since_ms = 9999;
+
+        // Czas w trybie forward / do aktywacji
+        uint32_t fwd_elapsed_ms = 0;
+        if (g_pas_fwd_since_ms > 0) {
+            fwd_elapsed_ms = (uint32_t)(esp_timer_get_time() / 1000) - g_pas_fwd_since_ms;
+        }
+
+        Serial.printf(
+            "\n  [PAS] st:%s edges:%lu since:%lums H:%lums L:%lums asym:%d%% conf:%d fwd:%d "
+            "rpm:%.0f fwd_ms:%lu/%u ped:%d inv:%d",
+            pas_state,
+            (unsigned long)g_pas_edge_count,
+            (unsigned long)since_ms,
+            (unsigned long)(ht / 1000),
+            (unsigned long)(lt / 1000),
+            (int)asym_pct,
+            (int)g_pas_dir_confidence,
             (int)g_pas_forward,
-            (unsigned long)g_pas_high_time_us,
-            (unsigned long)g_pas_low_time_us);
-    } else if (!g_pas_forward) {
-        Serial.printf("PAS:REV H:%lu L:%lu ",
-            (unsigned long)g_pas_high_time_us,
-            (unsigned long)g_pas_low_time_us);
+            cadence_rpm,
+            (unsigned long)fwd_elapsed_ms,
+            (unsigned)config_get().pas_start_delay_ms,
+            (int)g_pas_pedaling,
+            (int)g_pas_dir_invert_isr);
+
+        // Jeśli PAS aktywny — pokaż duty i V_target
+        if (g_pas_pedaling) {
+            int pasDutyPct = (int)((uint32_t)g_bldc_state.pas_duty * 100 / PWM_MAX_DUTY);
+            uint8_t ra = g_display.rx.assist_level;
+            uint8_t vm = g_display.config.p08_speed_limit;
+            if (vm == 0) vm = 25;
+            float vt = 6.0f + (float)ra * ((float)vm - 6.0f) / 15.0f;
+            Serial.printf(" d:%d%% vt:%.1f sl:%.2f", pasDutyPct, vt, g_speed_limit_factor);
+        }
     }
 
     // Prędkość koła [km/h]
@@ -3071,6 +3127,9 @@ void printHelp() {
     Serial.println("             0=bez limitu. Domyslnie 5%. Ogranicza szarpniecia mocy.");
     Serial.println("             Dziala razem z rampa (bardziej restrykcyjny wygrywa).");
     Serial.println("cfg:rev:N  Kierunek obrotow po restarcie: 0=CW (normalny), 1=CCW (odwrocony)");
+    Serial.println("cfg:defaults  Zaladuj wartosci domyslne do runtime (bez zapisu EEPROM)");
+    Serial.println("cfg:save      Zapisz aktualne wartosci runtime do EEPROM");
+    Serial.println("cfg:reload    Wczytaj wartosci z EEPROM i zastosuj do runtime");
     Serial.println();
     Serial.println("---------- PAS (Pedal Assist Sensor) ----------");
     Serial.println("  Czujnik na GPIO22, dysk magnesow na wale korbowym.");
@@ -3576,8 +3635,8 @@ static String executeCommand(const String& cmd) {
             g_manual_duty_override = false;
             return "[SAT] Anulowano. Offset przywrócony: " + String((int)g_atune_saved_offset);
         }
-        if (g_bldc_state.mode != DRIVE_MODE_SINUS) {
-            return "[SAT] Wymaga trybu SINUS! Użyj S lub m2 aby włączyć.";
+        if (g_bldc_state.mode != DRIVE_MODE_SINUS && g_bldc_state.mode != DRIVE_MODE_FOC) {
+            return "[SAT] Wymaga trybu SINUS lub FOC! Użyj S/F lub m2/m3 aby włączyć.";
         }
         // Opcjonalnie: sat:MIN:MAX:STEP  np. sat:-16:16:4
         if (cmd.startsWith("sat:")) {
@@ -3796,6 +3855,61 @@ static String executeCommand(const String& cmd) {
             }
             config_save();
             return cfg.motor_reverse ? "Kierunek boot: CCW (odwrocony)" : "Kierunek boot: CW (normalny)";
+        }
+        // cfg:defaults — załaduj wartości domyślne do runtime (BEZ zapisu do EEPROM)
+        if (cmd == "cfg:defaults") {
+            cfg.drive_mode          = (uint8_t)DRIVE_MODE_BLOCK;
+            cfg.ramp_time_ms        = 1200;
+            cfg.regen_enabled       = 0;
+            cfg.pas_dir_invert      = 0;
+            cfg.pas_start_delay_ms  = 2000;
+            cfg.pas_stop_delay_ms   = 1000;
+            cfg.pas_ramp_ms         = 1500;
+            cfg.duty_max_step_pct   = 5;
+            cfg.motor_reverse       = 0;
+            cfg.sine_hall_offset    = 0;
+            cfg.foc_kp_q = cfg.foc_kp_d = FOC_KP_DEFAULT;
+            cfg.foc_ki_q = cfg.foc_ki_d = FOC_KI_DEFAULT;
+            // Zastosuj do runtime
+            g_bldc_state.ramp_time_ms   = cfg.ramp_time_ms;
+            g_bldc_state.regen_enabled  = false;
+            g_pas_dir_invert_isr        = false;
+            g_reverse_isr               = false;
+            g_sine_hall_phase_offset    = 0;
+            g_foc_pi_d.kp = g_foc_pi_q.kp = FOC_KP_DEFAULT;
+            g_foc_pi_d.ki = g_foc_pi_q.ki = FOC_KI_DEFAULT;
+            g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
+            Serial.println("[CFG] Wartosci domyslne zaladowane do runtime (nie zapisano do EEPROM).");
+            Serial.println("[CFG] Uzyj cfg:save aby zapisac do EEPROM.");
+            return "";
+        }
+        // cfg:save — zsynchronizuj wartości runtime → config i zapisz do EEPROM
+        if (cmd == "cfg:save") {
+            cfg.ramp_time_ms       = g_bldc_state.ramp_time_ms;
+            cfg.regen_enabled      = g_bldc_state.regen_enabled ? 1 : 0;
+            cfg.pas_dir_invert     = g_pas_dir_invert_isr ? 1 : 0;
+            cfg.motor_reverse      = g_reverse_isr ? 1 : 0;
+            cfg.sine_hall_offset   = g_sine_hall_phase_offset;
+            cfg.foc_kp_q           = g_foc_pi_q.kp;
+            cfg.foc_ki_q           = g_foc_pi_q.ki;
+            cfg.foc_kp_d           = g_foc_pi_d.kp;
+            cfg.foc_ki_d           = g_foc_pi_d.ki;
+            config_save();
+            return "[CFG] Aktualne wartosci runtime zapisane do EEPROM.";
+        }
+        // cfg:reload — wczytaj config z EEPROM i zastosuj do runtime
+        if (cmd == "cfg:reload") {
+            config_init();  // wczytuje NVS do g_config (lub reset do domyslnych)
+            controller_config_t& c = config_get();
+            g_bldc_state.ramp_time_ms   = c.ramp_time_ms;
+            g_bldc_state.regen_enabled  = (c.regen_enabled != 0);
+            g_pas_dir_invert_isr        = (c.pas_dir_invert != 0);
+            g_reverse_isr               = (c.motor_reverse != 0);
+            g_sine_hall_phase_offset    = c.sine_hall_offset;
+            g_foc_pi_d.kp = c.foc_kp_d;  g_foc_pi_d.ki = c.foc_ki_d;
+            g_foc_pi_q.kp = c.foc_kp_q;  g_foc_pi_q.ki = c.foc_ki_q;
+            g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
+            return "[CFG] Wartosci z EEPROM zaladowane do runtime.";
         }
         return "Nieznany parametr cfg";
     }
