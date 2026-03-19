@@ -184,7 +184,6 @@ src/
 
 `bldc_state_t g_bldc_state` — jedna struktura przechowująca cały stan systemu:
 - tryb pracy (`mode`)
-- kierunek (`direction`)
 - wypełnienie PWM (`duty_cycle`)
 - surowa wartość przepustnicy (`throttle_raw`)
 - napięcie baterii (`battery_voltage`)
@@ -240,7 +239,6 @@ Zmienne współdzielone między `loop()` a `onCommutationTimer()` są `volatile`
 - `g_duty_isr` — aktualne wypełnienie PWM
 - `g_motor_enabled` — czy silnik ma się kręcić
 - `g_brake_isr` — czy hamulec aktywny
-- `g_direction_isr` — kierunek CW/CCW
 - `g_mode_isr` — aktualny tryb sterowania (BLOCK/SINUS/FOC/DISABLED)
 
 ---
@@ -253,7 +251,7 @@ W każdej chwili **jedna faza dostaje PWM (high-side ON)**, **jedna faza jest zw
 Sekwencja komutacji zależy od pozycji rotora odczytanej z czujników Halla.  
 Hall encoder daje 3-bitowy kod (wartości 1–6, 0 i 7 są błędem).
 
-### Tabela komutacji CW (Hall [C:B:A]):
+### Tabela komutacji (Hall [C:B:A]):
 
 | Hall (CBA) | Faza A    | Faza B    | Faza C    | Opis     |
 |------------|-----------|-----------|-----------|----------|
@@ -264,7 +262,6 @@ Hall encoder daje 3-bitowy kod (wartości 1–6, 0 i 7 są błędem).
 | 100 = 4    | LOW (GND) | FLOAT     | PWM HIGH  | C+ → A−  |
 | 101 = 5    | FLOAT     | LOW (GND) | PWM HIGH  | C+ → B−  |
 
-Dla **CCW** tabela jest lustrzanym odbiciem (zamienione fazy HIGH i LOW).
 
 > **Uwaga do dopasowania tabeli:**  
 > Kolejność Hall→uzwojenie zależy od fizycznego montażu czujników w silniku.  
@@ -309,9 +306,9 @@ indeks:  96 →     0  (guard = [0])
 ### Mapowanie Hall → sektor
 
 Tablica `g_hall_to_sector[8]` mapuje stan Halla (1–6) na indeks sektora 0–5.
-Kolejność sektorów odpowiada sekwencji CW z komutacji blokowej: 1→3→2→6→4→5.
+Kolejność sektorów odpowiada sekwencji komutacji blokowej: 1→3→2→6→4→5.
 
-| Hall (CW) | Sektor | Block commutation |
+| Hall | Sektor | Block commutation |
 |-----------|--------|-------------------|
 | 1 (001)   |    0   | A→B               |
 | 3 (011)   |    1   | A→C−              |
@@ -326,7 +323,7 @@ W przeciwieństwie do prostego snap-to-Hall, kąt jest śledzony ciągle w Q16
 fixed-point (0..96<<16). Co tick ISR (50 µs):
 
 ```
-angle += speed_q16  (lub −= dla CCW)
+angle += speed_q16
 ```
 
 Prędkość `speed_q16` = (16 × 50) << 16 / hall_period_us = 52428800 / hall_period_us,
@@ -391,12 +388,12 @@ zablokowany przez stall freeze (ponieważ stary timestamp wskazywałby >200ms).
 
 ### Generacja PWM 3 faz (center-aligned complementary)
 
-Mapowanie faz (dopasowane do tabeli komutacji blokowej CW):
+Mapowanie faz (dopasowane do tabeli komutacji blokowej):
 - **Faza A**: `sin(θ)` — referencyjna (peak w sektorach 0,1)
 - **Faza B**: `sin(θ + 64)` (64/96 × 360° = 240°, peak w sektorach 2,3)
 - **Faza C**: `sin(θ + 32)` (32/96 × 360° = 120°, peak w sektorach 4,5)
 
-Dzięki temu sekwencja peaków A→B→C jest zgodna z kierunkiem obrotu blokowego CW.
+Dzięki temu sekwencja peaków A→B→C jest zgodna z kierunkiem obrotu blokowego.
 
 Dla każdej fazy:
 1. Interpolacja liniowa z tabeli: `sin_val = sine_interp_q16(angle + offset)`
@@ -606,7 +603,7 @@ Hamowanie rekuperacyjne wykorzystuje silnik BLDC jako generator — energia kine
 1. **PWM ON** (LS ON): uzwojenie silnika jest zwarte przez GND → prąd narasta napędzany przez back-EMF, energia gromadzi się w indukcyjności uzwojenia
 2. **PWM OFF** (LS OFF): prąd indukcyjny nie może się zatrzymać → napięcie rośnie → prąd płynie przez body diodę high-side FET do V+ → **bateria jest ładowana**
 
-### Tabela komutacji regen (CW)
+### Tabela komutacji regen
 
 Transformacja motoring → regen:
 - Faza źródłowa (dawniej HS_PWM) → **LS_PWM** (regen)
@@ -942,7 +939,6 @@ P13 magnets:      12
 | `S`             | Włącz silnik — tryb SINUS |
 | `m2` Enter      | Włącz silnik — tryb SINUS (alternatywna) |
 | `d`             | Wyłącz silnik, duty = 0 |
-| `r`             | Odwróć kierunek CW↔CCW (tylko gdy wyłączony) |
 | `+`             | Zwiększ duty o 5% |
 | `-`             | Zmniejsz duty o 5% |
 | `0`–`100` Enter | Ustaw duty w % (np. `25` + Enter = 25%) |
@@ -995,13 +991,12 @@ P13 magnets:      12
 ### Format statusu (jedna linia)
 
 ```
-BLK CW D:35/80% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870) RPM:120 WT:500 P:44.6W DISP:OK L3
+BLK D:35/80% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870) RPM:120 WT:500 P:44.6W DISP:OK L3
 ```
 
 | Pole    | Znaczenie |
 |---------|-----------|
 | `BLK`   | Tryb: OFF/BLK/SIN/FOC |
-| `CW`    | Kierunek: CW/CCW |
 | `D:35/80%` | Duty cycle: aktualny (po rampie) / docelowy (z przepustnicy) |
 | `V:36.1`| Napięcie baterii [V] |
 | `Ia/Ib/Ic` | Prądy fazowe A, B, C [A] |
@@ -1099,7 +1094,6 @@ version:         5
 mode:            SINUS
 ramp_time_ms:    1200 ms
 regen:           OFF
-direction:       CW
 sine_offset:     0 (0.0°)
 ```
 

@@ -48,7 +48,6 @@ volatile uint8_t g_hall_isr = 0;
 volatile uint16_t g_duty_isr = 0;
 volatile bool g_motor_enabled = false;
 volatile bool g_brake_isr = false;
-volatile motor_direction_t g_direction_isr = DIRECTION_CW;
 volatile drive_mode_t g_mode_isr = DRIVE_MODE_DISABLED;   ///< Tryb sterowania (do ISR)
 
 // Pomiar RPM z przejść Halla (aktualizowane w ISR timera)
@@ -126,6 +125,9 @@ volatile uint16_t g_dbg_last_amp = 0;
 volatile int16_t  g_dbg_last_ma = 0;
 volatile int16_t  g_dbg_last_mb = 0;
 volatile int16_t  g_dbg_last_mc = 0;
+volatile int32_t  g_dbg_last_hall_err = 0;     ///< Ostatni błąd korekcji kąta Halla (Q16)
+volatile uint32_t g_dbg_snap_count = 0;        ///< Licznik pełnych snapów kąta (desync/crawl)
+volatile uint32_t g_dbg_corr_count = 0;        ///< Licznik łagodnych korekcji kąta
 
 // Pomiar RPM z pinu SPEED (GPIO ISR, dla silników przekładniowych, P07==1)
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
@@ -291,7 +293,7 @@ void printDiagnostics();
 void printDisplayConfig();
 void blockCommutate(uint8_t hallState, uint16_t duty);
 void processSerialCommands();
-static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir);
+static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty);
 static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude);
 static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude);
 static inline int32_t IRAM_ATTR sine_interp_q16(uint32_t angle_q16);
@@ -326,7 +328,7 @@ static const float kThrottleFilterAlpha  = 0.15f;  ///< EMA α dla przepustnicy 
 // Auto-status
 static bool g_autoStatus = false;
 static unsigned long g_lastAutoStatusMs = 0;
-static const unsigned long AUTO_STATUS_INTERVAL_MS = 1000;
+static const unsigned long AUTO_STATUS_INTERVAL_MS = 100;
 static bool g_debugSine = false;
 static unsigned long g_lastDebugSineMs = 0;
 static const unsigned long DEBUG_SINE_INTERVAL_MS = 200;
@@ -426,8 +428,9 @@ static uint8_t getSpeedLimitKmh() {
  * @return Duty po limitowaniu.
  */
 static float g_speed_limit_factor = 1.0f;           ///< EMA-filtrowany współczynnik mocy 0..1
-#define SPEED_LIMIT_EMA_ALPHA     0.03f              ///< EMA α (~2kHz loop → τ≈16ms, gładki)
-#define SPEED_LIMIT_FADE_START    0.70f              ///< Fade zaczyna się od 70% limitu
+#define SPEED_LIMIT_ALPHA_DOWN    0.03f              ///< EMA α spadek (over-speed → szybka redukcja duty)
+#define SPEED_LIMIT_ALPHA_UP      0.005f             ///< EMA α wzrost (under-speed → wolne narastanie duty)
+#define SPEED_LIMIT_FADE_START    0.65f              ///< Fade zaczyna się od 65% limitu
 
 static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
     if (duty_in == 0) {
@@ -446,16 +449,16 @@ static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
         if (speed_kmh <= fade_start) {
             raw_factor = 1.0f;  // poniżej strefy fade → pełna moc
         } else {
-            // Liniowy spadek 1.0→0.0 w strefie fade (70%..100% limitu)
+            // Liniowy spadek 1.0→0.0 w strefie fade
             raw_factor = (limit_f - speed_kmh) / (limit_f - fade_start);
         }
     }
 
-    // Filtr EMA: współczynnik zmienia się płynnie, eliminuje oscylacje
-    // spowodowane szumem pomiaru prędkości koła.
-    // Spadek (hamowanie): filtrowany — bez gwałtownych skoków duty
-    // Wzrost (przyspieszenie): filtrowany — płynny powrót mocy
-    g_speed_limit_factor += SPEED_LIMIT_EMA_ALPHA * (raw_factor - g_speed_limit_factor);
+    // Asymetryczny filtr EMA:
+    // - Over-speed (raw < sl): szybka redukcja duty → zapobiega przekroczeniu limitu
+    // - Under-speed (raw > sl): wolne narastanie → zapobiega oscylacji bang-bang
+    float alpha = (raw_factor < g_speed_limit_factor) ? SPEED_LIMIT_ALPHA_DOWN : SPEED_LIMIT_ALPHA_UP;
+    g_speed_limit_factor += alpha * (raw_factor - g_speed_limit_factor);
 
     // Clamp do 0..1 (bezpieczeństwo numeryczne)
     if (g_speed_limit_factor < 0.0f) g_speed_limit_factor = 0.0f;
@@ -1234,7 +1237,7 @@ void loop() {
             float ff_vd = 0.0f;
 
             // Globalny limit napięcia (bezpieczeństwo)
-            float amp_limit = ff_vq;  // max = feedforward (duty)
+            float amp_limit = fabsf(ff_vq);  // max = |feedforward| (duty)
 
             // PI limit = mała korekta wokół feedforward
             float pi_limit = FOC_PI_CORR_LIMIT;
@@ -1423,9 +1426,9 @@ void loop() {
     // Aktualizacja zmiennych ISR z głównego stanu
     g_hall_isr = g_bldc_state.hall_state;
     g_duty_isr = g_bldc_state.duty_cycle;
-    g_motor_enabled = (g_bldc_state.mode != DRIVE_MODE_DISABLED) && (g_bldc_state.duty_cycle > 0);
+    g_motor_enabled = (g_bldc_state.mode != DRIVE_MODE_DISABLED) &&
+        (g_bldc_state.duty_cycle > 0 || g_bldc_state.mode == DRIVE_MODE_SINUS || g_bldc_state.mode == DRIVE_MODE_FOC);
     g_brake_isr = g_bldc_state.brake_active;
-    g_direction_isr = g_bldc_state.direction;
     g_mode_isr = g_bldc_state.mode;
 
     // Prędkość sinusoidalna (speed_q16) jest teraz obliczana bezpośrednio
@@ -1893,16 +1896,15 @@ void readDigitalInputs() {
 /**
  * @brief Wypisuje pojedynczą linię statusu na Serial.
  *
- * Format: `MODE DIR D:duty% V:Vbat Ia:X.XX Ib:X.XX Ic:X.XX H:CBA T:temp Thr:thr%(raw) [flagi]`
+ * Format: `MODE D:duty% V:Vbat Ia:X.XX Ib:X.XX Ic:X.XX H:CBA T:temp Thr:thr%(raw) [flagi]`
  *
  * Przykład:
  * @code
- * BLK CW D:45% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1850)
+ * BLK D:45% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1850)
  * @endcode
  *
  * Kolumny:
  * - MODE:    OFF/BLK/SIN/FOC (tryb sterowania)
- * - DIR:     CW/CCW (kierunek)
  * - D:       duty cycle PWM [%]
  * - V:       napięcie baterii [V]
  * - Ia/Ib/Ic: prądy fazowe [A]
@@ -1926,9 +1928,8 @@ void printDiagnostics() {
         if (thrPct > 100) thrPct = 100;
     }
 
-    Serial.printf("%s %s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
+    Serial.printf("%s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
         modeNames[g_bldc_state.mode],
-        g_bldc_state.direction == DIRECTION_CW ? "CW" : "CCW",
         dutyPct, targetPct,
         g_bldc_state.battery_voltage,
         g_bldc_state.phase_current[0],
@@ -1992,6 +1993,24 @@ void printDiagnostics() {
         Serial.printf("%.1fkm/h ", g_bldc_state.wheel_speed_kmh);
     }
 
+    // Debug SINUS/FOC: parametry śledzenia kąta
+    if (g_bldc_state.mode == DRIVE_MODE_SINUS || g_bldc_state.mode == DRIVE_MODE_FOC) {
+        uint32_t ang = g_sine_angle_q16;
+        int32_t ang_entry = (int32_t)(ang >> 16);
+        int32_t hall_err_entry = g_dbg_last_hall_err >> 16;  // w wpisach tabeli (1=3.75°)
+        Serial.printf("\n  [DBG] ang:%ld spd:%lu hdir:%d sec:%d hp:%luus err:%ld snp:%lu cor:%lu fb:%lu d:%u",
+            (long)ang_entry,
+            (unsigned long)g_sine_speed_q16,
+            (int)g_sine_dir,
+            (int)g_sine_last_hall_idx,
+            (unsigned long)g_hall_period_us,
+            (long)hall_err_entry,
+            (unsigned long)g_dbg_snap_count,
+            (unsigned long)g_dbg_corr_count,
+            (unsigned long)g_dbg_sine_fallback_count,
+            (unsigned)g_bldc_state.duty_cycle);
+    }
+
     // Informacje z wyświetlacza S866
     if (g_display.connected) {
         Serial.printf("DISP:OK L%d(r%d) %s%s",
@@ -2025,11 +2044,10 @@ static void printSineDebug() {
         (unsigned long)g_hall_period_us,
         (unsigned long)since_hall);
 
-    Serial.printf("spd:%lu ang:%ld.%04ld dir:%s amp:%u m:%d/%d/%d ",
+    Serial.printf("spd:%lu ang:%ld.%04ld amp:%u m:%d/%d/%d ",
         (unsigned long)g_sine_speed_q16,
         (long)angle_entry,
         (long)((angle_frac * 10000L) >> 16),
-        (g_direction_isr == DIRECTION_CW) ? "CW" : "CCW",
         (unsigned)g_dbg_last_amp,
         (int)g_dbg_last_ma, (int)g_dbg_last_mb, (int)g_dbg_last_mc);
 
@@ -2102,36 +2120,39 @@ void IRAM_ATTR onCommutationTimer() {
             // Port z bldc_driver_v2: bldc_hall_interrupt()
             // FOC współdzieli angle tracking z SINUS (ten sam algorytm Q16)
             if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
-                g_sine_last_hall_ms = (uint32_t)(now_us / 1000);  // stall detection timestamp
-
-                // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
-                // Krytyczne: obliczanie w loop() dawało opóźnienie 1-50ms
-                // (Serial.printf), co przy 500 RPM = 20-1000 ISR ticków
-                // z nieaktualną prędkością → kąt ucieka → desync.
-                // 32-bit dzielenie na ESP32 Xtensa jest bezpieczne w ISR
-                // (LoadStoreError dotyczy tylko byte-access do IRAM, nie ALU).
-                if (dt_us >= HALL_MIN_PERIOD_US && dt_us < 500000) {
-                    uint32_t new_speed = 52428800UL / dt_us;
-                    uint32_t old_speed = g_sine_speed_q16;
-                    if (old_speed == 0) {
-                        g_sine_speed_q16 = new_speed;
-                    } else {
-                        g_sine_speed_q16 = (old_speed + new_speed) >> SINE_SPEED_FILTER_SHIFT;
-                    }
-                }
 
                 int8_t new_idx = g_hall_to_sector[hall];
                 if (new_idx >= 0) {
+
                     int8_t old_idx = g_sine_last_hall_idx;
 
                     // Detekcja kierunku z sekwencji przejść Halla
+                    // Po remapie sektory ZAWSZE rosną dla poprawnej rotacji.
                     if (old_idx >= 0) {
                         int8_t fwd = (old_idx + 1) % 6;
-                        int8_t rev = (new_idx + 1) % 6;
+                        int8_t rev = (old_idx + 5) % 6;
                         if (new_idx == fwd) {
-                            g_sine_dir = 1;   // forward (CW)
-                        } else if (old_idx == rev) {
-                            g_sine_dir = -1;  // reverse (CCW)
+                            g_sine_dir = 1;   // prawidłowy kierunek
+                        } else if (new_idx == rev) {
+                            g_sine_dir = -1;  // cofanie się
+                        }
+                    }
+
+                    // --- Stall detection timestamp ---
+                    g_sine_last_hall_ms = (uint32_t)(now_us / 1000);
+
+                    // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
+                    if (dt_us >= HALL_MIN_PERIOD_US && dt_us < 500000) {
+                        uint32_t new_speed = 52428800UL / dt_us;
+                        uint32_t old_speed = g_sine_speed_q16;
+                        if (old_speed == 0) {
+                            g_sine_speed_q16 = new_speed;
+                        } else if (new_speed < old_speed) {
+                            // Deceleracja: szybki filtr 50/50.
+                            g_sine_speed_q16 = (old_speed + new_speed) >> 1;
+                        } else {
+                            // Akceleracja: wolny filtr 75/25.
+                            g_sine_speed_q16 = (old_speed * 3 + new_speed) >> 2;
                         }
                     }
 
@@ -2149,20 +2170,24 @@ void IRAM_ATTR onCommutationTimer() {
 
                     int32_t abs_err = (err >= 0) ? err : -err;
 
+                    g_dbg_last_hall_err = err;
+
                     if (g_sine_speed_q16 == 0) {
                         // Przy starcie/crawl: pełny snap kąta na środek sektora
                         g_sine_angle_q16 = (uint32_t)expected;
+                        g_dbg_snap_count++;
                     } else if (abs_err > SINE_SNAP_THRESHOLD) {
                         // Duży błąd (>90° elektr.) = desync → pełny snap
                         // Zapobiega pozytywnej pętli zwrotnej: błąd→mniej momentu→stall
                         g_sine_angle_q16 = (uint32_t)expected;
+                        g_dbg_snap_count++;
                     } else {
                         // Normalna praca: łagodna korekcja 1/4 błędu
-                        g_sine_angle_q16 = (uint32_t)(current + (err >> SINE_PHASE_CORR_SHIFT));
-                    }
-                    // Wrap angle
-                    if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
-                        g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
+                        int32_t new_angle = current + (err >> SINE_PHASE_CORR_SHIFT);
+                        if (new_angle < 0) new_angle += (int32_t)SINE_TABLE_Q16_FULL;
+                        if (new_angle >= (int32_t)SINE_TABLE_Q16_FULL) new_angle -= (int32_t)SINE_TABLE_Q16_FULL;
+                        g_sine_angle_q16 = (uint32_t)new_angle;
+                        g_dbg_corr_count++;
                     }
 
                     g_sine_last_hall_idx = new_idx;
@@ -2185,7 +2210,7 @@ void IRAM_ATTR onCommutationTimer() {
     if (g_brake_isr) {
         // Hamulec aktywny — regen braking jeśli włączony, inaczej coast
         if (g_regen_active_isr && g_regen_duty_isr > 0) {
-            regenCommutateISR(hall, g_regen_duty_isr, g_direction_isr);
+            regenCommutateISR(hall, g_regen_duty_isr);
         } else {
             ledcWrite(PWM_CHANNEL_A_HIGH, 0);
             ledcWrite(PWM_CHANNEL_B_HIGH, 0);
@@ -2207,27 +2232,12 @@ void IRAM_ATTR onCommutationTimer() {
         return;
     }
 
-    uint16_t d = g_duty_isr;
-
-    // ── Explicit freewheel: duty == 0 → natychmiastowy wolnobieg ──
-    // Wszystkie MOSFETY na OFF (HS OFF, LS OFF).
-    // Guard niezależny od g_motor_enabled — eliminuje race condition
-    // (loop() ustawia g_duty_isr=0 PRZED g_motor_enabled=false;
-    // ISR może trafić w okno gdzie motor_enabled=true ale d=0).
-    // W BLOCK mode bez tego guardu: d=0 + LS ON = aktywne hamowanie EM
-    // zamiast wolnobiegu (phaseX_Low ustawia LS ON do GND).
-    if (d == 0) {
-        allMosfetsOff();
-        return;
-    }
-
-    // SINUS safety fallback: gdy brak przejść Halla przez dłuższy czas → zeruj prędkość.
-    // Timeout dynamiczny: max(400ms, 4*ostatni_hall_period + 20ms), aby uniknąć
-    // oscylacji przy chwilowym spadku prędkości pod obciążeniem.
-    // Po zerowaniu prędkości, crawl w sinusCommutateISR/focCommutateISR wolno obraca pole,
-    // aż silnik da przejście Halla i prędkość zostanie przywrócona.
+    // SINUS/FOC safety fallback: PRZED guardem d==0, żeby prędkość
+    // była zerowana nawet gdy duty=0 (motor coastuje po puszczeniu manetki).
+    // Bez tego: spd zostaje zamrożone na starej wartości → przy ponownym
+    // duty kąt startuje z błędną prędkością → snap → szarpnięcie.
     if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
-        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t now_ms = (uint32_t)esp_timer_get_time() / 1000;  // identycznie jak w Hall ISR
         uint32_t hp_us = g_hall_period_us;
         uint32_t dyn_ms = SINE_STALL_FALLBACK_MS;
         if (hp_us > 0 && hp_us < 500000) {
@@ -2240,11 +2250,21 @@ void IRAM_ATTR onCommutationTimer() {
                 g_dbg_sine_fallback_count++;
                 g_dbg_last_fallback_ms = now_ms;
             }
-            // Reset timestampu — pozwala crawl w sinusCommutateISR działać
-            // kolejne STALL_FREEZE_MS ms zanim stall freeze znów zadziała.
-            // Bez tego crawl byłby permanentnie zablokowany (deadlock).
             g_sine_last_hall_ms = now_ms;
         }
+    }
+
+    uint16_t d = g_duty_isr;
+
+    // ── Explicit freewheel: duty == 0 → wolnobieg ──
+    // BLOCK: natychmiast allMosfetsOff (bo d=0 + LS ON = hamowanie EM).
+    // SINUS/FOC: kontynuuj do sinusCommutateISR/focCommutateISR —
+    // angle advance musi działać nawet przy d=0, inaczej po ponownym
+    // włączeniu duty kąt jest stary → duży err → snap → szarpnięcie.
+    // sinusCommutateISR/focCommutateISR same wyłączą MOSFETy (amplitude < MIN).
+    if (d == 0 && g_mode_isr != DRIVE_MODE_SINUS && g_mode_isr != DRIVE_MODE_FOC) {
+        allMosfetsOff();
+        return;
     }
 
     // Dispatch trybu sterowania
@@ -2266,80 +2286,41 @@ void IRAM_ATTR onCommutationTimer() {
             return;
     }
 
-    if (g_direction_isr == DIRECTION_CW) {
-        switch (hall) {
-            case 1:
-                ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            case 3:
-                ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
-                break;
-            case 2:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
-                break;
-            case 6:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
-                ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            case 4:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            case 5:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
-                ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            default:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-                ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-        }
-    } else {
-        switch (hall) {
-            case 1:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
-                ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            case 3:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            case 2:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
-                ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            case 6:
-                ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-            case 4:
-                ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
-                break;
-            case 5:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-                ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
-                break;
-            default:
-                ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-                ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-                break;
-        }
+    switch (hall) {
+        case 1:
+            ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
+            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            break;
+        case 3:
+            ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
+            break;
+        case 2:
+            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
+            break;
+        case 6:
+            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
+            ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            break;
+        case 4:
+            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
+            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            break;
+        case 5:
+            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
+            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
+            ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            break;
+        default:
+            ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
+            ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            break;
     }
 }
 
@@ -2395,7 +2376,7 @@ static inline int32_t IRAM_ATTR sine_interp_q16(uint32_t angle_q16) {
  *
  * ## Algorytm (port z bldc_driver_v2 TIM1_UP_IRQHandler)
  *
- * 1. Advance angle: angle += speed_q16 (lub -= dla CCW)
+ * 1. Advance angle: angle += speed_q16
  * 2. Stall freeze: brak przejść Halla > 200ms → zamrożenie kąta
  * 3. Oblicz 3 kąty fazowe: C=base, A=base+32, B=base+64 (×120°)
  * 4. Interpolacja sinusa z tabeli + obliczenie duty
@@ -2420,15 +2401,6 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
         return;
     }
 
-    // Gdy amplitude < SINE_MIN_AMPLITUDE → coast (wszystkie FETy OFF).
-    // Center-aligned PWM z bazą 512 przy małej amplitudzie = ~50% switching
-    // na wszystkich fazach = aktywne hamowanie elektromagnetyczne.
-    // W block mode mały duty = niemal 0 prądu (tiny PWM na 1 fazie).
-    if (amplitude < SINE_MIN_AMPLITUDE) {
-        allMosfetsOff();
-        return;
-    }
-
     // ── 1. Stall freeze: brak przejścia Halla > 200ms → nie avansuj kąta ──
     // WYJĄTEK: w trybie crawl (speed==0) zawsze avansuj — crawl jest wolny
     // (~1 obr.elekt./s) i nie generuje niebezpiecznych prądów.
@@ -2440,35 +2412,28 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle ──
+    // Kąt ZAWSZE rośnie (+= speed).
     if (!stalled) {
         uint32_t spd = real_speed;
-        // Gdy speed==0 (startup/crawl), użyj minimalnej prędkości otwartopętlowej
-        // aby pole magnetyczne wolno się obracało i rotor zaczął podążać.
-        // Pierwsze przejście Halla da realną prędkość i crawl się wyłączy.
         if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        {
-            bool forward = (g_direction_isr == DIRECTION_CW);
-            if (forward) {
-                g_sine_angle_q16 += spd;
-                if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
-                    g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
-                }
-            } else {
-                if (g_sine_angle_q16 >= spd) {
-                    g_sine_angle_q16 -= spd;
-                } else {
-                    g_sine_angle_q16 = SINE_TABLE_Q16_FULL - (spd - g_sine_angle_q16);
-                }
-            }
+        g_sine_angle_q16 += spd;
+        if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+            g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
         }
     }
 
+    // ── Amplitude guard (PO angle advance!) ──
+    if (amplitude < SINE_MIN_AMPLITUDE) {
+        allMosfetsOff();
+        return;
+    }
+
     // ── 3. Oblicz 3 kąty fazowe z offsetami ──
-    // Mapowanie faz dopasowane do tabeli komutacji blokowej CW:
-    //   Phase A = sin(θ)           — faza referencyjna (peak w sektorach 0,1)
-    //   Phase B = sin(θ + 240°)    — offset 64 wpisów (peak w sektorach 2,3)
-    //   Phase C = sin(θ + 120°)    — offset 32 wpisy (peak w sektorach 4,5)
+    //   Phase A = sin(θ)           — faza referencyjna
+    //   Phase B = sin(θ + 240°)    — offset 64 wpisów
+    //   Phase C = sin(θ + 120°)    — offset 32 wpisów
     uint32_t angle = g_sine_angle_q16;
+
     uint32_t angle_a = angle;  // A = reference
     uint32_t angle_b = angle + ((uint32_t)SINE_PHASE_B_OFFSET << 16);
     uint32_t angle_c = angle + ((uint32_t)SINE_PHASE_C_OFFSET << 16);
@@ -2519,18 +2484,21 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
         int32_t da = offset + ma;
         if (da < 0) da = 0;
         if (da > (int32_t)PWM_MAX_DUTY) da = (int32_t)PWM_MAX_DUTY;
-        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
-        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
 
         int32_t db = offset + mb;
         if (db < 0) db = 0;
         if (db > (int32_t)PWM_MAX_DUTY) db = (int32_t)PWM_MAX_DUTY;
-        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
-        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
 
         int32_t dc = offset + mc;
         if (dc < 0) dc = 0;
         if (dc > (int32_t)PWM_MAX_DUTY) dc = (int32_t)PWM_MAX_DUTY;
+
+        // Faza A zawsze bez zmian.
+        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
+        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
+
+        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
+        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
         ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc);
         ledcWrite(PWM_CHANNEL_C_LOW,  (uint32_t)dc);
     }
@@ -2566,12 +2534,6 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
         return;
     }
 
-    // Guard: bardzo małe duty → coast (identycznie jak SINUS)
-    if (amplitude < SINE_MIN_AMPLITUDE) {
-        allMosfetsOff();
-        return;
-    }
-
     // ── 1. Stall freeze (identycznie jak SINUS) ──
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t since_hall = now_ms - g_sine_last_hall_ms;
@@ -2580,24 +2542,20 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
     bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle (identycznie jak SINUS) ──
+    // Kąt ZAWSZE rośnie — remapowane sektory + zamiana faz na wyjściu.
     if (!stalled) {
         uint32_t spd = real_speed;
         if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        {
-            bool forward = (g_direction_isr == DIRECTION_CW);
-            if (forward) {
-                g_sine_angle_q16 += spd;
-                if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
-                    g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
-                }
-            } else {
-                if (g_sine_angle_q16 >= spd) {
-                    g_sine_angle_q16 -= spd;
-                } else {
-                    g_sine_angle_q16 = SINE_TABLE_Q16_FULL - (spd - g_sine_angle_q16);
-                }
-            }
+        g_sine_angle_q16 += spd;
+        if (g_sine_angle_q16 >= SINE_TABLE_Q16_FULL) {
+            g_sine_angle_q16 -= SINE_TABLE_Q16_FULL;
         }
+    }
+
+    // ── Amplitude guard (PO angle advance!) ──
+    if (amplitude < SINE_MIN_AMPLITUDE) {
+        allMosfetsOff();
+        return;
     }
 
     // ── 3. Read Vd, Vq from loop() PI controller (int32_t, duty units) ──
@@ -2618,6 +2576,7 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
     // Vα = (Vd·cos + Vq·sin) >> 10
     // Vβ = (Vd·sin - Vq·cos) >> 10
     uint32_t angle = g_sine_angle_q16;
+    // FOC: surowy θ (bez offsetu 180°!) — musi być spójny z forward Park w loop().
     int32_t sin_val = sine_interp_q16(angle);  // -1024..+1024
     uint32_t cos_angle = angle + (24UL << 16); // +90° (24/96 entries = 90°)
     if (cos_angle >= SINE_TABLE_Q16_FULL) cos_angle -= SINE_TABLE_Q16_FULL;
@@ -2648,18 +2607,21 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
         int32_t da = offset + va;
         if (da < 0) da = 0;
         if (da > (int32_t)PWM_MAX_DUTY) da = (int32_t)PWM_MAX_DUTY;
-        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
-        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
 
         int32_t db = offset + vb;
         if (db < 0) db = 0;
         if (db > (int32_t)PWM_MAX_DUTY) db = (int32_t)PWM_MAX_DUTY;
-        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
-        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
 
         int32_t dc_duty = offset + vc;
         if (dc_duty < 0) dc_duty = 0;
         if (dc_duty > (int32_t)PWM_MAX_DUTY) dc_duty = (int32_t)PWM_MAX_DUTY;
+
+        // Faza A zawsze bez zmian.
+        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
+        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
+
+        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
+        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
         ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc_duty);
         ledcWrite(PWM_CHANNEL_C_LOW,  (uint32_t)dc_duty);
     }
@@ -2669,7 +2631,7 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
 // Komutacja blokowa (trapezoidalna / 6-step)
 // ============================================================================
 //
-// Tabela komutacji dla kierunku CW (Hall [C:B:A]):
+// Tabela komutacji (Hall [C:B:A]):
 //
 //   Hall | Faza A      | Faza B      | Faza C
 //   -----+-------------+-------------+------------
@@ -2679,8 +2641,6 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
 //    6   | LOW (low-on)| PWM (high)  | OFF (float)
 //    4   | LOW (low-on)| OFF (float) | PWM (high)
 //    5   | OFF (float) | LOW (low-on)| PWM (high)
-//
-// Dla CCW zamienione high/low.
 
 // Pomocnicze inline do ustawiania stanu fazy
 /**
@@ -2787,91 +2747,52 @@ static inline void IRAM_ATTR phaseC_RegenPWM(uint16_t duty) {
  *
  * @param hall  Stan Halla [C:B:A] 1-6
  * @param regen_duty Siła hamowania 0–PWM_MAX_DUTY
- * @param dir   Kierunek obrotu
  *
  * @warning Wszystkie high-side FETy MUSZĄ być OFF! Shoot-through = uszkodzenie.
  * @warning Nigdy duty 100% — brak fazy OFF = brak transferu do baterii (tylko ciepło).
  */
-static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty, motor_direction_t dir) {
-    if (dir == DIRECTION_CW) {
-        switch (hall) {
-            case 1:  // motoring: A+ B-  →  regen: A=LS_PWM, B=LS_ON, C=float
-                phaseA_RegenPWM(regen_duty);
-                phaseB_Low();
-                phaseC_Off();
-                break;
-            case 3:  // motoring: A+ C-  →  regen: A=LS_PWM, B=float, C=LS_ON
-                phaseA_RegenPWM(regen_duty);
-                phaseB_Off();
-                phaseC_Low();
-                break;
-            case 2:  // motoring: B+ C-  →  regen: A=float, B=LS_PWM, C=LS_ON
-                phaseA_Off();
-                phaseB_RegenPWM(regen_duty);
-                phaseC_Low();
-                break;
-            case 6:  // motoring: B+ A-  →  regen: A=LS_ON, B=LS_PWM, C=float
-                phaseA_Low();
-                phaseB_RegenPWM(regen_duty);
-                phaseC_Off();
-                break;
-            case 4:  // motoring: C+ A-  →  regen: A=LS_ON, B=float, C=LS_PWM
-                phaseA_Low();
-                phaseB_Off();
-                phaseC_RegenPWM(regen_duty);
-                break;
-            case 5:  // motoring: C+ B-  →  regen: A=float, B=LS_ON, C=LS_PWM
-                phaseA_Off();
-                phaseB_Low();
-                phaseC_RegenPWM(regen_duty);
-                break;
-            default:
-                allMosfetsOff();
-                break;
-        }
-    } else {  // CCW
-        switch (hall) {
-            case 1:  // motoring CCW: B+ A-  →  regen: A=LS_ON, B=LS_PWM, C=float
-                phaseA_Low();
-                phaseB_RegenPWM(regen_duty);
-                phaseC_Off();
-                break;
-            case 3:  // motoring CCW: C+ A-  →  regen: A=LS_ON, B=float, C=LS_PWM
-                phaseA_Low();
-                phaseB_Off();
-                phaseC_RegenPWM(regen_duty);
-                break;
-            case 2:  // motoring CCW: C+ B-  →  regen: A=float, B=LS_ON, C=LS_PWM
-                phaseA_Off();
-                phaseB_Low();
-                phaseC_RegenPWM(regen_duty);
-                break;
-            case 6:  // motoring CCW: A+ B-  →  regen: A=LS_PWM, B=LS_ON, C=float
-                phaseA_RegenPWM(regen_duty);
-                phaseB_Low();
-                phaseC_Off();
-                break;
-            case 4:  // motoring CCW: A+ C-  →  regen: A=LS_PWM, B=float, C=LS_ON
-                phaseA_RegenPWM(regen_duty);
-                phaseB_Off();
-                phaseC_Low();
-                break;
-            case 5:  // motoring CCW: B+ C-  →  regen: A=float, B=LS_PWM, C=LS_ON
-                phaseA_Off();
-                phaseB_RegenPWM(regen_duty);
-                phaseC_Low();
-                break;
-            default:
-                allMosfetsOff();
-                break;
-        }
+static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty) {
+    switch (hall) {
+        case 1:  // motoring: A+ B-  →  regen: A=LS_PWM, B=LS_ON, C=float
+            phaseA_RegenPWM(regen_duty);
+            phaseB_Low();
+            phaseC_Off();
+            break;
+        case 3:  // motoring: A+ C-  →  regen: A=LS_PWM, B=float, C=LS_ON
+            phaseA_RegenPWM(regen_duty);
+            phaseB_Off();
+            phaseC_Low();
+            break;
+        case 2:  // motoring: B+ C-  →  regen: A=float, B=LS_PWM, C=LS_ON
+            phaseA_Off();
+            phaseB_RegenPWM(regen_duty);
+            phaseC_Low();
+            break;
+        case 6:  // motoring: B+ A-  →  regen: A=LS_ON, B=LS_PWM, C=float
+            phaseA_Low();
+            phaseB_RegenPWM(regen_duty);
+            phaseC_Off();
+            break;
+        case 4:  // motoring: C+ A-  →  regen: A=LS_ON, B=float, C=LS_PWM
+            phaseA_Low();
+            phaseB_Off();
+            phaseC_RegenPWM(regen_duty);
+            break;
+        case 5:  // motoring: C+ B-  →  regen: A=float, B=LS_ON, C=LS_PWM
+            phaseA_Off();
+            phaseB_Low();
+            phaseC_RegenPWM(regen_duty);
+            break;
+        default:
+            allMosfetsOff();
+            break;
     }
 }
 
 /**
  * @brief Komutacja blokowa 6-step (backup path — wywoływana z loop()).
  *
- * Ustawia stany faz A/B/C na podstawie stanu Halla i kierunku.
+ * Ustawia stany faz A/B/C na podstawie stanu Halla.
  * Ta funkcja NIE jest używana w normalnej pracy (ISR obsługuje komutację).
  * Zachowana jako fallback / do debugowania bez timera.
  *
@@ -2889,80 +2810,43 @@ void blockCommutate(uint8_t hallState, uint16_t duty) {
         return;
     }
 
-    if (g_bldc_state.direction == DIRECTION_CW) {
-        // Komutacja CW
-        switch (hallState) {
-            case 1: // Hall 001: A+ B-
-                phaseA_PWM(duty);
-                phaseB_Low();
-                phaseC_Off();
-                break;
-            case 3: // Hall 011: A+ C-
-                phaseA_PWM(duty);
-                phaseB_Off();
-                phaseC_Low();
-                break;
-            case 2: // Hall 010: B+ C-
-                phaseA_Off();
-                phaseB_PWM(duty);
-                phaseC_Low();
-                break;
-            case 6: // Hall 110: B+ A-
-                phaseA_Low();
-                phaseB_PWM(duty);
-                phaseC_Off();
-                break;
-            case 4: // Hall 100: C+ A-
-                phaseA_Low();
-                phaseB_Off();
-                phaseC_PWM(duty);
-                break;
-            case 5: // Hall 101: C+ B-
-                phaseA_Off();
-                phaseB_Low();
-                phaseC_PWM(duty);
-                break;
-            default:
-                allMosfetsOff();
-                break;
-        }
-    } else {
-        // Komutacja CCW - zamienione high-side i low-side
-        switch (hallState) {
-            case 1: // Hall 001: B+ A-
-                phaseA_Low();
-                phaseB_PWM(duty);
-                phaseC_Off();
-                break;
-            case 3: // Hall 011: C+ A-
-                phaseA_Low();
-                phaseB_Off();
-                phaseC_PWM(duty);
-                break;
-            case 2: // Hall 010: C+ B-
-                phaseA_Off();
-                phaseB_Low();
-                phaseC_PWM(duty);
-                break;
-            case 6: // Hall 110: A+ B-
-                phaseA_PWM(duty);
-                phaseB_Low();
-                phaseC_Off();
-                break;
-            case 4: // Hall 100: A+ C-
-                phaseA_PWM(duty);
-                phaseB_Off();
-                phaseC_Low();
-                break;
-            case 5: // Hall 101: B+ C-
-                phaseA_Off();
-                phaseB_PWM(duty);
-                phaseC_Low();
-                break;
-            default:
-                allMosfetsOff();
-                break;
-        }
+    if (g_bldc_state.mode == DRIVE_MODE_DISABLED) return;  // safety
+
+    // Komutacja
+    switch (hallState) {
+        case 1: // Hall 001: A+ B-
+            phaseA_PWM(duty);
+            phaseB_Low();
+            phaseC_Off();
+            break;
+        case 3: // Hall 011: A+ C-
+            phaseA_PWM(duty);
+            phaseB_Off();
+            phaseC_Low();
+            break;
+        case 2: // Hall 010: B+ C-
+            phaseA_Off();
+            phaseB_PWM(duty);
+            phaseC_Low();
+            break;
+        case 6: // Hall 110: B+ A-
+            phaseA_Low();
+            phaseB_PWM(duty);
+            phaseC_Off();
+            break;
+        case 4: // Hall 100: C+ A-
+            phaseA_Low();
+            phaseB_Off();
+            phaseC_PWM(duty);
+            break;
+        case 5: // Hall 101: C+ B-
+            phaseA_Off();
+            phaseB_Low();
+            phaseC_PWM(duty);
+            break;
+        default:
+            allMosfetsOff();
+            break;
     }
 }
 
@@ -2986,8 +2870,6 @@ void printHelp() {
     Serial.println("             Transformacja Clarke+Park, regulator PI osi d/q.");
     Serial.println("             Feedforward + korekcja pradowa. Najlepsza sprawnosc.");
     Serial.println("d          Wylacz silnik (duty=0, wszystkie MOSFET OFF = wolnobieg)");
-    Serial.println("r          Odwroc kierunek obrotow (CW<->CCW)");
-    Serial.println("             Dziala tylko gdy silnik wylaczony (d). Zmienia sekwencje faz.");
     Serial.println();
     Serial.println("---------- Sterowanie moca (duty cycle) ----------");
     Serial.println("+          Zwieksz duty o 5% (wzgledem PWM_MAX_DUTY=1023)");
@@ -3336,7 +3218,7 @@ static String executeCommand(const String& cmd) {
         g_sine_last_hall_idx = -1;
         g_sine_speed_q16 = 0;
         g_sine_dir = 1;
-        g_sine_last_hall_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        g_sine_last_hall_ms = (uint32_t)esp_timer_get_time() / 1000;
         // Snap kąta do środka aktualnego sektora Halla
         uint8_t hall_now = g_bldc_state.hall_state;
         int8_t sector = (hall_now >= 1 && hall_now <= 6) ? g_hall_to_sector[hall_now] : 0;
@@ -3371,7 +3253,7 @@ static String executeCommand(const String& cmd) {
         g_sine_last_hall_idx = -1;
         g_sine_speed_q16 = 0;
         g_sine_dir = 1;
-        g_sine_last_hall_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        g_sine_last_hall_ms = (uint32_t)esp_timer_get_time() / 1000;
         // Snap kąta do środka aktualnego sektora Halla
         uint8_t hall_foc = g_bldc_state.hall_state;
         int8_t sec_foc = (hall_foc >= 1 && hall_foc <= 6) ? g_hall_to_sector[hall_foc] : 0;
@@ -3391,14 +3273,6 @@ static String executeCommand(const String& cmd) {
         g_duty_ramped = 0;
         allMosfetsOff();
         return "Silnik OFF";
-    }
-    if (cmd == "r") {
-        if (g_bldc_state.mode == DRIVE_MODE_DISABLED) {
-            g_bldc_state.direction = (g_bldc_state.direction == DIRECTION_CW)
-                ? DIRECTION_CCW : DIRECTION_CW;
-            return g_bldc_state.direction == DIRECTION_CW ? "Kierunek: CW" : "Kierunek: CCW";
-        }
-        return "Najpierw wylacz silnik!";
     }
     if (cmd == "+") {
         g_manual_duty_override = true;
@@ -3725,7 +3599,6 @@ static String executeCommand(const String& cmd) {
         Serial.printf("mode:          %s\n", rtMode);
         Serial.printf("ramp_time_ms:  %d ms\n", g_bldc_state.ramp_time_ms);
         Serial.printf("regen:         %s\n", g_bldc_state.regen_enabled ? "ON" : "OFF");
-        Serial.printf("direction:     %s\n", (g_bldc_state.direction == DIRECTION_CW) ? "CW" : "CCW");
         Serial.printf("sine_offset:   %d (%.1f\u00b0)\n", (int)g_sine_hall_phase_offset, (float)g_sine_hall_phase_offset * 3.75f);
         Serial.println();
         return "";

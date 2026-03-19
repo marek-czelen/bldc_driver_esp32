@@ -24,14 +24,6 @@ typedef enum {
 } drive_mode_t;
 
 /**
- * @brief Kierunek obrotu silnika
- */
-typedef enum {
-    DIRECTION_CW = 0,          ///< Zgodnie z ruchem wskazówek zegara
-    DIRECTION_CCW               ///< Przeciwnie do ruchu wskazówek zegara
-} motor_direction_t;
-
-/**
  * @brief Stan czujników Halla (3-bitowy: CBA)
  * 
  * Czujniki Halla kodują pozycję rotora w 6 krokach (wartości 1-6).
@@ -58,7 +50,6 @@ typedef enum {
  */
 typedef struct {
     drive_mode_t    mode;           ///< Aktualny tryb sterowania
-    motor_direction_t direction;    ///< Kierunek obrotu
     uint16_t        duty_cycle;     ///< Wypełnienie PWM (0 - PWM_MAX_DUTY)
     uint16_t        throttle_raw;   ///< Surowa wartość przepustnicy (ADC)
     float           battery_voltage;///< Napięcie baterii [V]
