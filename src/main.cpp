@@ -146,10 +146,15 @@ volatile bool g_pas_forward = true;           ///< Kierunek pedałowania (asymet
 volatile uint32_t g_pas_last_fwd_pulse_us = 0; ///< micros() ostatniej krawędzi PAS w kierunku FORWARD (aktualizowane tylko w ISR)
 volatile int8_t g_pas_dir_confidence = 0;     ///< Licznik pewności kierunku: >0=fwd, <0=rev (histereza ISR)
 volatile bool g_pas_dir_invert_isr = false;   ///< Kopia pas_dir_invert dla ISR (ustawiana w setup/cmd)
+volatile uint32_t g_pas_debounce_us_isr = 3000; ///< Kopia pas_debounce_us dla ISR (ustawiana z config)
 volatile uint32_t g_pas_edge_count = 0;       ///< Licznik krawędzi PAS (ISR inkrementuje)
 
-/// Minimalny półokres PAS: odrzucaj krawędzie szybsze niż 5ms (debounce)
+/// Minimalny półokres PAS: odrzucaj krawędzie szybsze niż 5ms (debounce półokresów)
 #define PAS_MIN_HALFPERIOD_US   5000
+/// Debounce PAS domyślny (compile-time fallback, runtime: g_pas_debounce_us_isr z EEPROM).
+/// Filtruje szpilki EMI z silnika (us-1ms) które fałszywie odświeżają timestampy.
+/// Przy max 150 RPM × 12 magnesów: min edge-to-edge = 16.7ms → 3ms ma 5.5× margines.
+#define PAS_DEBOUNCE_US_DEFAULT 3000
 /// Minimalna różnica duty cycle do detekcji kierunku (%)
 /// Jeśli |HIGH-LOW| < 5% okresu → magnesy symetryczne, zakładamy forward
 #define PAS_DIR_MIN_ASYMMETRY   5
@@ -473,12 +478,16 @@ static bool       g_wifi_active    = false;     ///< Flaga: WiFi AP aktywne
  */
 static uint16_t getAssistMaxDuty() {
     if (!g_display.connected) {
+        if (config_get().display_required) {
+            return 0;  // wyświetlacz wymagany ale niepodłączony → silnik wyłączony
+        }
         return PWM_MAX_DUTY;  // brak wyświetlacza → pełna moc (standalone)
     }
     if (g_display.rx.assist_level == 0) {
         return 0;  // assist level 0 → silnik wyłączony
     }
-    // Raw: 3=20%, 6=40%, 9=60%, 12=80%, 15=100%
+    // Raw assist_level z wyświetlacza S866 jest zawsze 0-15 (bajt 4, bity 0-3),
+    // niezależnie od ustawienia P05 (które definiuje ile kroków widzi użytkownik).
     uint16_t maxDuty = (uint16_t)((uint32_t)g_display.rx.assist_level * PWM_MAX_DUTY / 15);
     if (maxDuty > PWM_MAX_DUTY) maxDuty = PWM_MAX_DUTY;
     return maxDuty;
@@ -781,7 +790,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     }
 
     // --- V_target z poziomu wspomagania (z wygładzeniem) ---
-    uint8_t raw_assist = g_display.rx.assist_level;     // 0..15
+    uint8_t raw_assist = g_display.rx.assist_level;     // 0..15 (raw, niezależne od P05)
     uint8_t v_max = g_display.config.p08_speed_limit;
     if (v_max == 0) v_max = 25;
     float v_target_raw = 6.0f + (float)raw_assist * ((float)v_max - 6.0f) / 15.0f;
@@ -885,6 +894,16 @@ void IRAM_ATTR onSpeedPulse() {
  */
 void IRAM_ATTR onPasPulse() {
     uint32_t now_us = (uint32_t)esp_timer_get_time();
+
+    // --- Debounce: ignoruj szpilki szumowe z silnika ---
+    // Szpilki EMI z pracy silnika trwają µs do ~1ms i fałszywie odpalają ISR.
+    // Bez tego filtra: szpilka odświeża g_pas_last_fwd_pulse_us → timeout nigdy
+    // nie zachodzi → motor pracuje mimo pedałowania wstecz lub braku PAS.
+    // Realne impulsy PAS mają min ~5ms (asymetryczny half-period przy 150 RPM/12 mag).
+    if (g_pas_last_pulse_us > 0 && (now_us - g_pas_last_pulse_us) < g_pas_debounce_us_isr) {
+        return;  // szpilka szumowa — ignoruj całkowicie
+    }
+
     bool pin_high = (GPIO.in >> PIN_PAS) & 1;  // szybki odczyt GPIO
 
     // --- Detekcja długiej przerwy → reset pomiarów HIGH/LOW ---
@@ -993,6 +1012,7 @@ void setup() {
     g_bldc_state.ramp_time_ms = cfg.ramp_time_ms;
     g_bldc_state.regen_enabled = (cfg.regen_enabled != 0);
     g_pas_dir_invert_isr = (cfg.pas_dir_invert != 0);
+    g_pas_debounce_us_isr = (uint32_t)cfg.pas_debounce_us;
     g_reverse_isr = (cfg.motor_reverse != 0);
 
     // Inicjalizacja regulatorów PI dla FOC — z wartościami zapisanymi w NVS
@@ -1934,12 +1954,50 @@ void readAnalogInputs() {
     // Odczyt prądu fazy A (GPIO39)
     uint16_t phaseA_raw = analogRead(PIN_PHASE_A_CURRENT);
 
-    // Przepustnica: odczyt + filtr EMA (ADC2/GPIO2 jest podatny na szumy
-    // od PWM silnika — bez filtra pojedyncza szpilka <400 daje duty=0 i stall)
-    // Pomijamy odczyt gdy WiFi aktywne — ADC2 jest zajęty przez WiFi (błąd ESP_ERR_TIMEOUT).
-    // Gdy WiFi jest ON silnik jest i tak wyłączony, więc wartość przepustnicy nie ma znaczenia.
+    // Przepustnica: burst N próbek + odrzucenie outlierów + EMA
+    // ADC2/GPIO2 jest podatny na szumy od PWM silnika.
+    // Burst: N szybkich odczytów, sortowanie, odrzucenie outlierów (> delta od mediany), średnia.
+    // Pomijamy odczyt gdy WiFi aktywne — ADC2 jest zajęty przez WiFi.
     if (!g_wifi_active) {
-        uint16_t thr_raw = analogRead(PIN_THROTTLE);
+        controller_config_t& tcfg = config_get();
+        uint8_t n_samples = tcfg.thr_samples;
+        if (n_samples < 2) n_samples = 2;
+        if (n_samples > 16) n_samples = 16;
+        uint16_t thresh = tcfg.thr_outlier_thresh;
+
+        // Burst: szybkie odczyty ADC
+        uint16_t samples[16];
+        for (uint8_t i = 0; i < n_samples; i++) {
+            samples[i] = analogRead(PIN_THROTTLE);
+        }
+
+        // Proste sortowanie (insertion sort, max 16 elementów)
+        for (uint8_t i = 1; i < n_samples; i++) {
+            uint16_t key = samples[i];
+            int8_t j = i - 1;
+            while (j >= 0 && samples[j] > key) {
+                samples[j + 1] = samples[j];
+                j--;
+            }
+            samples[j + 1] = key;
+        }
+
+        // Mediana
+        uint16_t median = samples[n_samples / 2];
+
+        // Średnia z próbek bliskich medianie (odrzucenie outlierów)
+        uint32_t sum = 0;
+        uint8_t count = 0;
+        for (uint8_t i = 0; i < n_samples; i++) {
+            int32_t diff = (int32_t)samples[i] - (int32_t)median;
+            if (diff < 0) diff = -diff;
+            if ((uint16_t)diff <= thresh) {
+                sum += samples[i];
+                count++;
+            }
+        }
+        uint16_t thr_raw = (count > 0) ? (uint16_t)(sum / count) : median;
+
         static float thr_ema = 0.0f;
         static bool  thr_init = false;
         if (!thr_init) {
@@ -2220,7 +2278,7 @@ void printDiagnostics() {
 
     // Prędkość koła [km/h]
     if (g_bldc_state.wheel_speed_kmh > 0.5f) {
-        Serial.printf("%.1fkm/h ", g_bldc_state.wheel_speed_kmh);
+        Serial.printf("\n  [SPD] %.1fkm/h ", g_bldc_state.wheel_speed_kmh);
     }
 
     // Debug SINUS/FOC: parametry śledzenia kąta
@@ -3252,29 +3310,32 @@ void printDisplayConfig() {
     }
     const s866_config_t& c = g_display.config;
     Serial.println("========== PARAMETRY WYŚWIETLACZA S866 ==========");
+    Serial.printf("Assist level:  %d (raw: %d)\n", g_display.rx.assist_level / 3, g_display.rx.assist_level);
     Serial.println("--- Parametry lokalne wyświetlacza (nie w ramce) ---");
     Serial.printf("P01  Jasność podświetlenia:   [local]\n");
     Serial.printf("P02  Jednostki prędkości:     [local]\n");
     Serial.printf("P03  Napięcie systemu:        [local]\n");
     Serial.printf("P04  Auto-wyłączenie:         [local]\n");
+    Serial.printf("P05  Poziomy wspomagania:     [local]\n");
     Serial.println("--- Parametry z ramki RX ---");
-    Serial.printf("P05  Poziomy wspomagania:     %d\n",        c.p05_assist_levels);
-    Serial.printf("P06  Rozmiar koła:            %d.%d\"\n",   c.p06_wheel_size_x10 / 10, c.p06_wheel_size_x10 % 10);
-    Serial.printf("P07  Pole pairs / magnesy:    %d\n",        c.p07_speed_magnets);
-    Serial.printf("P08  Limit prędkości:         %d km/h\n",   c.p08_speed_limit);
-    Serial.printf("P09  Tryb startu:             %s\n",       c.p09_start_mode ? "po pedałowaniu" : "od zera");
-    Serial.printf("P10  Tryb jazdy:              %d\n",        c.p10_drive_mode);
+    Serial.printf("P06* Rozmiar koła:            %d.%d\"\n",   c.p06_wheel_size_x10 / 10, c.p06_wheel_size_x10 % 10);
+    Serial.printf("P07* Pole pairs / magnesy:    %d\n",        c.p07_speed_magnets);
+    Serial.printf("P08* Limit prędkości:         %d km/h\n",   c.p08_speed_limit);
+    Serial.printf("P09  Tryb startu:             %s\n",        c.p09_start_mode ? "po pedałowaniu" : "od zera");
+    Serial.printf("P10* Tryb jazdy:              %d (%s)\n",   c.p10_drive_mode,
+        c.p10_drive_mode == 0 ? "PAS+gaz" : c.p10_drive_mode == 1 ? "tylko gaz" : "tylko PAS");
     Serial.printf("P11  Czułość PAS:             %d\n",        c.p11_pas_sensitivity);
     Serial.printf("P12  Intensywność startu PAS: %d\n",        c.p12_pas_start_strength);
-    Serial.printf("P13  Magnesy PAS:             %d\n",        c.p13_pas_magnets);
+    Serial.printf("P13* Magnesy PAS:             %d\n",        c.p13_pas_magnets);
     Serial.printf("P14  Limit prądu:             %d A\n",      c.p14_current_limit_a);
-    Serial.printf("P15  Podna pięcie:            %.1f V\n",    c.p15_undervoltage_x10 / 10.0f);
+    Serial.printf("P15  Napięcie odcięcia:       %.1f V\n",    c.p15_undervoltage_x10 / 10.0f);
     Serial.println("--- Parametry lokalne wyświetlacza (nie w ramce) ---");
     Serial.printf("P16  Tryb komunikacji:        [local]\n");
-    Serial.printf("P17  Tempomat:                %s\n",       c.p17_cruise_control ? "ON" : "OFF");
+    Serial.printf("P17* WiFi config:             %d (%s)\n",   c.p17_cruise_control, c.p17_cruise_control ? "WiFi ON" : "WiFi OFF");
     Serial.printf("P18  Tryb gazu:               [local]\n");
     Serial.printf("P19  Power Assist:            [local]\n");
     Serial.printf("P20  Protokół:                [local]\n");
+    Serial.println("     * = parametr używany w logice sterownika");
     Serial.println("=================================================");
     uint8_t p07 = g_display.config.p07_speed_magnets;
     if (p07 <= 1) {
@@ -3794,6 +3855,7 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_start_delay:  %u ms\n", (unsigned)config_get().pas_start_delay_ms);
         Serial.printf("pas_stop_delay:   %u ms\n", (unsigned)config_get().pas_stop_delay_ms);
         Serial.printf("pas_ramp:         %u ms\n", (unsigned)config_get().pas_ramp_ms);
+        Serial.printf("pas_debounce:     %lu us\n", (unsigned long)g_pas_debounce_us_isr);
         Serial.printf("P13 magnets:      %d\n", (int)g_display.config.p13_pas_magnets);
         Serial.println("================================");
         return "";
@@ -3824,6 +3886,16 @@ static String executeCommand(const String& cmd) {
             return "PAS ramp (soft-start): " + String(val) + " ms";
         }
         return "Zakres 0-10000 ms";
+    }
+    if (cmd.startsWith("pasdbnc:")) {
+        int val = cmd.substring(8).toInt();
+        if (val >= 500 && val <= 10000) {
+            config_get().pas_debounce_us = (uint16_t)val;
+            g_pas_debounce_us_isr = (uint32_t)val;
+            config_save();
+            return "PAS debounce: " + String(val) + " us";
+        }
+        return "Zakres 500-10000 us";
     }
     if (cmd == "h") {
         printHelp();
@@ -3863,6 +3935,10 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_start_ms:  %u ms\n",  (unsigned)cfg.pas_start_delay_ms);
         Serial.printf("pas_stop_ms:   %u ms\n",  (unsigned)cfg.pas_stop_delay_ms);
         Serial.printf("pas_ramp_ms:   %u ms\n",  (unsigned)cfg.pas_ramp_ms);
+        Serial.printf("pas_dbnc_us:   %u us\n",  (unsigned)cfg.pas_debounce_us);
+        Serial.printf("disp_req:      %d (%s)\n", cfg.display_required, cfg.display_required ? "TAK" : "NIE");
+        Serial.printf("thr_samples:   %d\n", cfg.thr_samples);
+        Serial.printf("thr_outlier:   %d\n", cfg.thr_outlier_thresh);
         Serial.printf("duty_step:     %d %%\n",   cfg.duty_max_step_pct);
         Serial.printf("motor_rev:     %d (%s)\n", cfg.motor_reverse, cfg.motor_reverse ? "CCW" : "CW");
         Serial.printf("sine_offset:   %d (%.1f deg)\n", (int)cfg.sine_hall_offset, (float)cfg.sine_hall_offset * 3.75f);
@@ -3958,10 +4034,15 @@ static String executeCommand(const String& cmd) {
             cfg.foc_kp_q = cfg.foc_kp_d = FOC_KP_DEFAULT;
             cfg.foc_ki_q = cfg.foc_ki_d = FOC_KI_DEFAULT;
             cfg.foc_voltage_mode    = 0;
+            cfg.pas_debounce_us     = PAS_DEBOUNCE_US_DEFAULT;
+            cfg.display_required    = 1;
+            cfg.thr_samples         = 8;
+            cfg.thr_outlier_thresh  = 150;
             // Zastosuj do runtime
             g_bldc_state.ramp_time_ms   = cfg.ramp_time_ms;
             g_bldc_state.regen_enabled  = false;
             g_pas_dir_invert_isr        = false;
+            g_pas_debounce_us_isr       = PAS_DEBOUNCE_US_DEFAULT;
             g_reverse_isr               = false;
             g_sine_hall_phase_offset    = 0;
             g_foc_pi_d.kp = g_foc_pi_q.kp = FOC_KP_DEFAULT;
@@ -3984,6 +4065,8 @@ static String executeCommand(const String& cmd) {
             cfg.foc_kp_d           = g_foc_pi_d.kp;
             cfg.foc_ki_d           = g_foc_pi_d.ki;
             cfg.foc_voltage_mode   = g_foc_voltage_mode ? 1 : 0;
+            cfg.pas_debounce_us    = (uint16_t)g_pas_debounce_us_isr;
+            // display_required nie ma runtime var — zapisuje się bezpośrednio w cfg
             config_save();
             return "[CFG] Aktualne wartosci runtime zapisane do EEPROM.";
         }
@@ -4000,6 +4083,8 @@ static String executeCommand(const String& cmd) {
             g_foc_pi_q.kp = c.foc_kp_q;  g_foc_pi_q.ki = c.foc_ki_q;
             g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
             g_foc_voltage_mode = (c.foc_voltage_mode != 0);
+            g_pas_debounce_us_isr = (uint32_t)c.pas_debounce_us;
+            // display_required nie wymaga sync — czytany bezpośrednio z config_get()
             // Przełącz tryb silnika jeśli skonfigurowany tryb rozni się od bieżącego
             drive_mode_t target_mode = (drive_mode_t)c.drive_mode;
             if (target_mode >= DRIVE_MODE_BLOCK && target_mode <= DRIVE_MODE_FOC
@@ -4016,6 +4101,30 @@ static String executeCommand(const String& cmd) {
                 Serial.printf("[CFG] Tryb przełączony na: %s\n", mnames[target_mode]);
             }
             return "[CFG] Wartosci z EEPROM zaladowane do runtime.";
+        }
+        if (cmd.startsWith("cfg:dispreq:")) {
+            int val = cmd.substring(12).toInt();
+            cfg.display_required = val ? 1 : 0;
+            config_save();
+            return val ? "Wyswietlacz WYMAGANY (silnik tylko z display)" : "Wyswietlacz OPCJONALNY (standalone OK)";
+        }
+        if (cmd.startsWith("cfg:thrsamp:")) {
+            int val = cmd.substring(12).toInt();
+            if (val >= 2 && val <= 16) {
+                cfg.thr_samples = (uint8_t)val;
+                config_save();
+                return "Throttle samples: " + String(val);
+            }
+            return "Zakres 2-16";
+        }
+        if (cmd.startsWith("cfg:thrdelta:")) {
+            int val = cmd.substring(13).toInt();
+            if (val >= 10 && val <= 2000) {
+                cfg.thr_outlier_thresh = (uint16_t)val;
+                config_save();
+                return "Throttle outlier thresh: " + String(val);
+            }
+            return "Zakres 10-2000";
         }
         return "Nieznany parametr cfg";
     }
@@ -4070,6 +4179,12 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="row"><label>Op&#243;&#378;nienie stopu (ms)</label><input type="number" id="pas_t" min="100" max="10000" step="100"><button onclick="cmd('passtop:'+v('pas_t'))">Ustaw</button></div>
 <div class="row"><label>Rampa PAS (ms)</label><input type="number" id="pas_r" min="0" max="10000" step="100"><button onclick="cmd('pasramp:'+v('pas_r'))">Ustaw</button></div>
 <div class="row"><label>Kierunek PAS</label><select id="pas_d"><option value="0">Normalny</option><option value="1">Odwr&#243;cony</option></select><button onclick="setPasDir()">Ustaw</button></div>
+<div class="row"><label>Debounce PAS (&#181;s)</label><input type="number" id="pas_db" min="500" max="10000" step="100"><button onclick="cmd('pasdbnc:'+v('pas_db'))">Ustaw</button></div>
+</div></details>
+<details><summary>&#128295; Ustawienia systemowe</summary><div class="card">
+<div class="row"><label>Wymagany wy&#347;wietlacz</label><select id="disp_rq"><option value="1">TAK (silnik tylko z display)</option><option value="0">NIE (standalone OK)</option></select><button onclick="cmd('cfg:dispreq:'+v('disp_rq'))">Ustaw</button></div>
+<div class="row"><label>Throttle pr&#243;bki burst</label><input type="number" id="thr_n" min="2" max="16" step="1"><button onclick="cmd('cfg:thrsamp:'+v('thr_n'))">Ustaw</button></div>
+<div class="row"><label>Throttle max odchylenie</label><input type="number" id="thr_d" min="10" max="2000" step="10"><button onclick="cmd('cfg:thrdelta:'+v('thr_d'))">Ustaw</button></div>
 </div></details>
 <details><summary>&#128260; Parametry FOC</summary><div class="card">
 <div class="row"><label>Tryb napi&#281;ciowy (fvolt)</label><span id="fvolt_st" class="sv">-</span><button onclick="doFvolt()">Prze&#322;&#261;cz fvolt</button><button class="w" onclick="queueCmd('fpitune')">&#10141; Kolejka: fpitune</button></div>
@@ -4081,7 +4196,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <details><summary>&#128190; EEPROM / NVS</summary><div class="card">
 <div class="row"><button onclick="sendR('cfg:save')">&#128190; Zapisz do EEPROM</button><button class="w" onclick="sendR('cfg:reload')">&#128194; Wczytaj z EEPROM</button><button class="r" onclick="cfgDef()">&#9888; Domy&#347;lne</button></div>
 <hr><p class="hint">Warto&#347;ci zapisane w NVS (EEPROM):</p>
-<div class="sg"><span class="sl">Tryb boot:</span><span class="sv" id="n_dm">-</span><span class="sl">Rampa:</span><span class="sv" id="n_ramp">-</span><span class="sl">Regen:</span><span class="sv" id="n_regen">-</span><span class="sl">Max krok duty:</span><span class="sv" id="n_step">-</span><span class="sl">Kierunek:</span><span class="sv" id="n_rev">-</span><span class="sl">Offset Hall:</span><span class="sv" id="n_soff">-</span><span class="sl">FOC Vmode:</span><span class="sv" id="n_fvolt">-</span><span class="sl">Kp_q / Ki_q:</span><span class="sv" id="n_focq">-</span><span class="sl">Kp_d / Ki_d:</span><span class="sv" id="n_focd">-</span></div>
+<div class="sg"><span class="sl">Tryb boot:</span><span class="sv" id="n_dm">-</span><span class="sl">Rampa:</span><span class="sv" id="n_ramp">-</span><span class="sl">Regen:</span><span class="sv" id="n_regen">-</span><span class="sl">Max krok duty:</span><span class="sv" id="n_step">-</span><span class="sl">Kierunek:</span><span class="sv" id="n_rev">-</span><span class="sl">Offset Hall:</span><span class="sv" id="n_soff">-</span><span class="sl">FOC Vmode:</span><span class="sv" id="n_fvolt">-</span><span class="sl">Kp_q / Ki_q:</span><span class="sv" id="n_focq">-</span><span class="sl">Kp_d / Ki_d:</span><span class="sv" id="n_focd">-</span><span class="sl">PAS debounce:</span><span class="sv" id="n_pdbnc">-</span><span class="sl">Wym. wy&#347;wietlacz:</span><span class="sv" id="n_dreq">-</span><span class="sl">Thr pr&#243;bki:</span><span class="sv" id="n_thrn">-</span><span class="sl">Thr odchylenie:</span><span class="sv" id="n_thrd">-</span></div>
 </div></details>
 <details><summary>&#127919; Kolejka &#183; Komendy</summary><div class="card">
 <p class="hint">Komenda wykonana gdy P17&#8594;0 (WiFi wy&#322;&#261;czone, silnik dost&#281;pny)</p>
@@ -4132,6 +4247,10 @@ async function loadCfg(){
     el('mot_rev').value=_c.motor_reverse;el('sin_off').value=_c.sine_hall_offset;
     el('pas_s').value=_c.pas_start_delay_ms;el('pas_t').value=_c.pas_stop_delay_ms;
     el('pas_r').value=_c.pas_ramp_ms;el('pas_d').value=_c.pas_dir_invert;
+    el('pas_db').value=_c.pas_debounce_us||3000;
+    el('disp_rq').value=_c.display_required||0;
+    el('thr_n').value=_c.thr_samples||8;
+    el('thr_d').value=_c.thr_outlier_thresh||150;
     el('fkp_q').value=(_c.foc_kp_q||0).toFixed(3);el('fki_q').value=(_c.foc_ki_q||0).toFixed(3);
     el('fkp_d').value=(_c.foc_kp_d||0).toFixed(3);el('fki_d').value=(_c.foc_ki_d||0).toFixed(3);
     const fvSt=el('fvolt_st');fvSt.textContent=fvOn?'ON (fvolt)':'OFF (PI)';fvSt.style.color=fvOn?'#f0883e':'#3fb950';
@@ -4145,6 +4264,10 @@ async function loadCfg(){
     el('n_fvolt').textContent=_c.foc_voltage_mode?'ON':'OFF';el('n_fvolt').style.color=_c.foc_voltage_mode?'#f0883e':'#3fb950';
     el('n_focq').textContent=(_c.foc_kp_q||0).toFixed(3)+' / '+(_c.foc_ki_q||0).toFixed(3);
     el('n_focd').textContent=(_c.foc_kp_d||0).toFixed(3)+' / '+(_c.foc_ki_d||0).toFixed(3);
+    el('n_pdbnc').textContent=(_c.pas_debounce_us||3000)+' \u00b5s';
+    el('n_dreq').textContent=_c.display_required?'TAK':'NIE';el('n_dreq').style.color=_c.display_required?'#3fb950':'#f0883e';
+    el('n_thrn').textContent=_c.thr_samples||8;
+    el('n_thrd').textContent=_c.thr_outlier_thresh||150;
     notif('OK \u2013 '+new Date().toLocaleTimeString());
   }catch(e){notif('B\u0142\u0105d ładowania: '+e,1);}
 }
@@ -4169,6 +4292,9 @@ static void webHandleApiConfig() {
         "\"sine_hall_offset\":%d,\"foc_voltage_mode\":%d,"
         "\"foc_kp_q\":%.4f,\"foc_ki_q\":%.4f,"
         "\"foc_kp_d\":%.4f,\"foc_ki_d\":%.4f,"
+        "\"pas_debounce_us\":%d,"
+        "\"display_required\":%d,"
+        "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"rt_mode\":%d,\"rt_speed\":%.2f,\"rt_vbat\":%.2f,"
         "\"rt_duty\":%u,\"rt_fault\":%s,"
         "\"rt_fvolt\":%s,\"rt_sine_offset\":%d,"
@@ -4179,6 +4305,9 @@ static void webHandleApiConfig() {
         (int)cfg.duty_max_step_pct, (int)cfg.motor_reverse,
         (int)cfg.sine_hall_offset, (int)cfg.foc_voltage_mode,
         cfg.foc_kp_q, cfg.foc_ki_q, cfg.foc_kp_d, cfg.foc_ki_d,
+        (int)cfg.pas_debounce_us,
+        (int)cfg.display_required,
+        (int)cfg.thr_samples, (int)cfg.thr_outlier_thresh,
         (int)g_bldc_state.mode,
         g_bldc_state.wheel_speed_kmh,
         g_bldc_state.battery_voltage,

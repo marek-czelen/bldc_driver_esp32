@@ -47,6 +47,10 @@ static void config_apply_defaults() {
     g_config.foc_kp_d           = 0.5f;                          // FOC Kp_d domyślne
     g_config.foc_ki_d           = 5.0f;                          // FOC Ki_d domyślne
     g_config.foc_voltage_mode   = 0;                              // FOC Voltage mode domyślnie OFF
+    g_config.pas_debounce_us    = 3000;                            // Debounce PAS: 3ms (filtr szpilek EMI)
+    g_config.display_required   = 1;                               // Silnik tylko z wyświetlaczem (domyślnie)
+    g_config.thr_samples         = 8;                               // Throttle: 8 próbek burst
+    g_config.thr_outlier_thresh  = 150;                             // Throttle: odrzucaj > 150 od mediany
 }
 
 void config_init() {

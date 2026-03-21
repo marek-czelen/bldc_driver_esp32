@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  8
+#define CONFIG_VERSION  11
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -58,9 +58,13 @@ typedef struct __attribute__((packed)) {
     float           foc_kp_d;           ///< FOC PI Kp osi d, wynik komend 'fpitune' / 'fkpd:'
     float           foc_ki_d;           ///< FOC PI Ki osi d, wynik komend 'fpitune' / 'fkid:'
     uint8_t         foc_voltage_mode;   ///< FOC tryb napięciowy: 1=Vmode (fvolt ON), 0=PI closed-loop
+    uint16_t        pas_debounce_us;    ///< Debounce PAS: ignoruj krawędzie szybsze niż X µs [500-10000]
+    uint8_t         display_required;   ///< Wymagań wyświetlacz: 1=silnik tylko z wyświetlaczem (domyślnie), 0=standalone OK
+    uint8_t         thr_samples;        ///< Ilość próbek ADC throttle w burst [2-16], domyślnie 8
+    uint16_t        thr_outlier_thresh; ///< Max odchylenie od mediany do odrzucenia outlieru [ADC], domyślnie 150
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[27];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[21];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)

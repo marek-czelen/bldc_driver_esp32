@@ -66,9 +66,10 @@ static void s866_parse_rx_frame(s866_display_t* ctx) {
 
     // Aktualizacja kopii parametrów konfiguracyjnych P01-P20
     // Mapowanie z pól ramki RX na parametry P
-    // UWAGA: P01-P04, P16, P18-P20 nie są transmitowane w ramce —
+    // UWAGA: P01-P05, P16, P18-P20 nie są transmitowane w ramce —
     //        to ustawienia lokalne wyświetlacza.
-    ctx->config.p05_assist_levels      = 5;  // protokół 2 zawsze 5 poziomów
+    //        Raw assist_level (bajt 4, bity 0-3) jest zawsze 0-15,
+    //        niezależnie od P05. P05 określa ile kroków widzi użytkownik.
     ctx->config.p06_wheel_size_x10     = ctx->rx.wheel_size_inch_x10;  // f[7-8]
     ctx->config.p07_speed_magnets      = ctx->rx.gear_ratio;           // f[6] = P07
     ctx->config.p08_speed_limit        = ctx->rx.speed_max_limit;      // f[12]
