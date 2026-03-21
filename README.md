@@ -666,28 +666,72 @@ Jeśli warunki nie są spełnione → coast (allMosfetsOff).
 - **Pin:** GPIO2 (ADC2_CH2)
 - **Martwa strefa:** wartości ADC < 400 → duty = 0
 - **Zakres roboczy:** 400–2600 ADC
-- **Filtr EMA:** α = 0.15 (filtr szumów ADC2)
 
 > Zakres 400–2600 został skalibrowany empirycznie dla konkretnej przepustnicy.  
 > Jeśli przepustnica ma inny zakres, zmień `THROTTLE_DEAD_ZONE`, `THROTTLE_MIN_RAW`, `THROTTLE_MAX_RAW` w `main.cpp`.
 
-### Filtr EMA przepustnicy
+### Filtr szumów ADC przepustnicy (burst + outlier rejection + EMA)
 
-GPIO2 (ADC2) jest podatny na szumy od PWM silnika — bez filtra pojedyncza szpilka
-poniżej 400 daje `duty=0` i powoduje stall silnika. Zastosowano filtr EMA
-(Exponential Moving Average):
+GPIO2 (ADC2) jest podatny na szpilki EMI od PWM silnika. Pojedyncza szpilka
+poniżej progu dead-zone dawałaby `duty=0` i stall silnika. Zastosowano
+3-stopniowy pipeline filtracji:
 
 ```
-thr_ema += α × (thr_raw − thr_ema)
+  analogRead() × N
+       │
+  ┌────┴────┐
+  │ BURST   │  N próbek w szybkim burście (domyślnie 8)
+  └────┬────┘
+       │
+  ┌────┴─────────┐
+  │ SORTOWANIE   │  Insertion sort → mediana
+  └────┬─────────┘
+       │
+  ┌────┴──────────────┐
+  │ OUTLIER REJECTION │  Odrzucenie próbek > threshold od mediany
+  └────┬──────────────┘
+       │
+  ┌────┴────┐
+  │ ŚREDNIA │  Z pozostałych (valid) próbek
+  └────┬────┘
+       │
+  ┌────┴────┐
+  │  EMA    │  α = 0.15, wygładzenie czasowe
+  └────┬────┘
+       │
+    thr_ema → mapowanie na duty
 ```
 
-| Parametr | Wartość | Opis |
-|---|---|---|
-| `kThrottleFilterAlpha` | 0.15 | Szybkość reakcji filtra |
-| Czas ustalania | ~10 iteracji loop | 63% wartości docelowej |
+**Etap 1 — Burst sampling:**  
+Odczyt N próbek ADC w szybkim burście (pętla `analogRead()` bez opóźnień).  
+Parametr `thr_samples` (NVS, domyślnie 8, zakres 2–16).
 
-Filtr eliminuje pojedyncze szpilki szumowe bez zauważalnego opóźnienia reakcji
-przepustnicy. Pierwsza próbka inicjalizuje filtr (brak opóźnienia na starcie).
+**Etap 2 — Insertion sort + mediana:**  
+Próbki sortowane (O(N²), ale N≤16 — szybkie). Mediana = element środkowy tablicy.
+
+**Etap 3 — Outlier rejection (odrzucanie szpilek):**  
+Każda próbka oddalona od mediany o więcej niż `thr_outlier_thresh` (NVS, domyślnie 150,
+zakres 10–2000 jednostek ADC) jest odrzucana. Pozostają tylko próbki „w okolicy" mediany.
+
+**Etap 4 — Średnia z valid próbek:**  
+Średnia arytmetyczna próbek, które przeżyły filtr odchyleń. Jeśli żadna nie przeżyła
+(skrajny przypadek), zwraca medianę.
+
+**Etap 5 — EMA (Exponential Moving Average):**  
+```
+thr_ema += α × (burst_avg − thr_ema)
+```
+α = 0.15. Wygładza wynik w czasie — eliminuje jednorazowe odchyłki między burstami.
+
+| Parametr | Wartość | NVS komenda | Opis |
+|---|---|---|---|
+| `thr_samples` | 8 | `cfg:thrsamp:N` | Liczba próbek w burście (2–16) |
+| `thr_outlier_thresh` | 150 | `cfg:thrdelta:N` | Max odchylenie od mediany (10–2000) |
+| `kThrottleFilterAlpha` | 0.15 | — | Stała EMA (w kodzie) |
+
+> **Uwaga ADC2 — konflikt z WiFi:**  
+> Piny ADC2 (GPIO2, GPIO12, GPIO15) **nie mogą być czytane przez `analogRead()` gdy WiFi jest włączone**.
+> Podczas aktywnego WiFi (P17=1) odczyty tych pinów są pomijane, a silnik jest wyłączony.
 
 ### Mapowanie proporcjonalne (wspólny algorytm BLOCK / SINUS / FOC)
 
@@ -779,13 +823,65 @@ wspomagania ustawionego na wyświetlaczu.
 
 ### Sprzęt
 
-- **Pin:** GPIO22 (INPUT_PULLUP), przerwanie oba zbocza (CHANGE)
+- **Pin:** GPIO22 (INPUT_PULLUP)
 - **Czujnik:** Hall z asymetrycznym dyskiem magnesów (12 magnesów domyślnie, P13)
 - **Sygnał:** stan HIGH i LOW o różnym czasie trwania → detekcja kierunku
 
-### ISR — detekcja kierunku (`onPasPulse`)
+### Filtr cyfrowy — timer próbkujący (zamiast przerwania)
 
-ISR mierzy czas trwania stanów HIGH i LOW na obu zboczach:
+Wcześniejsza metoda: przerwanie GPIO na obu zboczach (`CHANGE`). Problem:
+szpilki EMI z komutacji silnika (µs do kilku ms) odpalały ISR i fałszowały
+pomiary HIGH/LOW time oraz odświeżały timestampy — zwłaszcza przy dużych
+prędkościach silnika, gdzie szum EMI jest najintensywniejszy.
+
+**Nowa metoda:** timer `esp_timer` próbkuje pin PAS co **500 µs** (2 kHz)
+i stosuje filtr cyfrowy z potwierdzeniem:
+
+```
+  Pin PAS (surowy):  ____████_██__████████████████████████___________████████████
+                          ↑ szpilki EMI           ↑ realna zmiana stanu
+  Próbki (co 500µs): LLLLHHLHLLLHHHHHHHHHHHHHHHHHHHHHHHHLLLLLLLLLLLLLHHHHHHHHHH
+  Stan filtrowany:   LLLLLLLLLLLLLLLLLLLLLL→H (po N zgodnych)       LLL→H
+```
+
+**Algorytm filtra:**
+1. Timer co 500 µs czyta pin PAS (`GPIO.in >> PIN_PAS`)
+2. Jeśli próbka == aktualny stan filtrowany → reset licznika (stan potwierdzony)
+3. Jeśli próbka != stan filtrowany → inkrementuj licznik
+4. Gdy licznik osiągnie **N** (`g_pas_filter_depth`) → akceptuj zmianę stanu
+5. Zmiana stanu wywołuje `processPasFilteredEdge()` — logikę detekcji kierunku
+
+**Głębokość filtra:**
+```
+N = pas_debounce_us / PAS_SAMPLE_INTERVAL_US
+```
+- Domyślnie: 3000 / 500 = **6 próbek = 3 ms** potwierdzenia
+- Szpilka EMI (< 1 ms) nie utrzyma się przez 6 × 500 µs → odfiltrowana
+- Burst szpilek (np. co 2–4 ms z komutacji): wystarczy **jedna** próbka zgodna
+  ze starym stanem aby zresetować licznik → burst nie przechodzi
+- Realny impuls PAS przy 150 RPM / 12 magnesów: min half-period ≈ 17 ms →
+  filtr 3 ms nie wpływa na realne pomiary
+
+**Dlaczego lepsze od debounce na przerwaniu:**
+
+| Cecha | Przerwanie + debounce | Timer próbkujący |
+|---|---|---|
+| Szpilka EMI 0.5 ms | Odfiltrowana (ok) | Odfiltrowana (ok) |
+| Burst szpilek co 4 ms | Przechodzą (> debounce 3 ms) | Odfiltrowane (reset licznika) |
+| Pomiary HIGH/LOW time | Fałszowane przez szpilki | Czyste (tylko potwierdzone krawędzie) |
+| Detekcja kierunku przy dużej prędkości | Zaśmiecona EMI | Stabilna |
+| Zaginiony impuls | Szpilka zjada timestamp | Nie występuje |
+
+| Parametr | Wartość | NVS komenda | Opis |
+|---|---|---|---|
+| `PAS_SAMPLE_INTERVAL_US` | 500 µs | — | Okres próbkowania (stała w kodzie) |
+| `pas_debounce_us` | 3000 µs | `pasdbnc:N` | Czas potwierdzenia stanu (500–10000) |
+| `g_pas_filter_depth` | 6 | — | Obliczane: debounce_us / 500 |
+
+### Detekcja kierunku (`processPasFilteredEdge`)
+
+Po przejściu filtra cyfrowego, przefiltrowane krawędzie są przetwarzane:
+
 - **RISING edge** → koniec okresu LOW, zapis `low_time`
 - **FALLING edge** → koniec okresu HIGH, zapis `high_time`, obliczenie kierunku
 
@@ -796,7 +892,10 @@ Detekcja kierunku z histerezą:
 4. Jeśli `diff ≤ 5%` → magnesy symetryczne, kierunek nie zmieniany
 5. `pas_dir_invert` (NVS) — odwraca konwencję HIGH>LOW=forward
 
-Debounce: krawędzie krótsze niż 5 ms (`PAS_MIN_HALFPERIOD_US`) są odrzucane.
+Debounce półokresów: krawędzie krótsze niż 5 ms (`PAS_MIN_HALFPERIOD_US`) są odrzucane.
+
+Długi timeout (> 2 s bez krawędzi): reset pomiarów HIGH/LOW — zapobiega mieszaniu
+starych i nowych pomiarów po przerwie w pedałowaniu.
 
 ### Algorytm sterowania (`calculatePasDuty`)
 
@@ -905,6 +1004,7 @@ Jeśli ostatni zmierzony **okres** jest dłuższy niż stop_delay — to nie jes
 | `pas_start_delay_ms` | 2000 | `passtart:N` | Czas ciągłego pedałowania forward do aktywacji [ms] |
 | `pas_stop_delay_ms` | 1000 | `passtop:N` | Timeout braku impulsów PAS → wyłącz wspomaganie [ms] |
 | `pas_ramp_ms` | 1500 | `pasramp:N` | Soft-start: czas narastania mocy 0→100% [ms] |
+| `pas_debounce_us` | 3000 | `pasdbnc:N` | Czas potwierdzenia stanu PAS [µs]. N=debounce/500 próbek filtra |
 
 ### Diagnostyka
 
@@ -959,7 +1059,8 @@ P13 magnets:      12
 
 | Stała | Wartość | Opis |
 |---|---|---|
-| `PAS_MIN_HALFPERIOD_US` | 5000 µs | Debounce krawędzi (min 5 ms) |
+| `PAS_SAMPLE_INTERVAL_US` | 500 µs | Okres próbkowania timera PAS |
+| `PAS_MIN_HALFPERIOD_US` | 5000 µs | Min półokres PAS (debounce krawędzi) |
 | `PAS_DIR_MIN_ASYMMETRY` | 5% | Próg asymetrii do detekcji kierunku |
 | `PAS_SPEED_MA_SIZE` | 8 | Próbek w buforze Moving Average prędkości |
 | `PAS_SLEW_RATE_MAX` | 30 | Max zmiana duty na wywołanie (~3% PWM) |
@@ -1143,7 +1244,7 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | Pole | Typ | Domyślnie | Opis |
 |---|---|---|---|
 | `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 7 | Wersja struktury |
+| `version` | uint16_t | 11 | Wersja struktury (CONFIG_VERSION) |
 | `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
 | `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
 | `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
@@ -1153,12 +1254,17 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | `pas_ramp_ms` | uint16_t | 1500 | Soft-start PAS: czas narastania 0→100% [ms] |
 | `duty_max_step_pct` | uint8_t | 5 | Max zmiana duty na wywołanie [% PWM_MAX] |
 | `motor_reverse` | uint8_t | 0 | Kierunek obrotów (0=CW, 1=CCW) |
-| `sine_hall_offset` | int8_t | 0 | Offset fazy Hall→sinus [-48..+48 wpisów], wynik `sat`/`so:N` |
-| `foc_kp_q` | float | 0.5 | FOC PI Kp osi q [PWM/A], wynik `fpitune`/`fkp:` |
-| `foc_ki_q` | float | 5.0 | FOC PI Ki osi q [PWM/(A·s)], wynik `fpitune`/`fki:` |
-| `foc_kp_d` | float | 0.5 | FOC PI Kp osi d [PWM/A], wynik `fkpd:` |
-| `foc_ki_d` | float | 5.0 | FOC PI Ki osi d [PWM/(A·s)], wynik `fkid:` |
-| `_reserved[28]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
+| `sine_hall_offset` | int8_t | 0 | Offset fazy Hall→sinus [-48..+48], wynik `sat`/`so:N` |
+| `foc_kp_q` | float | 0.5 | FOC PI Kp osi q [PWM/A] |
+| `foc_ki_q` | float | 5.0 | FOC PI Ki osi q [PWM/(A·s)] |
+| `foc_kp_d` | float | 0.5 | FOC PI Kp osi d [PWM/A] |
+| `foc_ki_d` | float | 5.0 | FOC PI Ki osi d [PWM/(A·s)] |
+| `foc_voltage_mode` | uint8_t | 0 | FOC tryb napięciowy (0=PI, 1=Vmode) — diagnostyka |
+| `pas_debounce_us` | uint16_t | 3000 | Czas potwierdzenia stanu PAS [µs] (filtr = N×500µs) |
+| `display_required` | uint8_t | 1 | Blokada silnika bez wyświetlacza S866 (0/1) |
+| `thr_samples` | uint8_t | 8 | Liczba próbek ADC przepustnicy w burście (2–16) |
+| `thr_outlier_thresh` | uint16_t | 150 | Max odchylenie próbki od mediany ADC (10–2000) |
+| `_reserved[21]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
 
 ### Walidacja
 
@@ -1176,6 +1282,9 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | `cfg:regen:N` | Zmienia regen (0/1), **natychmiast aktualizuje runtime**, zapisuje NVS |
 | `cfg:rev:N` | Kierunek obrotów: 0=CW, 1=CCW, zapisuje NVS |
 | `cfg:step:N` | Max zmiana duty 0-100% na krok, zapisuje NVS |
+| `cfg:dispreq:N` | Wymagany wyświetlacz: 0=NIE (standalone), 1=TAK, zapisuje NVS |
+| `cfg:thrsamp:N` | Próbki burst przepustnicy: 2-16, zapisuje NVS |
+| `cfg:thrdelta:N` | Max odchylenie od mediany ADC: 10-2000, zapisuje NVS |
 | `cfg:defaults` | Ładuje wartości domyślne do runtime i config struct **(bez zapisu NVS)** |
 | `cfg:save` | Synchronizuje runtime → NVS (zapisuje aktualny stan) |
 | `cfg:reload` | Wczytuje NVS → runtime + przełącza tryb silnika jeśli zmieniony |
@@ -1183,27 +1292,52 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | `passtart:N` | Opóźnienie startu PAS 0-10000 ms, zapisuje NVS |
 | `passtop:N` | Timeout PAS 100-10000 ms, zapisuje NVS |
 | `pasramp:N` | Soft-start PAS 0-10000 ms, zapisuje NVS |
+| `pasdbnc:N` | Czas potwierdzenia stanu PAS 500-10000 µs (filtr = N/500 próbek), zapisuje NVS |
 
 ### Przykład wyjścia `cfg`
 
 ```
 ========== KONFIGURACJA NVS ==========
 drive_mode:    3 (FOC)
+               Tryb pracy silnika po starcie: 1=BLOCK, 2=SINUS, 3=FOC
 ramp_time_ms:  1200 ms
+               Czas narastania duty 0->100%. 0=natychmiastowy. Dziala w obu kierunkach.
 regen_enabled: 0 (OFF)
+               Hamowanie regeneracyjne (odzyskiwanie energii do baterii).
 pas_dir_inv:   0 (NORM)
+               Inwersja kierunku PAS. Uzyj gdy silnik napedza wstecz.
 pas_start_ms:  2000 ms
+               Czas ciaglego pedalowania wymagany do aktywacji silnika.
 pas_stop_ms:   1000 ms
+               Czas bez impulsow PAS po ktorym silnik wylacza wspomaganie.
 pas_ramp_ms:   1500 ms
+               Soft-start PAS: czas narastania mocy 0->100% po aktywacji.
+pas_dbnc_us:   3000 us (filter: 6 probek x 500 us)
+               Czas potwierdzenia stanu PAS. Probkowanie co 500us, N zgodnych = zmiana stanu.
+disp_req:      1 (TAK)
+               Blokada silnika gdy wyswietlacz S866 nie jest polaczony.
+thr_samples:   8
+               Liczba probek ADC w jednym odczycie gazu (burst). Wiecej=gladszy, wolniejszy.
+thr_outlier:   150
+               Max odchylenie probki od mediany (ADC). Probki dalsze odrzucane jako szum.
 duty_step:     5 %
+               Max zmiana duty na krok petli. 0=bez limitu. Ogranicza szarpniecia mocy.
 motor_rev:     0 (CW)
+               Kierunek obrotow silnika. CW=normalny, CCW=odwrocony.
 sine_offset:   -6 (-22.5 deg)
+               Przesuniecie fazowe Hall->sinus. Dobierane komenda 'sat' (auto-tune).
 foc_kp_q:      0.450
+               FOC: wzmocnienie proporcjonalne PI osi Q (moment obrotowy).
 foc_ki_q:      12.345
+               FOC: wzmocnienie calkujace PI osi Q (moment obrotowy).
 foc_kp_d:      0.450
+               FOC: wzmocnienie proporcjonalne PI osi D (strumien magnetyczny).
 foc_ki_d:      12.345
+               FOC: wzmocnienie calkujace PI osi D (strumien magnetyczny).
+foc_vmode:     0 (OFF)
+               FOC tryb napieciowy: sterowanie napieciem bez PI. Do diagnostyki.
 magic:         0x424C4401 OK
-version:       7
+version:       11
 ======================================
 --- Runtime (bieżące) ---
 mode:          FOC
