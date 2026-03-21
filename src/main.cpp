@@ -184,6 +184,19 @@ static esp_timer_handle_t g_pas_sample_timer = nullptr;
 volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
 volatile uint16_t g_regen_duty_isr = 0;       ///< Siła hamowania regen 0-PWM_MAX_DUTY
 
+// Limit prądowy (P14 / NVS current_limit_a)
+static float g_current_limit_factor = 1.0f;   ///< Mnożnik duty z limitera prądowego (0.0–1.0)
+static bool  g_overcurrent_fault = false;      ///< Hard cutoff: prąd > 150% limitu → blokada
+static unsigned long g_overcurrent_fault_ms = 0; ///< Czas wejścia w fault [ms]
+static float g_ilim_current_ema = 0.0f;        ///< EMA-filtrowany max prąd fazowy dla limitera [A]
+static uint8_t g_ilim_hard_count = 0;          ///< Licznik kolejnych próbek powyżej hard cutoff
+#define OVERCURRENT_HARD_MULT  1.5f            ///< Mnożnik: hard cutoff przy 150% limitu
+#define OVERCURRENT_FAULT_MS   500             ///< Czas blokady po hard cutoff [ms]
+#define OVERCURRENT_CONSEC     3               ///< Wymagane kolejne próbki powyżej progu hard cutoff
+#define ILIMIT_KP_DOWN         0.05f           ///< Proporcjonalny spadek przy przekroczeniu [/A]
+#define ILIMIT_RECOVER_RATE    0.5f            ///< Szybkość odzyskiwania [1/s]
+#define ILIMIT_EMA_ALPHA       0.15f           ///< EMA α filtru prądu dla limitera (szybszy niż FOC)
+
 // Tryb testowy MOSFETów — diagnostyka uszkodzonych tranzystorów
 volatile bool g_mosfet_test_active = false;    ///< Tryb testu MOSFET aktywny (ISR nie rusza LEDC)
 static uint16_t g_mosfet_test_duty = PWM_MAX_DUTY * 10 / 100;  ///< Duty testowe (domyślnie 10%)
@@ -519,6 +532,22 @@ static uint8_t getSpeedLimitKmh() {
     uint8_t limit = g_display.config.p08_speed_limit;
     if (limit == 0) limit = 25;
     return limit;
+}
+
+/**
+ * @brief Efektywny limit prądu fazowego [A].
+ *
+ * Priorytet: P14 z wyświetlacza (jeśli podłączony i P14>0),
+ * w przeciwnym razie current_limit_a z NVS.
+ * Wartość 0 oznacza brak limitu (bypass).
+ *
+ * @return Limit prądu [A], 0 = brak limitu.
+ */
+static uint8_t getEffectiveCurrentLimit() {
+    if (g_display.connected && g_display.config.p14_current_limit_a > 0) {
+        return g_display.config.p14_current_limit_a;
+    }
+    return config_get().current_limit_a;
 }
 
 /**
@@ -1419,7 +1448,14 @@ void loop() {
             // ── Tryb PI (normalny FOC) ──
 
             // 1. Mapowanie duty → Iq target (torque)
-            g_foc_iq_target = (float)g_bldc_state.duty_cycle * FOC_IQ_MAX / (float)PWM_MAX_DUTY;
+            {
+                float iq_max = FOC_IQ_MAX;
+                uint8_t ilim = getEffectiveCurrentLimit();
+                if (ilim > 0 && (float)ilim < iq_max) {
+                    iq_max = (float)ilim;  // Warstwa 2: clamp Iq do P14/NVS
+                }
+                g_foc_iq_target = (float)g_bldc_state.duty_cycle * iq_max / (float)PWM_MAX_DUTY;
+            }
 
             // 2. Feedforward napięciowy: Vq_ff = duty (natychmiastowe napięcie)
             // PI dodaje tylko małą korektę wokół tego punktu pracy.
@@ -1641,11 +1677,24 @@ void loop() {
     // Tu nie ma nic do roboty — zostawione jako komentarz dla czytelności.
 
     // Obliczanie mocy: P = Vbat × max(Ia, Ib, Ic)
+    float g_maxI_now = 0.0f;  // max prąd fazowy — surowy (do wyświetlacza/mocy)
+    float g_maxI_filtered;    // EMA-filtrowany max prąd (do limitera prądowego)
     {
         float maxI = g_bldc_state.phase_current[0];
         if (g_bldc_state.phase_current[1] > maxI) maxI = g_bldc_state.phase_current[1];
         if (g_bldc_state.phase_current[2] > maxI) maxI = g_bldc_state.phase_current[2];
-        float power = g_bldc_state.battery_voltage * maxI;
+        g_maxI_now = maxI;
+
+        // EMA filtr prądu dla limitera — odrzuca szpilki ADC z niesynchr. samplingiem.
+        // INA180A2 z low-side shuntem: ADC nie zsynchr. z PWM → transjenty
+        // przełączania dają odczyty 20-33A z zasilacza 3A.
+        // EMA α=0.15 → τ≈3ms przy loop ~1kHz. Wystarczająco szybki na ochronę,
+        // wystarczająco wolny na odrzucenie pojedynczych szpilek.
+        g_ilim_current_ema += ILIMIT_EMA_ALPHA * (maxI - g_ilim_current_ema);
+        if (g_ilim_current_ema < 0.0f) g_ilim_current_ema = 0.0f;
+        g_maxI_filtered = g_ilim_current_ema;
+
+        float power = g_bldc_state.battery_voltage * g_maxI_filtered;
 
         if (g_bldc_state.regen_active) {
             // W trybie regen: prąd płynie do baterii → moc ujemna (oddawana)
@@ -1658,6 +1707,75 @@ void loop() {
         } else {
             g_bldc_state.power_watts = 0.0f;
             g_bldc_state.regen_power_watts = 0.0f;
+        }
+    }
+
+    // ====================================================================
+    // Limit prądowy (3 warstwy: soft P-regulator, Iq clamp, hard cutoff)
+    // ====================================================================
+    // Warstwa 1 (soft): g_current_limit_factor (0..1) — mnożnik duty.
+    //   Gdy maxI > limit → szybko obcina duty (Kp_down × error).
+    //   Gdy maxI < limit → wolno wraca do 1.0 (recovery rate).
+    // Warstwa 2 (FOC): Iq target obcinany do limitu (w sekcji FOC powyżej).
+    // Warstwa 3 (hard): maxI > 150% → natychmiastowy duty=0 na 500ms.
+    {
+        uint8_t limit_a = getEffectiveCurrentLimit();
+
+        if (limit_a > 0 && g_motor_enabled) {
+            float flimit = (float)limit_a;
+
+            // --- Warstwa 3: hard cutoff (ochrona MOSFET/silnika) ---
+            // Wymaga OVERCURRENT_CONSEC kolejnych próbek (filtrowanego prądu)
+            // powyżej progu. Pojedyncza szpilka ADC nie wywoła cutoff.
+            if (g_maxI_filtered > flimit * OVERCURRENT_HARD_MULT) {
+                g_ilim_hard_count++;
+                if (g_ilim_hard_count >= OVERCURRENT_CONSEC) {
+                    g_overcurrent_fault = true;
+                    g_overcurrent_fault_ms = millis();
+                    g_duty_isr = 0;
+                    g_bldc_state.duty_cycle = 0;
+                    g_duty_ramped = 0;
+                    Serial.printf("[ILIM] HARD CUTOFF! I_filt=%.1fA > %.0fA (150%% of %dA)\n",
+                                  g_maxI_filtered, flimit * OVERCURRENT_HARD_MULT, limit_a);
+                    g_ilim_hard_count = 0;
+                }
+            } else {
+                g_ilim_hard_count = 0;
+            }
+
+            // Blokada po hard cutoff
+            if (g_overcurrent_fault) {
+                if (millis() - g_overcurrent_fault_ms < OVERCURRENT_FAULT_MS) {
+                    g_duty_isr = 0;
+                    g_current_limit_factor = 0.0f;
+                } else {
+                    g_overcurrent_fault = false;
+                    g_current_limit_factor = 0.1f; // restart od 10%
+                }
+            } else {
+                // --- Warstwa 1: soft P-regulator ---
+                float error = g_maxI_filtered - flimit;
+                if (error > 0.0f) {
+                    // Przekroczenie → szybka redukcja
+                    g_current_limit_factor -= ILIMIT_KP_DOWN * error;
+                    if (g_current_limit_factor < 0.05f) g_current_limit_factor = 0.05f;
+                } else {
+                    // Pod limitem → wolne odzyskiwanie
+                    // dt ≈ 0.5-1ms (loop ~1-2kHz)
+                    g_current_limit_factor += ILIMIT_RECOVER_RATE * 0.001f;
+                    if (g_current_limit_factor > 1.0f) g_current_limit_factor = 1.0f;
+                }
+
+                // Zastosuj mnożnik do duty_isr (BLOCK + SINUS + FOC backup)
+                if (g_current_limit_factor < 1.0f) {
+                    uint16_t limited = (uint16_t)((float)g_duty_isr * g_current_limit_factor);
+                    g_duty_isr = limited;
+                }
+            }
+        } else {
+            // Brak limitu lub silnik wyłączony → pełna moc
+            g_current_limit_factor = 1.0f;
+            g_overcurrent_fault = false;
         }
     }
 
@@ -1995,8 +2113,35 @@ void allMosfetsOff() {
 void readAnalogInputs() {
     // Odczyt napięcia baterii
     uint16_t batteryRaw = analogRead(PIN_BATTERY_VOLTAGE);
-    // Odczyt prądu fazy A (GPIO39)
-    uint16_t phaseA_raw = analogRead(PIN_PHASE_A_CURRENT);
+
+    // ── Odczyt prądów fazowych: przepleciony burst × 3 + mediana ──
+    // ADC nie jest zsynchronizowany z PWM (LEDC nie ma triggera ADC).
+    // INA180A2 low-side mierzy prąd tylko gdy low-side MOSFET ON.
+    // analogRead() trafia losowo w: (a) low-side ON → prawdziwy prąd,
+    // (b) low-side OFF → ≈0, (c) transient przełączania → szpilka.
+    // Przeplecione czytanie (A,B,C,A,B,C,A,B,C) rozciąga 9 odczytów
+    // na ~4-9 cykli PWM → maksymalizuje szansę trafienia w low-side ON.
+    // Mediana z 3 próbek odrzuca zarówno szpilkę jak i zero.
+    uint16_t phaseA_raw, phaseB_raw, phaseC_raw;
+    {
+        uint16_t sa[3], sb[3], sc[3];
+        for (uint8_t i = 0; i < 3; i++) {
+            sa[i] = analogRead(PIN_PHASE_A_CURRENT);
+            sb[i] = analogRead(PIN_PHASE_B_CURRENT);
+            sc[i] = analogRead(PIN_PHASE_C_CURRENT);
+        }
+        // Sortowanie sieci (sorting network) — 3 porównania dla 3 elementów
+        #define MEDIAN3(arr) do { \
+            if (arr[0] > arr[1]) { uint16_t t = arr[0]; arr[0] = arr[1]; arr[1] = t; } \
+            if (arr[1] > arr[2]) { uint16_t t = arr[1]; arr[1] = arr[2]; arr[2] = t; } \
+            if (arr[0] > arr[1]) { uint16_t t = arr[0]; arr[0] = arr[1]; arr[1] = t; } \
+        } while(0)
+        MEDIAN3(sa); MEDIAN3(sb); MEDIAN3(sc);
+        #undef MEDIAN3
+        phaseA_raw = sa[1];  // mediana
+        phaseB_raw = sb[1];
+        phaseC_raw = sc[1];
+    }
 
     // Przepustnica: bufor kołowy N próbek (1 na iterację loop) + mediana
     // ADC2/GPIO2 jest podatny na szpilki EMI od PWM silnika.
@@ -2059,10 +2204,6 @@ void readAnalogInputs() {
     } else {
         g_bldc_state.throttle_raw = 0;  // WiFi ON: silnik wyłączony, przepustnica zignorowana
     }
-
-    // Odczyt prądów fazowych
-    uint16_t phaseB_raw = analogRead(PIN_PHASE_B_CURRENT);
-    uint16_t phaseC_raw = analogRead(PIN_PHASE_C_CURRENT);
 
     // Odczyt temperatury silnika (ADC2/GPIO15) — pomijamy gdy WiFi aktywne
     uint16_t motorTempRaw = g_wifi_active ? (uint16_t)g_bldc_state.motor_temperature
@@ -3343,6 +3484,12 @@ void printHelp() {
     Serial.println("pasdbg       Debug PAS ON/OFF: kierunek, kadencja RPM, V_target,");
     Serial.println("               V_smooth, speed_MA, duty, soft-start, stan automatu.");
     Serial.println();
+    Serial.println("---------- Limit pradowy ----------");
+    Serial.println("ilim:N       Limit pradu fazowego [A], zakres 0-50. 0=brak limitu.");
+    Serial.println("               Zapisuje do NVS. P14 z display nadpisuje (jesli>0).");
+    Serial.println("               3 warstwy ochrony: soft P-regulator (duty reduction),");
+    Serial.println("               FOC Iq clamp, hard cutoff przy 150% limitu.");
+    Serial.println();
     Serial.println("h          Pokaz te pomoc");
     Serial.println("==========================================================================");
     Serial.println();
@@ -3376,7 +3523,7 @@ void printDisplayConfig() {
     Serial.printf("P11  Czułość PAS:             %d\n",        c.p11_pas_sensitivity);
     Serial.printf("P12  Intensywność startu PAS: %d\n",        c.p12_pas_start_strength);
     Serial.printf("P13* Magnesy PAS:             %d\n",        c.p13_pas_magnets);
-    Serial.printf("P14  Limit prądu:             %d A\n",      c.p14_current_limit_a);
+    Serial.printf("P14* Limit prądu:             %d A\n",      c.p14_current_limit_a);
     Serial.printf("P15  Napięcie odcięcia:       %.1f V\n",    c.p15_undervoltage_x10 / 10.0f);
     Serial.println("--- Parametry lokalne wyświetlacza (nie w ramce) ---");
     Serial.printf("P16  Tryb komunikacji:        [local]\n");
@@ -3950,6 +4097,19 @@ static String executeCommand(const String& cmd) {
         }
         return "Zakres 500-10000 us";
     }
+    if (cmd.startsWith("ilim:")) {
+        int val = cmd.substring(5).toInt();
+        if (val >= 0 && val <= 50) {
+            config_get().current_limit_a = (uint8_t)val;
+            config_save();
+            g_current_limit_factor = 1.0f;
+            g_overcurrent_fault = false;
+            if (val == 0)
+                return "Limit pradu: WYLACZONY (brak limitu)";
+            return "Limit pradu: " + String(val) + " A";
+        }
+        return "Zakres 0-50 A (0=brak limitu)";
+    }
     if (cmd == "h") {
         printHelp();
         return "";
@@ -4000,6 +4160,8 @@ static String executeCommand(const String& cmd) {
         Serial.println("               Czas potwierdzenia stanu PAS. Probkowanie co 500us, N zgodnych = zmiana stanu.");
         Serial.printf("disp_req:      %d (%s)\n", cfg.display_required, cfg.display_required ? "TAK" : "NIE");
         Serial.println("               Blokada silnika gdy wyswietlacz S866 nie jest polaczony.");
+        Serial.printf("current_lim:   %d A (%s)\n", cfg.current_limit_a, cfg.current_limit_a ? "AKTYWNY" : "WYLACZONY");
+        Serial.println("               Limit pradu fazowego. 0=brak limitu. P14 z display nadpisuje (jesli>0). Komenda: ilim:N");
         Serial.printf("thr_samples:   %d\n", cfg.thr_samples);
         Serial.println("               Glebokosc bufora kolowego gazu. 1 probka/loop, mediana z N. Wiecej=gladszy.");
         Serial.printf("thr_outlier:   %d\n", cfg.thr_outlier_thresh);
@@ -4035,6 +4197,14 @@ static String executeCommand(const String& cmd) {
         Serial.printf("foc_ki_q:      %.3f\n", g_foc_pi_q.ki);
         Serial.printf("foc_kp_d:      %.3f\n", g_foc_pi_d.kp);
         Serial.printf("foc_ki_d:      %.3f\n", g_foc_pi_d.ki);
+        Serial.printf("ilim_factor:   %.2f\n", g_current_limit_factor);
+        Serial.printf("ilim_I_filt:   %.1f A (raw max: %.1f A)\n",
+                      g_ilim_current_ema,
+                      fmaxf(fmaxf(g_bldc_state.phase_current[0], g_bldc_state.phase_current[1]), g_bldc_state.phase_current[2]));
+        Serial.printf("ilim_eff:      %d A (P14=%d, NVS=%d)\n",
+                      (int)getEffectiveCurrentLimit(),
+                      (int)g_display.config.p14_current_limit_a,
+                      (int)config_get().current_limit_a);
         Serial.println();
         return "";
     }
@@ -4184,6 +4354,19 @@ static String executeCommand(const String& cmd) {
             config_save();
             return val ? "Wyswietlacz WYMAGANY (silnik tylko z display)" : "Wyswietlacz OPCJONALNY (standalone OK)";
         }
+        if (cmd.startsWith("cfg:ilim:")) {
+            int val = cmd.substring(9).toInt();
+            if (val >= 0 && val <= 50) {
+                cfg.current_limit_a = (uint8_t)val;
+                config_save();
+                g_current_limit_factor = 1.0f;
+                g_overcurrent_fault = false;
+                if (val == 0)
+                    return "Limit pradu NVS: WYLACZONY (brak limitu)";
+                return "Limit pradu NVS: " + String(val) + " A";
+            }
+            return "Zakres 0-50 A (0=brak limitu)";
+        }
         if (cmd.startsWith("cfg:thrsamp:")) {
             int val = cmd.substring(12).toInt();
             if (val >= 2 && val <= 16) {
@@ -4271,6 +4454,8 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <details><summary>&#128295; Ustawienia systemowe</summary><div class="card">
 <div class="row"><label>Wymagany wy&#347;wietlacz</label><select id="disp_rq"><option value="1">TAK (silnik tylko z display)</option><option value="0">NIE (standalone OK)</option></select><button onclick="cmd('cfg:dispreq:'+v('disp_rq'))">Ustaw</button></div>
 <p class="hint">Blokada silnika gdy wy&#347;wietlacz S866 nie jest pod&#322;&#261;czony. TAK=silnik wymaga display, NIE=dzia&#322;a samodzielnie.</p>
+<div class="row"><label>Limit pr&#261;du [A]</label><input type="number" id="ilim" min="0" max="50" step="1"><button onclick="cmd('cfg:ilim:'+v('ilim'))">Ustaw</button></div>
+<p class="hint">Limit pr&#261;du fazowego (ochrona silnika/MOSFET). 0=brak limitu. P14 z wy&#347;wietlacza nadpisuje gdy &gt;0. Komenda Serial: ilim:N</p>
 <div class="row"><label>Throttle bufor pr&#243;bek</label><input type="number" id="thr_n" min="2" max="16" step="1"><button onclick="cmd('cfg:thrsamp:'+v('thr_n'))">Ustaw</button></div>
 <p class="hint">G&#322;&#281;boko&#347;&#263; bufora ko&#322;owego gazu: 1 pr&#243;bka ADC na iteracj&#281; loop(), mediana z N. Wi&#281;cej = g&#322;adszy sygna&#322;. Zakres 2-16.</p>
 <div class="row"><label>Throttle max odchylenie</label><input type="number" id="thr_d" min="10" max="2000" step="10"><button onclick="cmd('cfg:thrdelta:'+v('thr_d'))">Ustaw</button></div>
@@ -4344,6 +4529,7 @@ async function loadCfg(){
     el('pas_r').value=_c.pas_ramp_ms;el('pas_d').value=_c.pas_dir_invert;
     el('pas_db').value=_c.pas_debounce_us||3000;
     el('disp_rq').value=_c.display_required||0;
+    el('ilim').value=_c.current_limit_a||0;
     el('thr_n').value=_c.thr_samples||8;
     el('thr_d').value=_c.thr_outlier_thresh||150;
     el('fkp_q').value=(_c.foc_kp_q||0).toFixed(3);el('fki_q').value=(_c.foc_ki_q||0).toFixed(3);
@@ -4389,6 +4575,7 @@ static void webHandleApiConfig() {
         "\"foc_kp_d\":%.4f,\"foc_ki_d\":%.4f,"
         "\"pas_debounce_us\":%d,"
         "\"display_required\":%d,"
+        "\"current_limit_a\":%d,"
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"rt_mode\":%d,\"rt_speed\":%.2f,\"rt_vbat\":%.2f,"
         "\"rt_duty\":%u,\"rt_fault\":%s,"
@@ -4402,6 +4589,7 @@ static void webHandleApiConfig() {
         cfg.foc_kp_q, cfg.foc_ki_q, cfg.foc_kp_d, cfg.foc_ki_d,
         (int)cfg.pas_debounce_us,
         (int)cfg.display_required,
+        (int)cfg.current_limit_a,
         (int)cfg.thr_samples, (int)cfg.thr_outlier_thresh,
         (int)g_bldc_state.mode,
         g_bldc_state.wheel_speed_kmh,

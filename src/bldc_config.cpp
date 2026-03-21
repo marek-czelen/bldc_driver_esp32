@@ -51,6 +51,7 @@ static void config_apply_defaults() {
     g_config.display_required   = 1;                               // Silnik tylko z wyświetlaczem (domyślnie)
     g_config.thr_samples         = 8;                               // Throttle: 8 próbek burst
     g_config.thr_outlier_thresh  = 150;                             // Throttle: odrzucaj > 150 od mediany
+    g_config.current_limit_a     = 15;                              // Limit prądu: 15A domyślnie (0=brak limitu)
 }
 
 void config_init() {
