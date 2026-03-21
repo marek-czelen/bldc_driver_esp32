@@ -3929,23 +3929,43 @@ static String executeCommand(const String& cmd) {
         Serial.println();
         Serial.println("========== KONFIGURACJA NVS ==========");
         Serial.printf("drive_mode:    %d (%s)\n", cfg.drive_mode, modeName);
+        Serial.println("               Tryb pracy silnika po starcie: 1=BLOCK, 2=SINUS, 3=FOC");
         Serial.printf("ramp_time_ms:  %d ms\n",   cfg.ramp_time_ms);
+        Serial.println("               Czas narastania duty 0->100%. 0=natychmiastowy. Dziala w obu kierunkach.");
         Serial.printf("regen_enabled: %d (%s)\n", cfg.regen_enabled, cfg.regen_enabled ? "ON" : "OFF");
+        Serial.println("               Hamowanie regeneracyjne (odzyskiwanie energii do baterii).");
         Serial.printf("pas_dir_inv:   %d (%s)\n", cfg.pas_dir_invert, cfg.pas_dir_invert ? "ODWR" : "NORM");
+        Serial.println("               Inwersja kierunku PAS. Uzyj gdy silnik napedza wstecz.");
         Serial.printf("pas_start_ms:  %u ms\n",  (unsigned)cfg.pas_start_delay_ms);
+        Serial.println("               Czas ciaglego pedalowania wymagany do aktywacji silnika.");
         Serial.printf("pas_stop_ms:   %u ms\n",  (unsigned)cfg.pas_stop_delay_ms);
+        Serial.println("               Czas bez impulsow PAS po ktorym silnik wylacza wspomaganie.");
         Serial.printf("pas_ramp_ms:   %u ms\n",  (unsigned)cfg.pas_ramp_ms);
+        Serial.println("               Soft-start PAS: czas narastania mocy 0->100% po aktywacji.");
         Serial.printf("pas_dbnc_us:   %u us\n",  (unsigned)cfg.pas_debounce_us);
+        Serial.println("               Filtr szpilek EMI z silnika na czujniku PAS. Min. odstep miedzy impulsami.");
         Serial.printf("disp_req:      %d (%s)\n", cfg.display_required, cfg.display_required ? "TAK" : "NIE");
+        Serial.println("               Blokada silnika gdy wyswietlacz S866 nie jest polaczony.");
         Serial.printf("thr_samples:   %d\n", cfg.thr_samples);
+        Serial.println("               Liczba probek ADC w jednym odczycie gazu (burst). Wiecej=gladszy, wolniejszy.");
         Serial.printf("thr_outlier:   %d\n", cfg.thr_outlier_thresh);
+        Serial.println("               Max odchylenie probki od mediany (ADC). Probki dalsze odrzucane jako szum.");
         Serial.printf("duty_step:     %d %%\n",   cfg.duty_max_step_pct);
+        Serial.println("               Max zmiana duty na krok petli. 0=bez limitu. Ogranicza szarpniecia mocy.");
         Serial.printf("motor_rev:     %d (%s)\n", cfg.motor_reverse, cfg.motor_reverse ? "CCW" : "CW");
+        Serial.println("               Kierunek obrotow silnika. CW=normalny, CCW=odwrocony.");
         Serial.printf("sine_offset:   %d (%.1f deg)\n", (int)cfg.sine_hall_offset, (float)cfg.sine_hall_offset * 3.75f);
+        Serial.println("               Przesuniecie fazowe Hall->sinus. Dobierane komenda 'sat' (auto-tune).");
         Serial.printf("foc_kp_q:      %.3f\n", cfg.foc_kp_q);
+        Serial.println("               FOC: wzmocnienie proporcjonalne PI osi Q (moment obrotowy).");
         Serial.printf("foc_ki_q:      %.3f\n", cfg.foc_ki_q);
+        Serial.println("               FOC: wzmocnienie calkujace PI osi Q (moment obrotowy).");
         Serial.printf("foc_kp_d:      %.3f\n", cfg.foc_kp_d);
+        Serial.println("               FOC: wzmocnienie proporcjonalne PI osi D (strumien magnetyczny).");
         Serial.printf("foc_ki_d:      %.3f\n", cfg.foc_ki_d);
+        Serial.println("               FOC: wzmocnienie calkujace PI osi D (strumien magnetyczny).");
+        Serial.printf("foc_vmode:     %d (%s)\n", cfg.foc_voltage_mode, cfg.foc_voltage_mode ? "ON" : "OFF");
+        Serial.println("               FOC tryb napieciowy: sterowanie napieciem bez PI. Do diagnostyki.");
         Serial.printf("magic:         0x%08X %s\n", cfg.magic, (cfg.magic == CONFIG_MAGIC) ? "OK" : "BAD!");
         Serial.printf("version:       %d\n",      cfg.version);
         Serial.println("======================================");
@@ -4168,30 +4188,49 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 </div></details>
 <details open><summary>&#9881; Silnik</summary><div class="card">
 <div class="row"><label>Tryb startu (boot)</label><select id="drv_m"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option></select><button onclick="cmd('cfg:mode:'+v('drv_m'))">Ustaw</button></div>
+<p class="hint">Tryb pracy silnika po w&#322;&#261;czeniu zasilania. BLOCK=komutacja trapezowa, SINUS=sinusoidalna, FOC=wektorowe sterowanie polem.</p>
 <div class="row"><label>Rampa 0&#8594;100% (ms)</label><input type="number" id="ramp_ms" min="0" max="10000" step="100"><button onclick="cmd('cfg:ramp:'+v('ramp_ms'))">Ustaw</button></div>
+<p class="hint">Czas narastania mocy od 0 do 100%. Dzia&#322;a w obu kierunkach (przyspieszanie i zwalnianie). 0=natychmiastowy.</p>
 <div class="row"><label>Regen hamowanie</label><select id="regen_e"><option value="0">OFF</option><option value="1">ON</option></select><button onclick="cmd('cfg:regen:'+v('regen_e'))">Ustaw</button></div>
+<p class="hint">Hamowanie regeneracyjne &#8212; odzyskiwanie energii do baterii przy zwalnianiu.</p>
 <div class="row"><label>Max krok duty (%)</label><input type="number" id="duty_s" min="0" max="100"><button onclick="cmd('cfg:step:'+v('duty_s'))">Ustaw</button></div>
+<p class="hint">Maksymalna zmiana duty na jeden cykl p&#281;tli. Ogranicza szarpni&#281;cia mocy. 0=bez limitu, domy&#347;lnie 5%.</p>
 <div class="row"><label>Kierunek silnika</label><select id="mot_rev"><option value="0">CW (normalny)</option><option value="1">CCW (odwr&#243;cony)</option></select><button onclick="cmd('cfg:rev:'+v('mot_rev'))">Ustaw</button></div>
+<p class="hint">Kierunek obrot&#243;w silnika. Zmie&#324; je&#347;li ko&#322;o kr&#281;ci si&#281; w z&#322;&#261; stron&#281;.</p>
 <div class="row"><label>Offset fazy Hall</label><select id="sin_off"></select><button onclick="cmd('so:'+v('sin_off'))">Ustaw</button></div>
+<p class="hint">Przesuni&#281;cie fazowe Hall&#8594;sinus. Dobierane automatycznie komend&#261; 'sat' (auto-tune) lub r&#281;cznie.</p>
 </div></details>
 <details><summary>&#128690; Asystent PAS</summary><div class="card">
 <div class="row"><label>Op&#243;&#378;nienie startu (ms)</label><input type="number" id="pas_s" min="0" max="10000" step="100"><button onclick="cmd('passtart:'+v('pas_s'))">Ustaw</button></div>
+<p class="hint">Czas ci&#261;g&#322;ego peda&#322;owania do przodu wymagany do aktywacji silnika. Zapobiega przypadkowemu w&#322;&#261;czeniu.</p>
 <div class="row"><label>Op&#243;&#378;nienie stopu (ms)</label><input type="number" id="pas_t" min="100" max="10000" step="100"><button onclick="cmd('passtop:'+v('pas_t'))">Ustaw</button></div>
+<p class="hint">Czas bez impuls&#243;w PAS po kt&#243;rym silnik wy&#322;&#261;cza wspomaganie. Ni&#380;sza warto&#347;&#263; = szybsza reakcja na stop.</p>
 <div class="row"><label>Rampa PAS (ms)</label><input type="number" id="pas_r" min="0" max="10000" step="100"><button onclick="cmd('pasramp:'+v('pas_r'))">Ustaw</button></div>
+<p class="hint">Soft-start PAS: czas narastania mocy 0&#8594;100% po aktywacji. 0=natychmiastowy, 1500=&#322;agodne ~1.5s.</p>
 <div class="row"><label>Kierunek PAS</label><select id="pas_d"><option value="0">Normalny</option><option value="1">Odwr&#243;cony</option></select><button onclick="setPasDir()">Ustaw</button></div>
+<p class="hint">Inwersja kierunku czujnika PAS. U&#380;yj gdy silnik nap&#281;dza przy peda&#322;owaniu do ty&#322;u.</p>
 <div class="row"><label>Debounce PAS (&#181;s)</label><input type="number" id="pas_db" min="500" max="10000" step="100"><button onclick="cmd('pasdbnc:'+v('pas_db'))">Ustaw</button></div>
+<p class="hint">Filtr szpilek EMI z silnika na czujniku PAS. Minimalny odst&#281;p mi&#281;dzy impulsami. Domy&#347;lnie 3000 &#181;s.</p>
 </div></details>
 <details><summary>&#128295; Ustawienia systemowe</summary><div class="card">
 <div class="row"><label>Wymagany wy&#347;wietlacz</label><select id="disp_rq"><option value="1">TAK (silnik tylko z display)</option><option value="0">NIE (standalone OK)</option></select><button onclick="cmd('cfg:dispreq:'+v('disp_rq'))">Ustaw</button></div>
+<p class="hint">Blokada silnika gdy wy&#347;wietlacz S866 nie jest pod&#322;&#261;czony. TAK=silnik wymaga display, NIE=dzia&#322;a samodzielnie.</p>
 <div class="row"><label>Throttle pr&#243;bki burst</label><input type="number" id="thr_n" min="2" max="16" step="1"><button onclick="cmd('cfg:thrsamp:'+v('thr_n'))">Ustaw</button></div>
+<p class="hint">Liczba pr&#243;bek ADC gazu w jednym odczycie. Wi&#281;cej = g&#322;adszy sygna&#322;, ale wolniejsza reakcja. Zakres 2-16.</p>
 <div class="row"><label>Throttle max odchylenie</label><input type="number" id="thr_d" min="10" max="2000" step="10"><button onclick="cmd('cfg:thrdelta:'+v('thr_d'))">Ustaw</button></div>
+<p class="hint">Pr&#243;bki ADC oddalone od mediany o wi&#281;cej ni&#380; ta warto&#347;&#263; s&#261; odrzucane jako szum EMI. Zakres 10-2000.</p>
 </div></details>
 <details><summary>&#128260; Parametry FOC</summary><div class="card">
 <div class="row"><label>Tryb napi&#281;ciowy (fvolt)</label><span id="fvolt_st" class="sv">-</span><button onclick="doFvolt()">Prze&#322;&#261;cz fvolt</button><button class="w" onclick="queueCmd('fpitune')">&#10141; Kolejka: fpitune</button></div>
+<p class="hint">Tryb napi&#281;ciowy: bezpo&#347;rednie sterowanie napi&#281;ciem (bez regulatora PI). Do diagnostyki i por&#243;wnania SINUS vs FOC.</p>
 <div class="row"><label>Kp o&#347; Q (torque) + D</label><input type="number" id="fkp_q" min="0" max="100" step="0.01"><button onclick="cmd('fkp:'+v('fkp_q'))">Ustaw Q+D</button></div>
+<p class="hint">Wzmocnienie proporcjonalne PI osi Q (moment obrotowy). Wi&#281;ksze = szybsza reakcja, za du&#380;e = oscylacje.</p>
 <div class="row"><label>Ki o&#347; Q (torque) + D</label><input type="number" id="fki_q" min="0" max="1000" step="0.1"><button onclick="cmd('fki:'+v('fki_q'))">Ustaw Q+D</button></div>
+<p class="hint">Wzmocnienie ca&#322;kuj&#261;ce PI osi Q. Eliminuje b&#322;&#261;d ustalony. Za du&#380;e = wolne oscylacje (wind-up).</p>
 <div class="row"><label>Kp_d o&#347; D (flux)</label><input type="number" id="fkp_d" min="0" max="100" step="0.01"><button onclick="cmd('fkpd:'+v('fkp_d'))">Ustaw D</button></div>
+<p class="hint">Wzmocnienie proporcjonalne PI osi D (strumie&#324; magnetyczny). Utrzymuje Id&#8776;0 (brak rozmagnesowania).</p>
 <div class="row"><label>Ki_d o&#347; D (flux)</label><input type="number" id="fki_d" min="0" max="1000" step="0.1"><button onclick="cmd('fkid:'+v('fki_d'))">Ustaw D</button></div>
+<p class="hint">Wzmocnienie ca&#322;kuj&#261;ce PI osi D. Eliminuje b&#322;&#261;d ustalony strumienia magnetycznego.</p>
 </div></details>
 <details><summary>&#128190; EEPROM / NVS</summary><div class="card">
 <div class="row"><button onclick="sendR('cfg:save')">&#128190; Zapisz do EEPROM</button><button class="w" onclick="sendR('cfg:reload')">&#128194; Wczytaj z EEPROM</button><button class="r" onclick="cfgDef()">&#9888; Domy&#347;lne</button></div>
