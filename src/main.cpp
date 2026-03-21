@@ -1985,59 +1985,64 @@ void readAnalogInputs() {
     // Odczyt prądu fazy A (GPIO39)
     uint16_t phaseA_raw = analogRead(PIN_PHASE_A_CURRENT);
 
-    // Przepustnica: burst N próbek + odrzucenie outlierów + EMA
-    // ADC2/GPIO2 jest podatny na szumy od PWM silnika.
-    // Burst: N szybkich odczytów, sortowanie, odrzucenie outlierów (> delta od mediany), średnia.
+    // Przepustnica: bufor kołowy N próbek (1 na iterację loop) + mediana
+    // ADC2/GPIO2 jest podatny na szpilki EMI od PWM silnika.
+    // Zamiast burst (N próbek w ~100µs) — 1 próbka na loop() (~0.5ms).
+    // Próbki rozłożone w czasie: szpilka EMI trwająca <N×0.5ms
+    // zanieczyszcza tylko część bufora, mediana ją odrzuca.
     // Pomijamy odczyt gdy WiFi aktywne — ADC2 jest zajęty przez WiFi.
     if (!g_wifi_active) {
+        static uint16_t thr_ring[16] = {0};
+        static uint8_t  thr_ring_idx = 0;
+        static bool     thr_ring_init = false;
+
         controller_config_t& tcfg = config_get();
         uint8_t n_samples = tcfg.thr_samples;
         if (n_samples < 2) n_samples = 2;
         if (n_samples > 16) n_samples = 16;
         uint16_t thresh = tcfg.thr_outlier_thresh;
 
-        // Burst: szybkie odczyty ADC
-        uint16_t samples[16];
-        for (uint8_t i = 0; i < n_samples; i++) {
-            samples[i] = analogRead(PIN_THROTTLE);
+        // 1 próbka ADC na wywołanie (rozłożone w czasie, nie burst)
+        uint16_t raw = analogRead(PIN_THROTTLE);
+        thr_ring[thr_ring_idx] = raw;
+        thr_ring_idx = (thr_ring_idx + 1) % n_samples;
+
+        // Inicjalizacja: wypełnij bufor pierwszą próbką
+        if (!thr_ring_init) {
+            for (uint8_t i = 0; i < 16; i++) thr_ring[i] = raw;
+            thr_ring_init = true;
         }
 
-        // Proste sortowanie (insertion sort, max 16 elementów)
+        // Kopia do sortowania (nie modyfikujemy bufora kołowego)
+        uint16_t sorted[16];
+        for (uint8_t i = 0; i < n_samples; i++) sorted[i] = thr_ring[i];
+
+        // Insertion sort
         for (uint8_t i = 1; i < n_samples; i++) {
-            uint16_t key = samples[i];
+            uint16_t key = sorted[i];
             int8_t j = i - 1;
-            while (j >= 0 && samples[j] > key) {
-                samples[j + 1] = samples[j];
+            while (j >= 0 && sorted[j] > key) {
+                sorted[j + 1] = sorted[j];
                 j--;
             }
-            samples[j + 1] = key;
+            sorted[j + 1] = key;
         }
 
-        // Mediana
-        uint16_t median = samples[n_samples / 2];
+        // Mediana — odporna na szpilki (do 50% bufora może być zaśmiecone)
+        uint16_t median = sorted[n_samples / 2];
 
-        // Średnia z próbek bliskich medianie (odrzucenie outlierów)
+        // Średnia z próbek bliskich medianie (dodatkowe wygładzenie)
         uint32_t sum = 0;
         uint8_t count = 0;
         for (uint8_t i = 0; i < n_samples; i++) {
-            int32_t diff = (int32_t)samples[i] - (int32_t)median;
+            int32_t diff = (int32_t)sorted[i] - (int32_t)median;
             if (diff < 0) diff = -diff;
             if ((uint16_t)diff <= thresh) {
-                sum += samples[i];
+                sum += sorted[i];
                 count++;
             }
         }
-        uint16_t thr_raw = (count > 0) ? (uint16_t)(sum / count) : median;
-
-        static float thr_ema = 0.0f;
-        static bool  thr_init = false;
-        if (!thr_init) {
-            thr_ema = (float)thr_raw;
-            thr_init = true;
-        } else {
-            thr_ema += kThrottleFilterAlpha * ((float)thr_raw - thr_ema);
-        }
-        g_bldc_state.throttle_raw = (uint16_t)(thr_ema + 0.5f);
+        g_bldc_state.throttle_raw = (count > 0) ? (uint16_t)(sum / count) : median;
     } else {
         g_bldc_state.throttle_raw = 0;  // WiFi ON: silnik wyłączony, przepustnica zignorowana
     }
@@ -3983,7 +3988,7 @@ static String executeCommand(const String& cmd) {
         Serial.printf("disp_req:      %d (%s)\n", cfg.display_required, cfg.display_required ? "TAK" : "NIE");
         Serial.println("               Blokada silnika gdy wyswietlacz S866 nie jest polaczony.");
         Serial.printf("thr_samples:   %d\n", cfg.thr_samples);
-        Serial.println("               Liczba probek ADC w jednym odczycie gazu (burst). Wiecej=gladszy, wolniejszy.");
+        Serial.println("               Glebokosc bufora kolowego gazu. 1 probka/loop, mediana z N. Wiecej=gladszy.");
         Serial.printf("thr_outlier:   %d\n", cfg.thr_outlier_thresh);
         Serial.println("               Max odchylenie probki od mediany (ADC). Probki dalsze odrzucane jako szum.");
         Serial.printf("duty_step:     %d %%\n",   cfg.duty_max_step_pct);
@@ -4253,10 +4258,10 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <details><summary>&#128295; Ustawienia systemowe</summary><div class="card">
 <div class="row"><label>Wymagany wy&#347;wietlacz</label><select id="disp_rq"><option value="1">TAK (silnik tylko z display)</option><option value="0">NIE (standalone OK)</option></select><button onclick="cmd('cfg:dispreq:'+v('disp_rq'))">Ustaw</button></div>
 <p class="hint">Blokada silnika gdy wy&#347;wietlacz S866 nie jest pod&#322;&#261;czony. TAK=silnik wymaga display, NIE=dzia&#322;a samodzielnie.</p>
-<div class="row"><label>Throttle pr&#243;bki burst</label><input type="number" id="thr_n" min="2" max="16" step="1"><button onclick="cmd('cfg:thrsamp:'+v('thr_n'))">Ustaw</button></div>
-<p class="hint">Liczba pr&#243;bek ADC gazu w jednym odczycie. Wi&#281;cej = g&#322;adszy sygna&#322;, ale wolniejsza reakcja. Zakres 2-16.</p>
+<div class="row"><label>Throttle bufor pr&#243;bek</label><input type="number" id="thr_n" min="2" max="16" step="1"><button onclick="cmd('cfg:thrsamp:'+v('thr_n'))">Ustaw</button></div>
+<p class="hint">G&#322;&#281;boko&#347;&#263; bufora ko&#322;owego gazu: 1 pr&#243;bka ADC na iteracj&#281; loop(), mediana z N. Wi&#281;cej = g&#322;adszy sygna&#322;. Zakres 2-16.</p>
 <div class="row"><label>Throttle max odchylenie</label><input type="number" id="thr_d" min="10" max="2000" step="10"><button onclick="cmd('cfg:thrdelta:'+v('thr_d'))">Ustaw</button></div>
-<p class="hint">Pr&#243;bki ADC oddalone od mediany o wi&#281;cej ni&#380; ta warto&#347;&#263; s&#261; odrzucane jako szum EMI. Zakres 10-2000.</p>
+<p class="hint">Pr&#243;bki ADC z bufora ko&#322;owego oddalone od mediany o wi&#281;cej ni&#380; ta warto&#347;&#263; s&#261; odrzucane jako szum EMI. Zakres 10-2000.</p>
 </div></details>
 <details><summary>&#128260; Parametry FOC</summary><div class="card">
 <div class="row"><label>Tryb napi&#281;ciowy (fvolt)</label><span id="fvolt_st" class="sv">-</span><button onclick="doFvolt()">Prze&#322;&#261;cz fvolt</button><button class="w" onclick="queueCmd('fpitune')">&#10141; Kolejka: fpitune</button></div>
