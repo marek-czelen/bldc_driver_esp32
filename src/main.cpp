@@ -149,12 +149,18 @@ volatile bool g_pas_dir_invert_isr = false;   ///< Kopia pas_dir_invert dla ISR 
 volatile uint32_t g_pas_debounce_us_isr = 3000; ///< Kopia pas_debounce_us dla ISR (ustawiana z config)
 volatile uint32_t g_pas_edge_count = 0;       ///< Licznik krawędzi PAS (ISR inkrementuje)
 
+/// PAS sampling: timer co PAS_SAMPLE_INTERVAL_US próbkuje pin zamiast przerwania.
+/// Stan zmieni się dopiero po g_pas_filter_depth kolejnych zgodnych próbkach.
+/// Eliminuje szpilki EMI z silnika (<1ms) które nie utrzymają się N×500µs.
+#define PAS_SAMPLE_INTERVAL_US  500   ///< Okres próbkowania PAS [µs] (2 kHz)
+#define PAS_DEBOUNCE_US_DEFAULT 3000  ///< Domyślny czas potwierdzenia stanu [µs]
+volatile uint8_t  g_pas_filter_count = 0;     ///< Ile kolejnych próbek różni się od stanu filtrowanego
+volatile bool     g_pas_filtered_state = false; ///< Aktualny przefiltrowany stan pinu PAS
+volatile uint8_t  g_pas_filter_depth = 6;     ///< Ile zgodnych próbek do zmiany stanu (debounce_us/500)
+static esp_timer_handle_t g_pas_sample_timer = nullptr;
+
 /// Minimalny półokres PAS: odrzucaj krawędzie szybsze niż 5ms (debounce półokresów)
 #define PAS_MIN_HALFPERIOD_US   5000
-/// Debounce PAS domyślny (compile-time fallback, runtime: g_pas_debounce_us_isr z EEPROM).
-/// Filtruje szpilki EMI z silnika (us-1ms) które fałszywie odświeżają timestampy.
-/// Przy max 150 RPM × 12 magnesów: min edge-to-edge = 16.7ms → 3ms ma 5.5× margines.
-#define PAS_DEBOUNCE_US_DEFAULT 3000
 /// Minimalna różnica duty cycle do detekcji kierunku (%)
 /// Jeśli |HIGH-LOW| < 5% okresu → magnesy symetryczne, zakładamy forward
 #define PAS_DIR_MIN_ASYMMETRY   5
@@ -892,25 +898,14 @@ void IRAM_ATTR onSpeedPulse() {
  * Jeśli magnesy są symetryczne (różnica < PAS_DIR_MIN_ASYMMETRY%),
  * zakładamy forward — nie można jednoznacznie określić kierunku.
  */
-void IRAM_ATTR onPasPulse() {
-    uint32_t now_us = (uint32_t)esp_timer_get_time();
-
-    // --- Debounce: ignoruj szpilki szumowe z silnika ---
-    // Szpilki EMI z pracy silnika trwają µs do ~1ms i fałszywie odpalają ISR.
-    // Bez tego filtra: szpilka odświeża g_pas_last_fwd_pulse_us → timeout nigdy
-    // nie zachodzi → motor pracuje mimo pedałowania wstecz lub braku PAS.
-    // Realne impulsy PAS mają min ~5ms (asymetryczny half-period przy 150 RPM/12 mag).
-    if (g_pas_last_pulse_us > 0 && (now_us - g_pas_last_pulse_us) < g_pas_debounce_us_isr) {
-        return;  // szpilka szumowa — ignoruj całkowicie
-    }
-
-    bool pin_high = (GPIO.in >> PIN_PAS) & 1;  // szybki odczyt GPIO
-
+/**
+ * @brief Przetwarzanie krawędzi PAS po przejściu filtra cyfrowego.
+ *
+ * Wywoływane z timera próbkującego gdy przefiltrowany stan pinu się zmienił.
+ * Zawiera logikę detekcji kierunku (asymetria HIGH/LOW) i aktualizację timestampów.
+ */
+static void IRAM_ATTR processPasFilteredEdge(bool pin_high, uint32_t now_us) {
     // --- Detekcja długiej przerwy → reset pomiarów HIGH/LOW ---
-    // Jeśli od ostatniej krawędzi minęło > 2s, stare pomiary HIGH/LOW są nieaktualne.
-    // Bez tego: po długiej przerwie nowy pomiar HIGH miesza się ze starym LOW
-    // z innego okresu, co fałszuje detekcję kierunku (np. stare L:59ms + nowe H:31ms
-    // → fałszywy "wstecz").  Reset tutaj jest bezpieczny — jedyny pisarz to ISR.
     if (g_pas_last_pulse_us > 0 && (now_us - g_pas_last_pulse_us) > 2000000UL) {
         g_pas_high_time_us   = 0;
         g_pas_low_time_us    = 0;
@@ -918,7 +913,7 @@ void IRAM_ATTR onPasPulse() {
         g_pas_rising_us      = 0;
         g_pas_falling_us     = 0;
         g_pas_dir_confidence = 0;
-        g_pas_forward        = true;  // po przerwie zakładamy forward (domyślny)
+        g_pas_forward        = true;
     }
 
     if (pin_high) {
@@ -945,8 +940,6 @@ void IRAM_ATTR onPasPulse() {
             uint32_t period = g_pas_high_time_us + g_pas_low_time_us;
             g_pas_period_us = period;
 
-            // Detekcja kierunku: porównaj HIGH vs LOW time
-            // Asymetria musi przekraczać próg (symetryczne magnesy → forward)
             uint32_t diff = (g_pas_high_time_us > g_pas_low_time_us)
                           ? (g_pas_high_time_us - g_pas_low_time_us)
                           : (g_pas_low_time_us - g_pas_high_time_us);
@@ -954,7 +947,6 @@ void IRAM_ATTR onPasPulse() {
             if (diff > threshold) {
                 bool should_fwd = (g_pas_high_time_us > g_pas_low_time_us);
                 if (g_pas_dir_invert_isr) should_fwd = !should_fwd;
-                // Histereza: wymagaj kilku zgodnych krawędzi przed zmianą kierunku
                 if (should_fwd) {
                     if (g_pas_dir_confidence < 5) g_pas_dir_confidence++;
                 } else {
@@ -962,22 +954,48 @@ void IRAM_ATTR onPasPulse() {
                 }
                 g_pas_forward = (g_pas_dir_confidence > 0);
             }
-            // diff <= threshold: magnesy symetryczne — kierunek nieznany, zachowaj ostatni.
         }
     }
 
     g_pas_last_pulse_us = now_us;
 
-    // g_pas_last_fwd_pulse_us — czas ostatniego impulsu uznanego za FORWARD.
-    // Aktualizowany W ISR na podstawie g_pas_forward (ustawianego wyżej).
-    // Kluczowe: gdy PAS stoi (ISR nie odpala) → ten timestamp starzeje się naturalnie.
-    // Gdy PAS kręci wstecz: ISR odpala, g_pas_forward=false → timestamp nie odświeżany → starzeje się.
-    // Używany przez calculatePasDuty() do wykrycia braku pedałowania forward (timed_out).
     if (g_pas_forward) {
         g_pas_last_fwd_pulse_us = now_us;
     }
 
     g_pas_edge_count++;
+}
+
+/**
+ * @brief Timer ISR: próbkowanie pinu PAS co PAS_SAMPLE_INTERVAL_US (500µs = 2kHz).
+ *
+ * Zamiast reagować na każde zbocze (w tym szpilki EMI), próbkujemy pin
+ * z ustaloną częstotliwością i wymagamy N kolejnych zgodnych próbek
+ * przed uznaniem zmiany stanu. Szpilki EMI (<1ms) nie utrzymają się
+ * przez N×500µs i zostaną odfiltrowane.
+ *
+ * g_pas_filter_depth = pas_debounce_us / PAS_SAMPLE_INTERVAL_US
+ * Np. debounce=3000µs → depth=6 → zmiana stanu wymaga 3ms ciągłego sygnału.
+ */
+void IRAM_ATTR onPasSampleTimer(void* arg) {
+    bool raw = (GPIO.in >> PIN_PAS) & 1;
+
+    if (raw == g_pas_filtered_state) {
+        // Próbka zgodna z aktualnym stanem — reset licznika
+        g_pas_filter_count = 0;
+        return;
+    }
+
+    // Próbka różni się od przefiltrowanego stanu
+    if (++g_pas_filter_count >= g_pas_filter_depth) {
+        // N kolejnych próbek potwierdziło nowy stan → akceptuj zmianę
+        g_pas_filter_count = 0;
+        g_pas_filtered_state = raw;
+
+        // Przefiltrowana krawędź — przetwórz jak dawne przerwanie
+        uint32_t now_us = (uint32_t)esp_timer_get_time();
+        processPasFilteredEdge(raw, now_us);
+    }
 }
 
 // ============================================================================
@@ -1028,9 +1046,22 @@ void setup() {
     // Przerwanie na pinie SPEED (czujnik zewnętrzny — aktywne przy P07<=1)
     attachInterrupt(digitalPinToInterrupt(PIN_SPEED), onSpeedPulse, FALLING);
 
-    // PAS (Pedal Assist Sensor) — przerwanie na obu zboczach (detekcja kierunku)
-    attachInterrupt(digitalPinToInterrupt(PIN_PAS), onPasPulse, CHANGE);
-    Serial.println("[OK] Przerwanie SPEED (GPIO21) + PAS (GPIO22) gotowe [v3]");
+    // PAS (Pedal Assist Sensor) — timer próbkujący zamiast przerwania.
+    // Próbkowanie co 500µs (2kHz), filtr cyfrowy: N zgodnych próbek do zmiany stanu.
+    // Odporność na szpilki EMI z silnika — szpilka musi trwać N×500µs żeby przejść.
+    g_pas_filter_depth = (uint8_t)(g_pas_debounce_us_isr / PAS_SAMPLE_INTERVAL_US);
+    if (g_pas_filter_depth < 2) g_pas_filter_depth = 2;
+    g_pas_filtered_state = (GPIO.in >> PIN_PAS) & 1;  // stan początkowy
+    {
+        esp_timer_create_args_t timer_args = {};
+        timer_args.callback = onPasSampleTimer;
+        timer_args.name = "pas_sample";
+        timer_args.dispatch_method = ESP_TIMER_TASK;  // callback z task (nie ISR)
+        esp_timer_create(&timer_args, &g_pas_sample_timer);
+        esp_timer_start_periodic(g_pas_sample_timer, PAS_SAMPLE_INTERVAL_US);
+    }
+    Serial.printf("[OK] PAS sampling timer: %d us, filter depth: %d (debounce %lu us)\n",
+                  PAS_SAMPLE_INTERVAL_US, g_pas_filter_depth, (unsigned long)g_pas_debounce_us_isr);
 
     // Inicjalizacja PWM
     initPWM();
@@ -3855,7 +3886,8 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_start_delay:  %u ms\n", (unsigned)config_get().pas_start_delay_ms);
         Serial.printf("pas_stop_delay:   %u ms\n", (unsigned)config_get().pas_stop_delay_ms);
         Serial.printf("pas_ramp:         %u ms\n", (unsigned)config_get().pas_ramp_ms);
-        Serial.printf("pas_debounce:     %lu us\n", (unsigned long)g_pas_debounce_us_isr);
+        Serial.printf("pas_debounce:     %lu us (filter depth: %d, sample: %d us)\n",
+                      (unsigned long)g_pas_debounce_us_isr, (int)g_pas_filter_depth, PAS_SAMPLE_INTERVAL_US);
         Serial.printf("P13 magnets:      %d\n", (int)g_display.config.p13_pas_magnets);
         Serial.println("================================");
         return "";
@@ -3892,8 +3924,11 @@ static String executeCommand(const String& cmd) {
         if (val >= 500 && val <= 10000) {
             config_get().pas_debounce_us = (uint16_t)val;
             g_pas_debounce_us_isr = (uint32_t)val;
+            uint8_t depth = (uint8_t)(val / PAS_SAMPLE_INTERVAL_US);
+            if (depth < 2) depth = 2;
+            g_pas_filter_depth = depth;
             config_save();
-            return "PAS debounce: " + String(val) + " us";
+            return "PAS debounce: " + String(val) + " us (filter depth: " + String(depth) + ")";
         }
         return "Zakres 500-10000 us";
     }
@@ -3942,8 +3977,9 @@ static String executeCommand(const String& cmd) {
         Serial.println("               Czas bez impulsow PAS po ktorym silnik wylacza wspomaganie.");
         Serial.printf("pas_ramp_ms:   %u ms\n",  (unsigned)cfg.pas_ramp_ms);
         Serial.println("               Soft-start PAS: czas narastania mocy 0->100% po aktywacji.");
-        Serial.printf("pas_dbnc_us:   %u us\n",  (unsigned)cfg.pas_debounce_us);
-        Serial.println("               Filtr szpilek EMI z silnika na czujniku PAS. Min. odstep miedzy impulsami.");
+        Serial.printf("pas_dbnc_us:   %u us (filter: %d probek x %d us)\n",
+                      (unsigned)cfg.pas_debounce_us, (int)g_pas_filter_depth, PAS_SAMPLE_INTERVAL_US);
+        Serial.println("               Czas potwierdzenia stanu PAS. Probkowanie co 500us, N zgodnych = zmiana stanu.");
         Serial.printf("disp_req:      %d (%s)\n", cfg.display_required, cfg.display_required ? "TAK" : "NIE");
         Serial.println("               Blokada silnika gdy wyswietlacz S866 nie jest polaczony.");
         Serial.printf("thr_samples:   %d\n", cfg.thr_samples);
@@ -4063,6 +4099,7 @@ static String executeCommand(const String& cmd) {
             g_bldc_state.regen_enabled  = false;
             g_pas_dir_invert_isr        = false;
             g_pas_debounce_us_isr       = PAS_DEBOUNCE_US_DEFAULT;
+            { uint8_t d = (uint8_t)(PAS_DEBOUNCE_US_DEFAULT / PAS_SAMPLE_INTERVAL_US); g_pas_filter_depth = (d < 2) ? 2 : d; }
             g_reverse_isr               = false;
             g_sine_hall_phase_offset    = 0;
             g_foc_pi_d.kp = g_foc_pi_q.kp = FOC_KP_DEFAULT;
@@ -4104,6 +4141,7 @@ static String executeCommand(const String& cmd) {
             g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
             g_foc_voltage_mode = (c.foc_voltage_mode != 0);
             g_pas_debounce_us_isr = (uint32_t)c.pas_debounce_us;
+            { uint8_t d = (uint8_t)(g_pas_debounce_us_isr / PAS_SAMPLE_INTERVAL_US); g_pas_filter_depth = (d < 2) ? 2 : d; }
             // display_required nie wymaga sync — czytany bezpośrednio z config_get()
             // Przełącz tryb silnika jeśli skonfigurowany tryb rozni się od bieżącego
             drive_mode_t target_mode = (drive_mode_t)c.drive_mode;
@@ -4210,7 +4248,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="row"><label>Kierunek PAS</label><select id="pas_d"><option value="0">Normalny</option><option value="1">Odwr&#243;cony</option></select><button onclick="setPasDir()">Ustaw</button></div>
 <p class="hint">Inwersja kierunku czujnika PAS. U&#380;yj gdy silnik nap&#281;dza przy peda&#322;owaniu do ty&#322;u.</p>
 <div class="row"><label>Debounce PAS (&#181;s)</label><input type="number" id="pas_db" min="500" max="10000" step="100"><button onclick="cmd('pasdbnc:'+v('pas_db'))">Ustaw</button></div>
-<p class="hint">Filtr szpilek EMI z silnika na czujniku PAS. Minimalny odst&#281;p mi&#281;dzy impulsami. Domy&#347;lnie 3000 &#181;s.</p>
+<p class="hint">Filtr cyfrowy PAS: pin pr&#243;bkowany co 500&#181;s, zmiana stanu wymaga N kolejnych zgodnych pr&#243;bek (N=debounce/500). Szpilki EMI &lt;N&#215;500&#181;s s&#261; odfiltrowane.</p>
 </div></details>
 <details><summary>&#128295; Ustawienia systemowe</summary><div class="card">
 <div class="row"><label>Wymagany wy&#347;wietlacz</label><select id="disp_rq"><option value="1">TAK (silnik tylko z display)</option><option value="0">NIE (standalone OK)</option></select><button onclick="cmd('cfg:dispreq:'+v('disp_rq'))">Ustaw</button></div>
