@@ -143,6 +143,7 @@ volatile uint32_t g_pas_falling_us = 0;       ///< Czas ostatniego FALLING edge
 volatile uint32_t g_pas_high_time_us = 0;     ///< Czas trwania stanu HIGH [µs]
 volatile uint32_t g_pas_low_time_us = 0;      ///< Czas trwania stanu LOW [µs]
 volatile bool g_pas_forward = true;           ///< Kierunek pedałowania (asymetria duty cycle)
+volatile uint32_t g_pas_last_fwd_pulse_us = 0; ///< micros() ostatniej krawędzi PAS w kierunku FORWARD (aktualizowane tylko w ISR)
 volatile int8_t g_pas_dir_confidence = 0;     ///< Licznik pewności kierunku: >0=fwd, <0=rev (histereza ISR)
 volatile bool g_pas_dir_invert_isr = false;   ///< Kopia pas_dir_invert dla ISR (ustawiana w setup/cmd)
 volatile uint32_t g_pas_edge_count = 0;       ///< Licznik krawędzi PAS (ISR inkrementuje)
@@ -695,7 +696,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
 
     uint32_t now_us = (uint32_t)esp_timer_get_time();
     uint32_t now_ms = (uint32_t)(now_us / 1000);
-    uint32_t last_pulse = g_pas_last_pulse_us;  // snapshot volatile
+    uint32_t last_fwd_pulse = g_pas_last_fwd_pulse_us;  // snapshot volatile — ostatni FORWARD impuls z ISR
 
     // Parametry z EEPROM
     controller_config_t& cfg = config_get();
@@ -703,13 +704,19 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     uint32_t start_delay_ms = (uint32_t)cfg.pas_start_delay_ms;
     uint32_t ramp_ms = (uint32_t)cfg.pas_ramp_ms;
 
-    // --- Brak impulsów PAS przez stop_delay → przestał pedałować ---
-    // Warunek 1: cisza — brak krawędzi od stop_delay_us
-    // Warunek 2: zmierzony okres > stop_delay — magnesy zatrzymane generują sporadyczne
-    //            szpilki (17ms LOW co kilkanaście sekund), które resetują 'since', ale
-    //            zmierzony OKRES (H+L) jest wielokrotnie dłuższy niż stop_delay.
+    // --- Timeout: brak PAS FORWARD przez stop_delay → zatrzymaj wspomaganie ---
+    // g_pas_last_fwd_pulse_us jest odświeżane w ISR tylko przy g_pas_forward==true.
+    // PAS stoi  → ISR nie odpala       → timestamp starzeje się → timed_out ✓
+    // PAS wstecz → ISR odpala, fwd=false → timestamp nie odświeżany → timed_out ✓
+    // PAS forward → ISR odpala, fwd=true  → timestamp odświeżany  → timed_out ✗
+    //
+    // Stale dane HIGH/LOW po długiej przerwie: ISR sam resetuje pomiary
+    // gdy wykryje przerwę >2s (patrz początek onPasPulse).
+    //
+    // period_too_long: magnesy zatrzymane generują sporadyczne szpilki,
+    // które odnawiają last_pulse. Zmierzony okres H+L >> stop_delay → wykrycie.
     uint32_t period_us = g_pas_period_us;
-    bool timed_out = (last_pulse == 0) || ((now_us - last_pulse) > stop_delay_us);
+    bool timed_out = (last_fwd_pulse == 0) || ((now_us - last_fwd_pulse) >= stop_delay_us);
     bool period_too_long = (period_us > 0) && (period_us > stop_delay_us);
     if (timed_out || period_too_long) {
         g_pas_pedaling = false;
@@ -726,11 +733,11 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     }
 
     // --- Kierunek: reverse z holdoff ---
-    // Aktualizuj timestamp ostatniego forward
+    // g_pas_last_fwd_ms: timestamp ostatniego forward — dla pomiaru holdoff 300ms.
+    // Aktualizowany tutaj (po bloku timed_out) — działa poprawnie, bo timed_out już sprawdzony.
     if (g_pas_forward) {
         g_pas_last_fwd_ms = now_ms;
     }
-    // Sprawdzenie: czy ISR mówi reverse ORAZ minął holdoff?
     bool effective_reverse = !g_pas_forward
         && (g_pas_last_fwd_ms == 0 || (now_ms - g_pas_last_fwd_ms) > PAS_FWD_HOLDOFF_MS);
 
@@ -880,6 +887,21 @@ void IRAM_ATTR onPasPulse() {
     uint32_t now_us = (uint32_t)esp_timer_get_time();
     bool pin_high = (GPIO.in >> PIN_PAS) & 1;  // szybki odczyt GPIO
 
+    // --- Detekcja długiej przerwy → reset pomiarów HIGH/LOW ---
+    // Jeśli od ostatniej krawędzi minęło > 2s, stare pomiary HIGH/LOW są nieaktualne.
+    // Bez tego: po długiej przerwie nowy pomiar HIGH miesza się ze starym LOW
+    // z innego okresu, co fałszuje detekcję kierunku (np. stare L:59ms + nowe H:31ms
+    // → fałszywy "wstecz").  Reset tutaj jest bezpieczny — jedyny pisarz to ISR.
+    if (g_pas_last_pulse_us > 0 && (now_us - g_pas_last_pulse_us) > 2000000UL) {
+        g_pas_high_time_us   = 0;
+        g_pas_low_time_us    = 0;
+        g_pas_period_us      = 0;
+        g_pas_rising_us      = 0;
+        g_pas_falling_us     = 0;
+        g_pas_dir_confidence = 0;
+        g_pas_forward        = true;  // po przerwie zakładamy forward (domyślny)
+    }
+
     if (pin_high) {
         // RISING edge — koniec okresu LOW
         if (g_pas_falling_us > 0) {
@@ -921,11 +943,22 @@ void IRAM_ATTR onPasPulse() {
                 }
                 g_pas_forward = (g_pas_dir_confidence > 0);
             }
-            // Jeśli diff <= threshold: magnesy symetryczne, nie zmieniaj kierunku
+            // diff <= threshold: magnesy symetryczne — kierunek nieznany, zachowaj ostatni.
         }
     }
+
     g_pas_last_pulse_us = now_us;
-    g_pas_edge_count++;  // licznik krawędzi dla detekcji pedałowania
+
+    // g_pas_last_fwd_pulse_us — czas ostatniego impulsu uznanego za FORWARD.
+    // Aktualizowany W ISR na podstawie g_pas_forward (ustawianego wyżej).
+    // Kluczowe: gdy PAS stoi (ISR nie odpala) → ten timestamp starzeje się naturalnie.
+    // Gdy PAS kręci wstecz: ISR odpala, g_pas_forward=false → timestamp nie odświeżany → starzeje się.
+    // Używany przez calculatePasDuty() do wykrycia braku pedałowania forward (timed_out).
+    if (g_pas_forward) {
+        g_pas_last_fwd_pulse_us = now_us;
+    }
+
+    g_pas_edge_count++;
 }
 
 // ============================================================================
@@ -977,7 +1010,7 @@ void setup() {
 
     // PAS (Pedal Assist Sensor) — przerwanie na obu zboczach (detekcja kierunku)
     attachInterrupt(digitalPinToInterrupt(PIN_PAS), onPasPulse, CHANGE);
-    Serial.println("[OK] Przerwanie SPEED (GPIO21) gotowe");
+    Serial.println("[OK] Przerwanie SPEED (GPIO21) + PAS (GPIO22) gotowe [v3]");
 
     // Inicjalizacja PWM
     initPWM();
@@ -2158,7 +2191,7 @@ void printDiagnostics() {
 
         Serial.printf(
             "\n  [PAS] st:%s edges:%lu since:%lums H:%lums L:%lums asym:%d%% conf:%d fwd:%d "
-            "rpm:%.0f fwd_ms:%lu/%u ped:%d inv:%d",
+            "rpm:%.0f fwd_ms:%lu/%u ped:%d inv:%d pin:%d",
             pas_state,
             (unsigned long)g_pas_edge_count,
             (unsigned long)since_ms,
@@ -2171,7 +2204,8 @@ void printDiagnostics() {
             (unsigned long)fwd_elapsed_ms,
             (unsigned)config_get().pas_start_delay_ms,
             (int)g_pas_pedaling,
-            (int)g_pas_dir_invert_isr);
+            (int)g_pas_dir_invert_isr,
+            digitalRead(PIN_PAS));
 
         // Jeśli PAS aktywny — pokaż duty i V_target
         if (g_pas_pedaling) {
