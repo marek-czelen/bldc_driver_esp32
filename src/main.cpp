@@ -1,15 +1,24 @@
 /**
  * @file main.cpp
  * @brief BLDC Motor Driver — ESP32
- * @version 0.1.0
+ * @version 1.0.0
  *
  * Sterownik silnika BLDC (bezszczotkowego) 3-fazowego na ESP32.
- * Aktualnie obsługiwana metoda: komutacja blokowa (6-step / trapezoidalna).
+ * Obsługiwane metody sterowania:
+ *   - Komutacja blokowa (6-step / trapezoidalna)
+ *   - Komutacja sinusoidalna (ciągłe śledzenie kąta z LUT 97-wpisów)
+ *   - FOC (Field Oriented Control) — inverse Park/Clarke + SVPWM
  *
  * ## Architektura
  * Komutacja odbywa się w ISR timera sprzętowego (20 kHz), niezależnie od loop().
  * Dzięki temu Serial.printf() i inne wolne operacje w loop() nie powodują
  * zakłóceń w sterowaniu silnikiem.
+ *
+ * ## Filtracja wejść
+ * - PAS: timer próbkujący co 500µs + filtr cyfrowy (N zgodnych próbek)
+ * - Przepustnica: bufor kołowy 1 próbka/loop + mediana + outlier rejection
+ * - Hamulec: debounce z licznikiem kolejnych odczytów
+ * - Halle silnika: debounce w ISR komutacji (HALL_MIN_PERIOD_US)
  *
  * ## Sterowniki mostu
  * IR2103: HIN=active HIGH (high-side ON gdy HIGH),
@@ -21,6 +30,10 @@
  * loop() czyta ADC/Hall/GPIO → aktualizuje zmienne volatile → ISR odczytuje je
  * w każdym przerwaniu i ustawia odpowiednie kanały LEDC.
  *
+ * ## Konfiguracja
+ * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=11).
+ * Interfejs: Serial 115200 baud + WiFi AP (P17=1) z responsywnym UI.
+ *
  * ## Hardware
  * - MCU: ESP32-D0WDQ6, 240 MHz, Arduino via PlatformIO
  * - Gate drivers: 3x IR2103
@@ -28,6 +41,8 @@
  * - Czujniki Halla: GPIO5(A)/18(B)/19(C), INPUT_PULLUP
  * - VBAT dzielnik: 1.13 MΩ / 31.7 kΩ
  * - Przepustnica: GPIO2, ADC 400-2600 RAW → 0-100%
+ * - Wyświetlacz: S866 protokół 2, Serial2 9600 baud
+ * - PAS: GPIO22, timer sampling 2 kHz + filtr cyfrowy
  */
 
 #include <Arduino.h>
@@ -410,9 +425,6 @@ static const uint16_t DUTY_STEP = PWM_MAX_DUTY / 20;  // 5% kroku
 static const uint16_t THROTTLE_DEAD_ZONE = 400;
 static const uint16_t THROTTLE_MIN_RAW   = 400;   // 0% duty
 static const uint16_t THROTTLE_MAX_RAW   = 2600;  // 100% duty
-static const float kThrottleFilterAlpha  = 0.15f;  ///< EMA α dla przepustnicy (filtr szumów ADC2)
-                                                    //   α=0.15 @ 2kHz loop → τ≈3ms, 99% settling≈14ms
-                                                    //   Szpilka 1870→0 → po filtrze: 1590 (>400 dead zone)
 
 // Auto-status
 static bool g_autoStatus = false;
@@ -1016,7 +1028,8 @@ void setup() {
     
     Serial.println("==========================================");
     Serial.println("  BLDC Motor Driver - ESP32");
-    Serial.println("  Wersja: 0.2.0");
+    Serial.println("  Wersja: 1.0.0");
+    Serial.println("  BLOCK / SINUS / FOC | PAS | WiFi");
     Serial.println("==========================================");
     Serial.println();
 

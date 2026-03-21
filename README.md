@@ -1,8 +1,11 @@
 # BLDC Motor Driver — ESP32
 
+**Wersja firmware: 1.0.0** | CONFIG_VERSION: 11 | PlatformIO espressif32
+
 Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
 Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, **komutacja sinusoidalna** oraz **FOC (Field Oriented Control)**.  
 Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-startem i regulacją prędkości docelowej.  
+Konfiguracja przez **Serial 115200 baud** oraz **WiFi AP** (responsywny interfejs webowy).
 
 ---
 
@@ -27,8 +30,11 @@ Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-starte
 17. [Konfiguracja NVS](#konfiguracja-nvs)
 18. [Diagnostyka MOSFET — tryb testowy](#diagnostyka-mosfet--tryb-testowy)
 19. [FOC — Field Oriented Control](#foc--field-oriented-control)
-20. [Rozbudowa projektu](#rozbudowa-projektu)
-21. [Konfiguracja PlatformIO](#konfiguracja-platformio)
+20. [WiFi — interfejs konfiguracyjny WWW](#wifi--interfejs-konfiguracyjny-www)
+21. [Filtracja wejść — przegląd](#filtracja-wejść--przegląd)
+22. [Rozbudowa projektu](#rozbudowa-projektu)
+23. [Troubleshooting](#troubleshooting)
+24. [Konfiguracja PlatformIO](#konfiguracja-platformio)
 
 ---
 
@@ -1698,54 +1704,36 @@ ale z ramą dq.
 
 ## Rozbudowa projektu
 
-### 1. ~~Sterowanie sinusoidalne (DRIVE_MODE_SINUS)~~ — **ZAIMPLEMENTOWANE** ✓
-- Komenda `S` (natychmiastowa) lub `m2` + Enter — przełącza na tryb sinusoidalny
-- Szczegóły: patrz sekcja **Komutacja sinusoidalna** poniżej
+### Zaimplementowane w wersji 1.0.0
 
-### 2. ~~FOC (Field Oriented Control) (DRIVE_MODE_FOC)~~ — **ZAIMPLEMENTOWANE** ✓
-- Komenda `F` (natychmiastowa) lub `m3` + Enter — przełącza na tryb FOC
-- Feedforward + PI korekta, inverse Park/Clarke, SVPWM
-- Tryb napięciowy (`fvolt`) i tryb PI z pełną diagnostyką
-- Strojenie online: `fkp:`, `fki:`, `fkpd:`, `fkid:`
-- Szczegóły: patrz sekcja **FOC — Field Oriented Control**
-- **Ograniczenie:** pełna zamknięta pętla prądowa wymaga dwukierunkowych czujników
-  i ADC zsynchronizowanego z PWM (obecny sprzęt: feedforward + lekka korekta PI)
+| # | Funkcjonalność | Opis |
+|---|----------------|------|
+| 1 | **Komutacja sinusoidalna** | Komenda `S` / `m2` — tryb sinusoidalny z interpolacją kąta Hall |
+| 2 | **FOC (Field Oriented Control)** | Komenda `F` / `m3` — feedforward + PI, Park/Clarke, SVPWM, tryb napięciowy i PI |
+| 3 | **PAS — Pedal Assist Sensor** | Timer sampling 2 kHz, filtr cyfrowy, detekcja kierunku, soft-start, maszyna stanów |
+| 4 | **WiFi — interfejs WWW** | AP mode, responsive UI, REST API, kolejka komend trybu |
+| 5 | **Konfiguracja NVS (EEPROM)** | 21 parametrów, CONFIG_VERSION=11, Serial `cfg` + Web UI |
+| 6 | **Filtracja przepustnicy** | Ring buffer + median + odrzucanie outlierów (odporność na EMI) |
+| 7 | **Filtracja PAS** | Timer sampling 500 µs, N kolejnych zgodnych próbek (odporność na EMI) |
+| 8 | **Wyświetlacz S866** | Protokół 2, prędkość, moc, poziomy wspomagania, flaga `display_required` |
 
-### 3. Zabezpieczenia (rozszerzone)
+### Planowane rozszerzenia
+
+#### 1. Zabezpieczenia (rozszerzone)
 - Overcurrent: porównać `phase_current[i]` z progiem → `allMosfetsOff()` + `fault = true`
 - Overtemperature: po skalibrowanym czujniku
 - Undervoltage: sprawdzać `battery_voltage` < próg
 - TVS dioda na szynie DC jako hardwarowy clamp (regen overvoltage)
 
-### 4. Regulacja siły regen
+#### 2. Regulacja siły regen
 - Mapowanie siły hamowania z prędkości (szybciej → więcej hamowania)
 - Pętla prądowa: INA180A2 → limit prądu regen z P14
 - Konfiguracja duty regen z wyświetlacza lub komend Serial
 
-### 5. ~~PAS — Pedal Assist Sensor~~ — **ZAIMPLEMENTOWANE** ✓
-- Detekcja kierunku z histerezą ±5 w ISR, `pas_dir_invert` w NVS
-- Maszyna stanów IDLE→WAIT→ACTIVE z konfigurowalnymi opóźnieniami
-- V_target = 6 + Lx × (v_max − 6) / 15, soft-start, speed Moving Average (8 próbek)
-- Slew rate limiter (±30/call), forward holdoff 300 ms
-- Komendy Serial: `pasdir`, `passtart:N`, `passtop:N`, `pasramp:N`, `pasdbg`
-- Szczegóły: patrz sekcja **PAS — Pedal Assist Sensor**
+#### 3. Konfiguracja UART — rozszerzenie
+- Zmiana `THROTTLE_DEAD_ZONE`, `THROTTLE_MAX_RAW` bez rekompilacji
 
-### 6. ~~WiFi — interfejs konfiguracyjny WWW~~ — **ZAIMPLEMENTOWANE** ✓
-- P17=1 w menu wyświetlacza S866 → uruchamia WiFi AP + serwer HTTP, wyłącza silnik
-- P17=0 → zatrzymuje WiFi (ADC2 ponownie dostępne), wykonuje komendę z kolejki, silnik wraca do użytku
-- SSID: `BLDC_Config`, hasło: `bldc1234`, IP: `192.168.4.1`, port 80
-- Responsive UI: stan systemu, konfiguracja silnika, PAS, FOC, EEPROM, kolejka trybu
-- REST API: `GET /api/config` (JSON), `POST /api/cmd` (natychmiastowe komendy), `POST /api/queue` (kolejka trybu)
-- Komendy startujące silnik (`B`, `S`, `F`) przez `/api/cmd` zablokowane gdy WiFi aktywne — użyj kolejki
-- Szczegóły: patrz sekcja **WiFi — interfejs konfiguracyjny WWW**
-
-### 7. ~~Konfiguracja przez UART~~ — **CZĘŚCIOWO ZAIMPLEMENTOWANE** ✓
-- Komenda `cfg` — wyświetlanie konfiguracji NVS + runtime
-- Komendy `cfg:mode:N`, `cfg:ramp:N`, `cfg:regen:N` — zmiana i zapis do NVS
-- Komendy PAS: `pasdir`, `passtart:N`, `passtop:N`, `pasramp:N`
-- **Do rozbudowy:** zmiana `THROTTLE_DEAD_ZONE`, `THROTTLE_MAX_RAW` bez rekompilacji
-
-### 7. CAN bus / RS485
+#### 4. CAN bus / RS485
 - Gotowy pin UART_EN (GPIO17) sugeruje planowany RS485 lub CAN
 - Zaimplementować protokół ramki np. `$CMD,VALUE\n`
 
@@ -1769,5 +1757,6 @@ board_build.partitions = default.csv
 
 ---
 
-*Dokumentacja wygenerowana: 2025-07-17*  
-*Wersja firmware: 0.5.0 (PAS + FOC + PI auto-tune)*
+*Dokumentacja wygenerowana: 2026-03-21*  
+*Wersja firmware: 1.0.0 (BLOCK + SINUS + FOC + PAS + WiFi + NVS)*  
+*CONFIG_VERSION: 11 | controller_config_t: 64 bajty*
