@@ -42,7 +42,7 @@
  * w każdym przerwaniu TEZ i ustawia odpowiednie generatory MCPWM.
  *
  * ## Konfiguracja
- * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=12).
+ * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=13).
  * Interfejs: Serial 115200 baud + WiFi AP (P17=1) z responsywnym UI.
  *
  * ## Hardware
@@ -85,6 +85,8 @@ volatile uint16_t g_duty_isr = 0;
 volatile bool g_motor_enabled = false;
 volatile bool g_brake_isr = false;
 volatile drive_mode_t g_mode_isr = DRIVE_MODE_DISABLED;   ///< Tryb sterowania (do ISR)
+static uint16_t g_pwm_freq_hz = PWM_FREQUENCY;           ///< Aktualna częstotliwość PWM [Hz]
+static uint16_t applyPwmFrequency(uint16_t freq_hz);     ///< Forward declaration
 
 // Pomiar RPM z przejść Halla (aktualizowane w ISR timera)
 volatile uint8_t g_hall_prev_isr = 0;         ///< Poprzedni stan Halla w ISR
@@ -168,6 +170,18 @@ volatile uint32_t g_dbg_corr_count = 0;        ///< Licznik łagodnych korekcji 
 // Pomiar RPM z pinu SPEED (GPIO ISR, dla silników przekładniowych, P07==1)
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
 volatile uint32_t g_speed_period_us = 0;      ///< Okres między impulsami SPEED [µs]
+volatile uint32_t g_speed_pulse_count = 0;    ///< Licznik zaakceptowanych impulsów SPEED
+volatile uint32_t g_speed_reject_count = 0;   ///< Licznik odrzuconych impulsów (debounce)
+#define SPEED_DEBOUNCE_US  30000              ///< Min okres SPEED [µs] (~250 km/h @26")
+
+// Mediana z 3 ostatnich pomiarów okresu SPEED (filtr outlier)
+static uint32_t g_speed_period_buf[3] = {0, 0, 0};
+static uint8_t  g_speed_period_idx = 0;
+static uint8_t  g_speed_period_valid = 0;  ///< Ile pomiarów w buforze (0..3)
+static uint32_t g_speed_outlier_count = 0; ///< Ile pomiarów odrzuconych jako outlier (>3x lub <1/3 mediany)
+static uint8_t  g_speed_pulses_per_rev = 1; ///< Impulsy SPEED na obrót koła (z NVS, kalibracja: spdcal)
+static uint32_t g_speed_last_processed_sp = 0;  ///< Ostatni przetworzony period ISR (skip duplikatów)
+static uint32_t g_speed_last_accepted_us = 0;   ///< Timestamp ostatniego zaakceptowanego pomiaru do mediany
 
 // PAS (Pedal Assist Sensor) — pomiar kadencji i kierunku z przerwania GPIO
 volatile uint32_t g_pas_last_pulse_us = 0;    ///< micros() ostatniej krawędzi PAS
@@ -193,11 +207,11 @@ volatile bool     g_pas_filtered_state = false; ///< Aktualny przefiltrowany sta
 volatile uint8_t  g_pas_filter_depth = 6;     ///< Ile zgodnych próbek do zmiany stanu (debounce_us/500)
 static esp_timer_handle_t g_pas_sample_timer = nullptr;
 
-/// Minimalny półokres PAS: odrzucaj krawędzie szybsze niż 5ms (debounce półokresów)
-#define PAS_MIN_HALFPERIOD_US   5000
+/// Minimalny półokres PAS: domyślnie 5ms — nadpisywany z NVS (pas_min_halfperiod_ms)
+static uint32_t g_pas_min_halfperiod_us = 5000;
 /// Minimalna różnica duty cycle do detekcji kierunku (%)
-/// Jeśli |HIGH-LOW| < 5% okresu → magnesy symetryczne, zakładamy forward
-#define PAS_DIR_MIN_ASYMMETRY   5
+/// Domyślnie 5% — nadpisywany z NVS (pas_dir_asymmetry_pct)
+static uint8_t g_pas_dir_min_asymmetry = 5;
 
 // Regeneracja — zmienne volatile dla ISR
 volatile bool g_regen_active_isr = false;     ///< Tryb regen aktywny (do ISR)
@@ -350,7 +364,12 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prędkość startowa ≈ 1 obr.elekt./s (52428800/166666)
 #define SINE_STALL_FALLBACK_MS  400             // minimalny timeout fallback (histereza, anty-szarpanie)
 #define SINE_START_MAX_HALL_US  30000           // max okres Halla (min prędkość) do wejścia w SINUS
-#define SINE_PHASE_CORR_SHIFT   2               // korekcja 1/4 błędu na przejście Halla
+#define SINE_PHASE_CORR_SHIFT   1               // korekcja 1/2 błędu na przejście Halla
+                                                // (było 2 = 1/4, ale silniki z małą liczbą
+                                                //  biegunów mają mało korekcji/obrót → drift)
+#define SINE_SPEED_CORR_ENABLE  1               // PLL: korekcja prędkości na przejściu Halla
+                                                // err>0 = kąt za wolny → zwiększ prędkość
+                                                // err<0 = kąt za szybki → zmniejsz prędkość
 #define SINE_SPEED_FILTER_SHIFT 1               // filtr prędkości: 1/2 new + 1/2 old
 
 /**
@@ -631,6 +650,43 @@ static uint16_t g_atune_test_duty    = 0;        ///< Duty testowe (10% domyśln
 static const unsigned long ATUNE_SETTLE_MS  = 400;  ///< Czas stabilizacji [ms]
 static const unsigned long ATUNE_MEASURE_MS = 600;  ///< Czas pomiaru [ms]
 
+// PAS Auto-tune (komenda 'pasat')
+// Zbiera statystyki sygnału PAS przez PASAT_MEASURE_S sekund,
+// potem oblicza i ustawia optymalne parametry filtra PAS.
+enum PasAtState : uint8_t {
+    PASAT_IDLE = 0,
+    PASAT_INIT,
+    PASAT_MEASURE,
+    PASAT_DONE
+};
+static PasAtState g_pasat_state = PASAT_IDLE;
+static unsigned long g_pasat_start_ms        = 0;
+static uint32_t g_pasat_edge_start           = 0;     ///< g_pas_edge_count na starcie
+static uint32_t g_pasat_min_halfperiod_us    = UINT32_MAX;
+static uint32_t g_pasat_max_halfperiod_us    = 0;
+static uint64_t g_pasat_sum_halfperiod_us    = 0;
+static uint32_t g_pasat_halfperiod_count     = 0;
+static uint64_t g_pasat_sum_asymmetry_x100   = 0;     ///< Suma asymetrii * 100
+static uint32_t g_pasat_asymmetry_count      = 0;
+static uint32_t g_pasat_max_asymmetry_x100   = 0;     ///< Max zmierzona asymetria * 100
+static uint32_t g_pasat_prev_high_us         = 0;     ///< Poprzedni odczyt g_pas_high_time_us
+static uint32_t g_pasat_prev_low_us          = 0;     ///< Poprzedni odczyt g_pas_low_time_us
+static const unsigned long PASAT_MEASURE_S   = 10;    ///< Czas pomiaru [s]
+
+// SPEED Calibration (komenda 'spdcal')
+// Kalibracja: użytkownik kręci kołem 3 pełne obroty w 15 s,
+// firmware zlicza impulsy i oblicza pulses_per_rev.
+enum SpdCalState : uint8_t {
+    SPDCAL_IDLE = 0,
+    SPDCAL_INIT,
+    SPDCAL_MEASURE,
+    SPDCAL_DONE
+};
+static SpdCalState g_spdcal_state       = SPDCAL_IDLE;
+static unsigned long g_spdcal_start_ms  = 0;
+static uint32_t g_spdcal_pulse_start    = 0;    ///< g_speed_pulse_count na starcie
+static const unsigned long SPDCAL_MEASURE_S = 15;  ///< Czas pomiaru [s]
+
 // Wyświetlacz S866 (zawsze aktywny na Serial2)
 static s866_display_t g_display;
 
@@ -673,12 +729,10 @@ static uint16_t getAssistMaxDuty() {
 
 /**
  * @brief Pobiera limit prędkości [km/h] z parametru P08.
- * @return Limit prędkości w km/h (fallback: 25 km/h)
+ * @return Limit prędkości w km/h. 0 = brak limitu (wyłączony).
  */
 static uint8_t getSpeedLimitKmh() {
-    uint8_t limit = g_display.config.p08_speed_limit;
-    if (limit == 0) limit = 25;
-    return limit;
+    return g_display.config.p08_speed_limit;
 }
 
 /**
@@ -724,6 +778,11 @@ static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
         return 0;
     }
     uint8_t limit_kmh = getSpeedLimitKmh();
+    if (limit_kmh == 0) {
+        // P08==0: brak limitu prędkości — pełna moc bez ograniczeń
+        g_speed_limit_factor = 1.0f;
+        return duty_in;
+    }
     float limit_f = (float)limit_kmh;
 
     // Oblicz surowy współczynnik mocy (0.0 .. 1.0)
@@ -838,11 +897,11 @@ static uint8_t g_pas_speed_ma_idx = 0;
 static bool g_pas_speed_ma_full = false;
 
 /// Maksymalna zmiana duty PAS na jedno wywołanie (slew rate)
-/// ~3% PWM_MAX_DUTY. Przy 2kHz loop = ~60%/s max.
-#define PAS_SLEW_RATE_MAX  30
+/// Domyślnie 30 (~6% PWM_MAX_DUTY). Nadpisywany z NVS (pas_slew_rate).
+static uint16_t g_pas_slew_rate_max = 30;
 /// Czas podtrzymania stanu forward po krótkim "reverse" [ms]
-/// Zapobiega chwilowemu wyłączeniu PAS na szumie kierunku.
-#define PAS_FWD_HOLDOFF_MS  300
+/// Domyślnie 300. Nadpisywany z NVS (pas_fwd_holdoff_ms).
+static uint16_t g_pas_fwd_holdoff_ms = 300;
 
 /**
  * @brief Oblicza prędkość koła [km/h] z wheeltime_ms i rozmiaru koła P06.
@@ -927,8 +986,8 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_active_since_ms = 0;
         g_pas_vtarget_smooth = 0.0f;
         // Slew rate w dół: łagodne wygaszenie zamiast twardego 0
-        if (g_pas_prev_duty > PAS_SLEW_RATE_MAX) {
-            g_pas_prev_duty -= PAS_SLEW_RATE_MAX;
+        if (g_pas_prev_duty > g_pas_slew_rate_max) {
+            g_pas_prev_duty -= g_pas_slew_rate_max;
             return g_pas_prev_duty;
         }
         g_pas_prev_duty = 0;
@@ -936,21 +995,21 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     }
 
     // --- Kierunek: reverse z holdoff ---
-    // g_pas_last_fwd_ms: timestamp ostatniego forward — dla pomiaru holdoff 300ms.
+    // g_pas_last_fwd_ms: timestamp ostatniego forward — dla pomiaru holdoff.
     // Aktualizowany tutaj (po bloku timed_out) — działa poprawnie, bo timed_out już sprawdzony.
     if (g_pas_forward) {
         g_pas_last_fwd_ms = now_ms;
     }
     bool effective_reverse = !g_pas_forward
-        && (g_pas_last_fwd_ms == 0 || (now_ms - g_pas_last_fwd_ms) > PAS_FWD_HOLDOFF_MS);
+        && (g_pas_last_fwd_ms == 0 || (now_ms - g_pas_last_fwd_ms) > g_pas_fwd_holdoff_ms);
 
     if (effective_reverse) {
         g_pas_pedaling = false;
         g_pas_fwd_since_ms = 0;
         g_pas_active_since_ms = 0;
         g_pas_vtarget_smooth = 0.0f;
-        if (g_pas_prev_duty > PAS_SLEW_RATE_MAX) {
-            g_pas_prev_duty -= PAS_SLEW_RATE_MAX;
+        if (g_pas_prev_duty > g_pas_slew_rate_max) {
+            g_pas_prev_duty -= g_pas_slew_rate_max;
             return g_pas_prev_duty;
         }
         g_pas_prev_duty = 0;
@@ -986,7 +1045,9 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     // --- V_target z poziomu wspomagania (z wygładzeniem) ---
     uint8_t raw_assist = g_display.rx.assist_level;     // 0..15 (raw, niezależne od P05)
     uint8_t v_max = g_display.config.p08_speed_limit;
-    if (v_max == 0) v_max = 25;
+    // P08==0: brak limitu prędkości → PAS zawsze pełna moc (speed_factor=1)
+    bool pas_speed_unlimited = (v_max == 0);
+    if (v_max == 0) v_max = 25;  // fallback dla obliczeń v_target (nie ogranicza)
     float v_target_raw = 6.0f + (float)raw_assist * ((float)v_max - 6.0f) / 15.0f;
 
     // Smooth V_target: zapobiega szarpnięciom przy zmianie assist level w trakcie jazdy.
@@ -1016,7 +1077,9 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
 
     // --- Speed ramp-down (strefa 3 km/h) ---
     float speed_factor;
-    if (speed_kmh >= v_target) {
+    if (pas_speed_unlimited) {
+        speed_factor = 1.0f;  // P08==0: brak limitu → zawsze pełna moc
+    } else if (speed_kmh >= v_target) {
         speed_factor = 0.0f;
     } else if (speed_kmh > v_target - 3.0f) {
         // Liniowa redukcja: v_target-3 = 100%, v_target = 0%
@@ -1033,17 +1096,17 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     uint16_t target_duty = (uint16_t)(factor * (float)PWM_MAX_DUTY);
     if (target_duty > PWM_MAX_DUTY) target_duty = PWM_MAX_DUTY;
 
-    // --- Slew rate limiter: max ±PAS_SLEW_RATE_MAX na wywołanie ---
+    // --- Slew rate limiter: max ±g_pas_slew_rate_max na wywołanie ---
     uint16_t result;
     if (target_duty > g_pas_prev_duty) {
         uint16_t step = target_duty - g_pas_prev_duty;
-        result = (step > PAS_SLEW_RATE_MAX)
-            ? (g_pas_prev_duty + PAS_SLEW_RATE_MAX)
+        result = (step > g_pas_slew_rate_max)
+            ? (g_pas_prev_duty + g_pas_slew_rate_max)
             : target_duty;
     } else {
         uint16_t step = g_pas_prev_duty - target_duty;
-        result = (step > PAS_SLEW_RATE_MAX)
-            ? (g_pas_prev_duty - PAS_SLEW_RATE_MAX)
+        result = (step > g_pas_slew_rate_max)
+            ? (g_pas_prev_duty - g_pas_slew_rate_max)
             : target_duty;
     }
     g_pas_prev_duty = result;
@@ -1065,7 +1128,13 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
 void IRAM_ATTR onSpeedPulse() {
     uint32_t now_us = (uint32_t)esp_timer_get_time();
     if (g_speed_last_pulse_us > 0) {
-        g_speed_period_us = now_us - g_speed_last_pulse_us;
+        uint32_t dt = now_us - g_speed_last_pulse_us;
+        if (dt < SPEED_DEBOUNCE_US) {
+            g_speed_reject_count++;
+            return;  // bounce — za krótki interwał
+        }
+        g_speed_period_us = dt;
+        g_speed_pulse_count++;
     }
     g_speed_last_pulse_us = now_us;
 }
@@ -1108,7 +1177,7 @@ static void IRAM_ATTR processPasFilteredEdge(bool pin_high, uint32_t now_us) {
         // RISING edge — koniec okresu LOW
         if (g_pas_falling_us > 0) {
             uint32_t low_time = now_us - g_pas_falling_us;
-            if (low_time >= PAS_MIN_HALFPERIOD_US) {
+            if (low_time >= g_pas_min_halfperiod_us) {
                 g_pas_low_time_us = low_time;
             }
         }
@@ -1117,7 +1186,7 @@ static void IRAM_ATTR processPasFilteredEdge(bool pin_high, uint32_t now_us) {
         // FALLING edge — koniec okresu HIGH
         if (g_pas_rising_us > 0) {
             uint32_t high_time = now_us - g_pas_rising_us;
-            if (high_time >= PAS_MIN_HALFPERIOD_US) {
+            if (high_time >= g_pas_min_halfperiod_us) {
                 g_pas_high_time_us = high_time;
             }
         }
@@ -1131,7 +1200,7 @@ static void IRAM_ATTR processPasFilteredEdge(bool pin_high, uint32_t now_us) {
             uint32_t diff = (g_pas_high_time_us > g_pas_low_time_us)
                           ? (g_pas_high_time_us - g_pas_low_time_us)
                           : (g_pas_low_time_us - g_pas_high_time_us);
-            uint32_t threshold = period * PAS_DIR_MIN_ASYMMETRY / 100;
+            uint32_t threshold = period * g_pas_dir_min_asymmetry / 100;
             if (diff > threshold) {
                 bool should_fwd = (g_pas_high_time_us > g_pas_low_time_us);
                 if (g_pas_dir_invert_isr) should_fwd = !should_fwd;
@@ -1220,6 +1289,12 @@ void setup() {
     g_bldc_state.regen_enabled = (cfg.regen_enabled != 0);
     g_pas_dir_invert_isr = (cfg.pas_dir_invert != 0);
     g_pas_debounce_us_isr = (uint32_t)cfg.pas_debounce_us;
+    g_pas_min_halfperiod_us = (uint32_t)cfg.pas_min_halfperiod_ms * 1000;
+    g_pas_dir_min_asymmetry = cfg.pas_dir_asymmetry_pct;
+    g_pas_slew_rate_max     = cfg.pas_slew_rate;
+    g_pas_fwd_holdoff_ms    = cfg.pas_fwd_holdoff_ms;
+    g_speed_pulses_per_rev  = cfg.speed_pulses_per_rev;
+    if (g_speed_pulses_per_rev < 1) g_speed_pulses_per_rev = 1;
     g_reverse_isr = (cfg.motor_reverse != 0);
 
     // Inicjalizacja regulatorów PI dla FOC — z wartościami zapisanymi w NVS
@@ -1288,6 +1363,15 @@ void setup() {
     // Timer sprzętowy do komutacji (co 50 us = 20 kHz)
     initCommutationTimer();
     Serial.println("[OK] Timer komutacji uruchomiony (20 kHz)");
+
+    // Zastosuj częstotliwość PWM z NVS (jeśli inna niż domyślna 20 kHz)
+    if (cfg.pwm_freq_hz >= 8000 && cfg.pwm_freq_hz <= 32000 && cfg.pwm_freq_hz != PWM_FREQUENCY) {
+        uint16_t actual = applyPwmFrequency(cfg.pwm_freq_hz);
+        Serial.printf("[OK] PWM freq z NVS: %u Hz (żądane: %u Hz)\n", actual, cfg.pwm_freq_hz);
+    } else {
+        g_pwm_freq_hz = PWM_FREQUENCY;
+    }
+
     Serial.printf("[OK] Rampa rozpędzania: %d ms (0→100%%)\n", g_bldc_state.ramp_time_ms);
 
     // Inicjalizacja wyświetlacza S866 na Serial2 (GPIO4/GPIO16)
@@ -1457,6 +1541,269 @@ static void autoTuneStep() {
     }
 }
 
+/**
+ * @brief PAS auto-tune — krok maszyny stanów (wywoływany z updateMotorState).
+ *
+ * Zbiera statystyki sygnału PAS przez PASAT_MEASURE_S sekund:
+ * - min/max/avg półokres (HIGH time, LOW time)
+ * - średnia/max asymetria H/L
+ * - liczba krawędzi
+ *
+ * Na koniec oblicza i ustawia optymalne parametry filtra PAS:
+ * - pas_min_halfperiod_ms: 50% minimalnego zmierzonego półokresu
+ * - pas_dir_asymmetry_pct: 60% średniej zmierzonej asymetrii (min 3%)
+ * - pas_debounce_us: 30% minimalnego półokresu (min 500µs)
+ */
+static void pasAutoTuneStep() {
+    if (g_pasat_state == PASAT_IDLE) return;
+
+    unsigned long now = millis();
+
+    switch (g_pasat_state) {
+    case PASAT_INIT: {
+        g_pasat_start_ms = now;
+        g_pasat_edge_start = g_pas_edge_count;
+        g_pasat_min_halfperiod_us = UINT32_MAX;
+        g_pasat_max_halfperiod_us = 0;
+        g_pasat_sum_halfperiod_us = 0;
+        g_pasat_halfperiod_count = 0;
+        g_pasat_sum_asymmetry_x100 = 0;
+        g_pasat_asymmetry_count = 0;
+        g_pasat_max_asymmetry_x100 = 0;
+        g_pasat_prev_high_us = 0;
+        g_pasat_prev_low_us = 0;
+        Serial.println("[PASAT] === PAS Auto-tune start ===");
+        Serial.printf("[PASAT] Pedaluj rownomiernie przez %lu sekund...\n", PASAT_MEASURE_S);
+        g_pasat_state = PASAT_MEASURE;
+        break;
+    }
+
+    case PASAT_MEASURE: {
+        // Odczytaj bieżące pomiary PAS (snapshot volatile)
+        uint32_t ht = g_pas_high_time_us;
+        uint32_t lt = g_pas_low_time_us;
+
+        // Nowy pomiar HIGH — różny od poprzedniego snapshot
+        if (ht > 0 && ht != g_pasat_prev_high_us) {
+            g_pasat_prev_high_us = ht;
+            if (ht < g_pasat_min_halfperiod_us) g_pasat_min_halfperiod_us = ht;
+            if (ht > g_pasat_max_halfperiod_us) g_pasat_max_halfperiod_us = ht;
+            g_pasat_sum_halfperiod_us += ht;
+            g_pasat_halfperiod_count++;
+        }
+        // Nowy pomiar LOW
+        if (lt > 0 && lt != g_pasat_prev_low_us) {
+            g_pasat_prev_low_us = lt;
+            if (lt < g_pasat_min_halfperiod_us) g_pasat_min_halfperiod_us = lt;
+            if (lt > g_pasat_max_halfperiod_us) g_pasat_max_halfperiod_us = lt;
+            g_pasat_sum_halfperiod_us += lt;
+            g_pasat_halfperiod_count++;
+        }
+
+        // Asymetria (gdy oba dostępne)
+        if (ht > 0 && lt > 0) {
+            uint32_t sum = ht + lt;
+            uint32_t diff = (ht > lt) ? (ht - lt) : (lt - ht);
+            uint32_t asym_x100 = diff * 100 / sum;  // asymetria w %
+            // Zbieraj unikalne pomiary (zmiana któregokolwiek)
+            if (ht != g_pasat_prev_high_us || lt != g_pasat_prev_low_us) {
+                // Pomiary już zaktualizowane powyżej, ale asymetrię liczymy osobno
+            }
+            // Zawsze aktualizuj max asymetrię
+            if (asym_x100 > g_pasat_max_asymmetry_x100) g_pasat_max_asymmetry_x100 = asym_x100;
+            // Zbieraj średnią asymetrii co ~100ms
+            static unsigned long s_last_asym_ms = 0;
+            if (now - s_last_asym_ms >= 100) {
+                s_last_asym_ms = now;
+                g_pasat_sum_asymmetry_x100 += asym_x100;
+                g_pasat_asymmetry_count++;
+            }
+        }
+
+        // Progress co 2s
+        unsigned long elapsed_s = (now - g_pasat_start_ms) / 1000;
+        static unsigned long s_last_progress_s = UINT32_MAX;
+        if (elapsed_s != s_last_progress_s && (elapsed_s % 2) == 0 && elapsed_s > 0) {
+            s_last_progress_s = elapsed_s;
+            uint32_t edges = g_pas_edge_count - g_pasat_edge_start;
+            Serial.printf("[PASAT] %lu/%lus: %lu krawedzi, %lu pomiarow halfperiod\n",
+                          elapsed_s, PASAT_MEASURE_S, (unsigned long)edges,
+                          (unsigned long)g_pasat_halfperiod_count);
+        }
+
+        // Koniec pomiaru
+        if ((now - g_pasat_start_ms) >= PASAT_MEASURE_S * 1000UL) {
+            g_pasat_state = PASAT_DONE;
+        }
+        break;
+    }
+
+    case PASAT_DONE: {
+        uint32_t total_edges = g_pas_edge_count - g_pasat_edge_start;
+
+        Serial.println("[PASAT] === Wyniki pomiaru ===");
+        Serial.printf("[PASAT] Krawedzi PAS:       %lu\n", (unsigned long)total_edges);
+        Serial.printf("[PASAT] Pomiarow halfperiod: %lu\n", (unsigned long)g_pasat_halfperiod_count);
+
+        if (g_pasat_halfperiod_count < 10) {
+            Serial.println("[PASAT] BLAD: Za malo danych! Pedaluj szybciej/dluzej.");
+            Serial.println("[PASAT] Parametry NIE zmienione.");
+            g_pasat_state = PASAT_IDLE;
+            break;
+        }
+
+        uint32_t avg_hp_us = (uint32_t)(g_pasat_sum_halfperiod_us / g_pasat_halfperiod_count);
+        uint32_t avg_asym = (g_pasat_asymmetry_count > 0)
+            ? (uint32_t)(g_pasat_sum_asymmetry_x100 / g_pasat_asymmetry_count)
+            : 0;
+
+        Serial.printf("[PASAT] Halfperiod min:     %lu us\n", (unsigned long)g_pasat_min_halfperiod_us);
+        Serial.printf("[PASAT] Halfperiod max:     %lu us\n", (unsigned long)g_pasat_max_halfperiod_us);
+        Serial.printf("[PASAT] Halfperiod avg:     %lu us\n", (unsigned long)avg_hp_us);
+        Serial.printf("[PASAT] Asymetria avg:      %lu %%\n", (unsigned long)avg_asym);
+        Serial.printf("[PASAT] Asymetria max:      %lu %%\n", (unsigned long)g_pasat_max_asymmetry_x100);
+
+        // === Oblicz optymalne parametry ===
+        // min_halfperiod: 50% minimalnego zmierzonego (margines na szybsze pedałowanie)
+        uint32_t new_halfperiod_ms = (g_pasat_min_halfperiod_us / 2) / 1000;
+        if (new_halfperiod_ms < 1) new_halfperiod_ms = 1;
+        if (new_halfperiod_ms > 200) new_halfperiod_ms = 200;
+
+        // debounce: 30% minimalnego półokresu (wystarczający do odfiltrowania szumów)
+        uint32_t new_debounce_us = g_pasat_min_halfperiod_us * 30 / 100;
+        if (new_debounce_us < 500) new_debounce_us = 500;
+        if (new_debounce_us > 10000) new_debounce_us = 10000;
+        // Zaokrąglij do wielokrotności PAS_SAMPLE_INTERVAL_US
+        new_debounce_us = (new_debounce_us / PAS_SAMPLE_INTERVAL_US) * PAS_SAMPLE_INTERVAL_US;
+        if (new_debounce_us < 500) new_debounce_us = 500;
+
+        // asymetria: 60% średniej (z marginesem) ale minimum 3%
+        uint32_t new_asymmetry = avg_asym * 60 / 100;
+        if (new_asymmetry < 3) new_asymmetry = 3;
+        if (new_asymmetry > 50) new_asymmetry = 50;
+
+        Serial.println("[PASAT] === Nowe parametry ===");
+        Serial.printf("[PASAT] pas_min_halfperiod_ms: %lu (bylo: %u)\n",
+                      (unsigned long)new_halfperiod_ms, (unsigned)config_get().pas_min_halfperiod_ms);
+        Serial.printf("[PASAT] pas_debounce_us:       %lu (bylo: %u)\n",
+                      (unsigned long)new_debounce_us, (unsigned)config_get().pas_debounce_us);
+        Serial.printf("[PASAT] pas_dir_asymmetry_pct: %lu (bylo: %u)\n",
+                      (unsigned long)new_asymmetry, (unsigned)config_get().pas_dir_asymmetry_pct);
+
+        // Zastosuj parametry
+        controller_config_t& cfg = config_get();
+        cfg.pas_min_halfperiod_ms = (uint8_t)new_halfperiod_ms;
+        g_pas_min_halfperiod_us = new_halfperiod_ms * 1000;
+
+        cfg.pas_debounce_us = (uint16_t)new_debounce_us;
+        g_pas_debounce_us_isr = new_debounce_us;
+        uint8_t depth = (uint8_t)(new_debounce_us / PAS_SAMPLE_INTERVAL_US);
+        if (depth < 2) depth = 2;
+        g_pas_filter_depth = depth;
+
+        cfg.pas_dir_asymmetry_pct = (uint8_t)new_asymmetry;
+        g_pas_dir_min_asymmetry = (uint8_t)new_asymmetry;
+
+        config_save();
+
+        Serial.println("[PASAT] Parametry zapisane do NVS.");
+        Serial.println("[PASAT] Slew rate i holdoff nie zmienione (ustaw recznie: passlew:N, pashold:N).");
+        Serial.println("[PASAT] === Auto-tune zakonczony ===");
+
+        g_pasat_state = PASAT_IDLE;
+        break;
+    }
+
+    default:
+        g_pasat_state = PASAT_IDLE;
+        break;
+    }
+}
+
+/**
+ * @brief Krok maszyny stanów kalibracji czujnika SPEED.
+ *
+ * Procedura: użytkownik kręci kołem dokładnie 3 pełne obroty w 15 sekund.
+ * Firmware zlicza impulsy SPEED i oblicza pulses_per_rev = total / 3.
+ * Wynik zapisywany do NVS.
+ */
+static void spdCalStep() {
+    if (g_spdcal_state == SPDCAL_IDLE) return;
+
+    unsigned long now = millis();
+
+    switch (g_spdcal_state) {
+    case SPDCAL_INIT: {
+        g_spdcal_start_ms = now;
+        g_spdcal_pulse_start = g_speed_pulse_count;
+        Serial.println("[SPDCAL] === Kalibracja SPEED start ===");
+        Serial.printf("[SPDCAL] Obroc kolo dokladnie 3 razy w ciagu %lu sekund.\n", SPDCAL_MEASURE_S);
+        Serial.println("[SPDCAL] Silnik musi byc wylaczony! Krec reka.");
+        g_spdcal_state = SPDCAL_MEASURE;
+        break;
+    }
+
+    case SPDCAL_MEASURE: {
+        unsigned long elapsed_s = (now - g_spdcal_start_ms) / 1000;
+        static unsigned long s_last_progress_s = UINT32_MAX;
+        if (elapsed_s != s_last_progress_s && (elapsed_s % 3) == 0 && elapsed_s > 0) {
+            s_last_progress_s = elapsed_s;
+            uint32_t pulses = g_speed_pulse_count - g_spdcal_pulse_start;
+            Serial.printf("[SPDCAL] %lu/%lus: %lu impulsow\n",
+                          elapsed_s, SPDCAL_MEASURE_S, (unsigned long)pulses);
+        }
+        if ((now - g_spdcal_start_ms) >= SPDCAL_MEASURE_S * 1000UL) {
+            g_spdcal_state = SPDCAL_DONE;
+        }
+        break;
+    }
+
+    case SPDCAL_DONE: {
+        uint32_t total_pulses = g_speed_pulse_count - g_spdcal_pulse_start;
+
+        Serial.println("[SPDCAL] === Wyniki kalibracji ===");
+        Serial.printf("[SPDCAL] Impulsy SPEED:     %lu\n", (unsigned long)total_pulses);
+
+        if (total_pulses < 6) {
+            Serial.println("[SPDCAL] BLAD: Za malo impulsow (<6)! Krec szybciej/sprawdz czujnik.");
+            Serial.println("[SPDCAL] Parametry NIE zmienione.");
+            g_spdcal_state = SPDCAL_IDLE;
+            break;
+        }
+
+        // Zaokrąglij do najbliższej: total_pulses / 3 obrotów
+        uint8_t ppr = (uint8_t)((total_pulses + 1) / 3);
+        if (ppr < 1) ppr = 1;
+        if (ppr > 20) ppr = 20;
+
+        Serial.printf("[SPDCAL] Obliczony pulses_per_rev: %d (bylo: %d)\n",
+                      (int)ppr, (int)g_speed_pulses_per_rev);
+
+        // Zastosuj i zapisz
+        g_speed_pulses_per_rev = ppr;
+        config_get().speed_pulses_per_rev = ppr;
+        config_save();
+
+        // Reset filtra mediany (nowe parametry → czysta historia)
+        g_speed_period_valid = 0;
+        g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
+        g_speed_last_accepted_us = 0;
+        g_speed_outlier_count = 0;
+
+        Serial.println("[SPDCAL] Zapisano do NVS.");
+        Serial.printf("[SPDCAL] Wheeltime teraz = period_us * %d\n", (int)ppr);
+        Serial.println("[SPDCAL] === Kalibracja zakonczona ===");
+
+        g_spdcal_state = SPDCAL_IDLE;
+        break;
+    }
+
+    default:
+        g_spdcal_state = SPDCAL_IDLE;
+        break;
+    }
+}
+
 // ============================================================================
 // Loop
 // ============================================================================
@@ -1502,7 +1849,7 @@ void loop() {
 
         // --- Oblicz kadencję PAS i prędkość koła ---
         g_bldc_state.pas_cadence_rpm = calculatePasCadence();
-        g_bldc_state.wheel_speed_kmh = calculateWheelSpeedKmh();
+        // wheel_speed_kmh obliczana po aktualizacji wheeltime_ms (w display block poniżej)
         float speed_kmh = g_bldc_state.wheel_speed_kmh;
 
         // --- Throttle duty ---
@@ -1750,10 +2097,16 @@ void loop() {
                         // Ultimate gain: Ku = 4*d/(π*a)
                         float ku = 4.0f * g_foc_at_relay_amp / (3.14159f * avg_amp);
 
-                        // Ziegler-Nichols PI: Kp = 0.45*Ku, Ti = Tu/1.2, Ki = Kp/Ti
-                        float kp_new = 0.45f * ku;
-                        float ti = tu_s / 1.2f;
-                        float ki_new = (ti > 0.0001f) ? (kp_new / ti) : 0.0f;
+                        // Konserwatywne PI (Tyreus-Luyben, bezpieczniejsze niż Z-N):
+                        // Kp = 0.30*Ku (Z-N: 0.45), Ki = Kp/(2.2*Tu)  (Z-N: Kp*1.2/Tu)
+                        float kp_new = 0.30f * ku;
+                        float ki_new = (tu_s > 0.001f) ? (kp_new / (2.2f * tu_s)) : 0.0f;
+
+                        // Sanity clamp — zapobiegaj absurdalnym wartościom
+                        if (kp_new > 5.0f) kp_new = 5.0f;
+                        if (ki_new > 50.0f) ki_new = 50.0f;
+                        if (kp_new < 0.01f) kp_new = FOC_KP_DEFAULT;
+                        if (ki_new < 0.01f) ki_new = FOC_KI_DEFAULT;
 
                         Serial.printf("  Oscylacje: %d przejsc, amplituda=%.3f A, Tu=%.4f s\n",
                                       g_foc_at_crossings, avg_amp, tu_s);
@@ -2009,7 +2362,64 @@ void loop() {
             uint32_t now_us = (uint32_t)esp_timer_get_time();
             // Timeout: jeśli >3s od ostatniego impulsu → koło stoi
             if (sp > 0 && sp < 10000000 && last > 0 && (now_us - last) < 3000000) {
-                wt_us = sp;  // 1 impuls = 1 obrót koła
+                // Przetwarzaj każdy nowy impuls ISR tylko raz (skip duplikatów)
+                if (sp != g_speed_last_processed_sp) {
+                    g_speed_last_processed_sp = sp;
+
+                    // Stale median reset: jeśli mediana ważna ale żaden impuls
+                    // nie zaakceptowany >3s, warunki się zmieniły — reset filtra
+                    if (g_speed_period_valid >= 3 && g_speed_last_accepted_us > 0
+                        && (now_us - g_speed_last_accepted_us) > 3000000) {
+                        g_speed_period_valid = 0;
+                        g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
+                    }
+
+                    // Outlier rejection: nowy pomiar akceptowany tylko gdy
+                    // jest w zakresie 1/3..3x aktualnej mediany (gdy mediana dostępna).
+                    bool accept = true;
+                    if (g_speed_period_valid >= 3) {
+                        uint32_t a = g_speed_period_buf[0];
+                        uint32_t b = g_speed_period_buf[1];
+                        uint32_t c = g_speed_period_buf[2];
+                        if (a > b) { uint32_t t = a; a = b; b = t; }
+                        if (b > c) { uint32_t t = b; b = c; c = t; }
+                        if (a > b) { uint32_t t = a; a = b; b = t; }
+                        uint32_t median = b;
+                        if (sp < median / 3 || sp > median * 3) {
+                            accept = false;
+                            g_speed_outlier_count++;
+                        }
+                    }
+                    if (accept) {
+                        g_speed_period_buf[g_speed_period_idx] = sp;
+                        g_speed_period_idx = (g_speed_period_idx + 1) % 3;
+                        if (g_speed_period_valid < 3) g_speed_period_valid++;
+                        g_speed_last_accepted_us = now_us;
+                    }
+                }
+                // Oblicz medianę (lub surowy) do wheeltime
+                if (g_speed_period_valid >= 3) {
+                    uint32_t a = g_speed_period_buf[0];
+                    uint32_t b = g_speed_period_buf[1];
+                    uint32_t c = g_speed_period_buf[2];
+                    if (a > b) { uint32_t t = a; a = b; b = t; }
+                    if (b > c) { uint32_t t = b; b = c; c = t; }
+                    if (a > b) { uint32_t t = a; a = b; b = t; }
+                    wt_us = b;  // mediana
+                } else if (g_speed_period_valid > 0) {
+                    wt_us = g_speed_period_buf[(g_speed_period_idx + 2) % 3]; // ostatni zaakceptowany
+                } else {
+                    wt_us = sp;
+                }
+            } else if ((now_us - last) >= 3000000) {
+                // Koło stanęło — reset mediany (włącznie z zawartością bufora)
+                g_speed_period_valid = 0;
+                g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
+                g_speed_last_accepted_us = 0;
+            }
+            // Przelicz: period_jednego_impulsu × impulsy_na_obrót = czas_obrotu_koła
+            if (wt_us > 0 && g_speed_pulses_per_rev > 1) {
+                wt_us *= g_speed_pulses_per_rev;
             }
         } else {
             // P07 > 1: direct-drive hub, P07 = hall transitions per wheel revolution
@@ -2036,6 +2446,9 @@ void loop() {
             g_bldc_state.rpm = 0;
         }
 
+        // Prędkość koła — oblicz tutaj, po aktualizacji wheeltime_ms
+        g_bldc_state.wheel_speed_kmh = calculateWheelSpeedKmh();
+
         // Obsługa protokołu wyswietlacza
         s866_service(&g_display);
     }
@@ -2044,25 +2457,36 @@ void loop() {
     processSerialCommands();
 
     // Serwer WWW konfiguracji: P17=1 → WiFi+HTTP ON, silnik OFF; P17=0 → WiFi OFF, wykonaj kolejkę
+    // UWAGA: P17 przetwarzamy TYLKO gdy display podłączony. Przy odłączonym display
+    // szum EMI (szczególnie z SINUS/FOC) generuje fałszywe ramki S866 na Serial2
+    // (checksum XOR = 1/256 kolizji) → P17 "migocze" → fałszywy WiFi start/stop.
     {
-        static uint8_t s_prev_p17 = 0xFF;
-        const uint8_t p17 = g_display.config.p17_cruise_control;
-        if (p17 != s_prev_p17) {
-            s_prev_p17 = p17;
-            if (p17 != 0) {
-                webConfigInit();
-            } else {
-                webConfigStop();
-                // Zawsze przeladuj config z EEPROM po wyjsciu z WiFi —
-                // przywraca tryb silnika, wszystkie parametry runtime.
-                executeCommand("cfg:reload");
-                // Dopiero teraz wykonaj skoljkowana komende (silnik jest juz w trybie z EEPROM)
-                if (g_web_queued_cmd.length() > 0) {
-                    String qr = executeCommand(g_web_queued_cmd);
-                    Serial.printf("[WEB-Q] '%s' -> %s\n", g_web_queued_cmd.c_str(), qr.c_str());
-                    g_web_queued_cmd = "";
+        static uint8_t s_prev_p17 = 0;  // 0 = domyślne, nie triggeruje fałszywej zmiany
+        if (g_display.connected) {
+            const uint8_t p17 = g_display.config.p17_cruise_control;
+            if (p17 != s_prev_p17) {
+                s_prev_p17 = p17;
+                if (p17 != 0) {
+                    webConfigInit();
+                } else {
+                    webConfigStop();
+                    // Zawsze przeladuj config z EEPROM po wyjsciu z WiFi —
+                    // przywraca tryb silnika, wszystkie parametry runtime.
+                    executeCommand("cfg:reload");
+                    // Dopiero teraz wykonaj skoljkowana komende (silnik jest juz w trybie z EEPROM)
+                    if (g_web_queued_cmd.length() > 0) {
+                        String qr = executeCommand(g_web_queued_cmd);
+                        Serial.printf("[WEB-Q] '%s' -> %s\n", g_web_queued_cmd.c_str(), qr.c_str());
+                        g_web_queued_cmd = "";
+                    }
                 }
             }
+        } else {
+            // Display odłączony — wyłącz WiFi jeśli było aktywne
+            if (g_wifi_active) {
+                webConfigStop();
+            }
+            s_prev_p17 = 0;  // reset trackera
         }
         if (g_wifi_active) {
             webConfigHandle();
@@ -2095,6 +2519,12 @@ void loop() {
 
     // Auto-tune fazy sinusoidalnej (maszyna stanów)
     autoTuneStep();
+
+    // PAS auto-tune (maszyna stanów)
+    pasAutoTuneStep();
+
+    // SPEED calibration (maszyna stanów)
+    spdCalStep();
 }
 
 // ============================================================================
@@ -2174,6 +2604,53 @@ void initGPIO() {
     pinMode(PIN_EXT_1, INPUT_PULLUP);
     pinMode(PIN_EXT_2, INPUT);
     pinMode(PIN_EXT_3, INPUT);
+}
+
+// ============================================================================
+// Zmiana częstotliwości PWM w runtime
+// ============================================================================
+
+/**
+ * @brief Zmienia częstotliwość PWM przez modyfikację prescalera timera MCPWM.
+ *
+ * Period=500 (PWM_MAX_DUTY) nie zmienia się — duty 0-500 nadal odpowiada 0-100%.
+ * Zmienia się tylko prescaler timera: timer_clk = 160MHz / prescaler.
+ * freq = timer_clk / (2 × 500) = 160000 / prescaler
+ * prescaler = round(160000 / freq_hz)
+ *
+ * Dead-time ticks skalowany do ~500ns: ticks = timer_clk * 500ns = 160M/pre * 500e-9
+ *
+ * @param freq_hz  Żądana częstotliwość [Hz], zakres 8000-32000
+ * @return Faktyczna częstotliwość [Hz] po zaokrągleniu prescalera
+ */
+static uint16_t applyPwmFrequency(uint16_t freq_hz) {
+    if (freq_hz < 8000) freq_hz = 8000;
+    if (freq_hz > 32000) freq_hz = 32000;
+
+    // prescaler = round(160000 / freq)
+    uint8_t prescaler = (uint8_t)((160000UL + freq_hz / 2) / freq_hz);
+    if (prescaler < 5) prescaler = 5;    // max 32kHz
+    if (prescaler > 20) prescaler = 20;  // min 8kHz
+
+    uint16_t actual_freq = (uint16_t)(160000UL / prescaler);
+
+    // Dead-time: ~500ns = timer_clk * 500e-9 = (160M/pre) * 500e-9 = 80/pre
+    uint8_t dt_ticks = (uint8_t)(80 / prescaler);
+    if (dt_ticks < 2) dt_ticks = 2;
+
+    // Wyłącz silnik na czas zmiany prescalera
+    allMosfetsOff();
+
+    // Zmień prescaler i dead-time dla wszystkich 3 timerów
+    for (int t = 0; t < 3; t++) {
+        mcpwm_ll_timer_set_clock_prescale(&MCPWM0, t, prescaler);
+        // Period bez zmian (500) — PWM_MAX_DUTY zachowane
+    }
+    // Dead-time update (bypass mode — IR2103 robi own dead-time)
+    // Nie potrzebujemy zmieniać DT bo IR2103 ma wbudowany
+
+    g_pwm_freq_hz = actual_freq;
+    return actual_freq;
 }
 
 // ============================================================================
@@ -2685,9 +3162,24 @@ void printDiagnostics() {
         }
     }
 
-    // Prędkość koła [km/h]
-    if (g_bldc_state.wheel_speed_kmh > 0.5f) {
-        Serial.printf("\n  [SPD] %.1fkm/h ", g_bldc_state.wheel_speed_kmh);
+    // Prędkość koła [km/h] + debug SPEED
+    if (g_bldc_state.wheel_speed_kmh > 0.5f || g_speed_pulse_count > 0) {
+        uint32_t age_us = 0;
+        if (g_speed_last_pulse_us > 0) {
+            age_us = (uint32_t)esp_timer_get_time() - g_speed_last_pulse_us;
+        }
+        Serial.printf("\n  [SPD] %.1fkm/h per:%lums wt:%u ppr:%d pls:%lu rej:%lu out:%lu age:%lums med:[%lu,%lu,%lu]",
+            g_bldc_state.wheel_speed_kmh,
+            (unsigned long)(g_speed_period_us / 1000),
+            (unsigned)g_bldc_state.wheeltime_ms,
+            (int)g_speed_pulses_per_rev,
+            (unsigned long)g_speed_pulse_count,
+            (unsigned long)g_speed_reject_count,
+            (unsigned long)g_speed_outlier_count,
+            (unsigned long)(age_us / 1000),
+            (unsigned long)(g_speed_period_buf[0] / 1000),
+            (unsigned long)(g_speed_period_buf[1] / 1000),
+            (unsigned long)(g_speed_period_buf[2] / 1000));
     }
 
     // Debug SINUS/FOC: parametry śledzenia kąta
@@ -2860,11 +3352,15 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                         if (old_speed == 0) {
                             g_sine_speed_q16 = new_speed;
                         } else if (new_speed < old_speed) {
-                            // Deceleracja: szybki filtr 50/50.
-                            g_sine_speed_q16 = (old_speed + new_speed) >> 1;
+                            // Deceleracja: szybki filtr 75/25 (new dominant).
+                            // Wolniejszy filtr powoduje opóźniony kąt → oscylacje momentu
+                            // szczególnie na silnikach z małą liczbą biegunów.
+                            g_sine_speed_q16 = (old_speed + new_speed * 3) >> 2;
                         } else {
-                            // Akceleracja: wolny filtr 75/25.
-                            g_sine_speed_q16 = (old_speed * 3 + new_speed) >> 2;
+                            // Akceleracja: filtr 50/50 (szybszy niż poprzedni 75/25).
+                            // Na DD z wieloma biegunami i tak działa gładko (dużo korekcji/obrót).
+                            // Na przekładniowym wolny filtr powoduje lag → pole ciągnie do tyłu.
+                            g_sine_speed_q16 = (old_speed + new_speed) >> 1;
                         }
                     }
 
@@ -2894,12 +3390,25 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                         g_sine_angle_q16 = (uint32_t)expected;
                         g_dbg_snap_count++;
                     } else {
-                        // Normalna praca: łagodna korekcja 1/4 błędu
+                        // Normalna praca: łagodna korekcja 1/2 błędu kąta
                         int32_t new_angle = current + (err >> SINE_PHASE_CORR_SHIFT);
                         if (new_angle < 0) new_angle += (int32_t)SINE_TABLE_Q16_FULL;
                         if (new_angle >= (int32_t)SINE_TABLE_Q16_FULL) new_angle -= (int32_t)SINE_TABLE_Q16_FULL;
                         g_sine_angle_q16 = (uint32_t)new_angle;
                         g_dbg_corr_count++;
+
+#if SINE_SPEED_CORR_ENABLE
+                        // PLL: korekcja prędkości proporcjonalna do błędu kąta
+                        // err>0 → kąt za wolny → prędkość za mała → zwiększ
+                        // err<0 → kąt za szybki → prędkość za duża → zmniejsz
+                        // Formuła: spd_corr = 0.25 × err × speed / sector_q16
+                        // (err>>8)×speed>>14 = err×speed>>22 ≈ /4M ≈ 0.25/sector
+                        int32_t err_s = err >> 8;
+                        int32_t spd_corr = (err_s * (int32_t)g_sine_speed_q16) >> 14;
+                        int32_t new_spd = (int32_t)g_sine_speed_q16 + spd_corr;
+                        if (new_spd < 0) new_spd = 0;
+                        g_sine_speed_q16 = (uint32_t)new_spd;
+#endif
                     }
 
                     g_sine_last_hall_idx = new_idx;
@@ -3621,6 +4130,8 @@ void printHelp() {
     Serial.println("             0=bez limitu. Domyslnie 5%. Ogranicza szarpniecia mocy.");
     Serial.println("             Dziala razem z rampa (bardziej restrykcyjny wygrywa).");
     Serial.println("cfg:rev:N  Kierunek obrotow po restarcie: 0=CW (normalny), 1=CCW (odwrocony)");
+    Serial.println("pwmfreq    Pokaz aktualna czestotliwosc PWM [Hz]");
+    Serial.println("pwmfreq:N  Ustaw czestotliwosc PWM: 8000-32000 Hz (domyslnie 20000)");
     Serial.println("cfg:defaults  Zaladuj wartosci domyslne do runtime (bez zapisu EEPROM)");
     Serial.println("cfg:save      Zapisz aktualne wartosci runtime do EEPROM");
     Serial.println("cfg:reload    Wczytaj wartosci z EEPROM i zastosuj do runtime");
@@ -3630,6 +4141,13 @@ void printHelp() {
     Serial.println("  Detekcja kierunku: asymetria HIGH/LOW (histereza +/-5 impulsow).");
     Serial.println("  V_target z poziomu assist: 6 + Lx*(Vmax-6)/15 km/h, wygladzony.");
     Serial.println("  Freewheel: gdy Vkola >= Vtarget, duty=0 (motor nie przeszkadza).");
+    Serial.println();
+    Serial.println("---------- Diagnostyka predkosci (SPEED) ----------");
+    Serial.println("spddbg       Debug SPEED: okres, impulsy, odrzucone, mediana, pin state.");
+    Serial.println("spddbg0      Zerowanie licznikow SPEED (pulse/reject count).");
+    Serial.println("spdcal       Kalibracja SPEED: obroc kolo 3x w 15s -> oblicza pulses/rev.");
+    Serial.println("               Ponowne wpisanie spdcal anuluje trwajaca kalibracje.");
+    Serial.println("spdppr:N     Reczne ustawienie impulsow SPEED na obrot (1-20, domyslnie 1).");
     Serial.println();
     Serial.println("pasdir       Przelacz kierunek PAS normal/odwrocony (zapisuje do NVS).");
     Serial.println("               Jesli silnik krecisie wstecz przy pedalowaniu, uzyj tego.");
@@ -3644,6 +4162,16 @@ void printHelp() {
     Serial.println("               0=natychmiastowy start, 1500=lagodne narastanie ~1.5s.");
     Serial.println("pasdbg       Debug PAS ON/OFF: kierunek, kadencja RPM, V_target,");
     Serial.println("               V_smooth, speed_MA, duty, soft-start, stan automatu.");
+    Serial.println("pashalf:N    Min polokres PAS [ms], zakres 1-200 (domyslnie 5).");
+    Serial.println("               Impulsy krotsze odrzucane jako szum.");
+    Serial.println("pasasym:N    Prog asymetrii kierunku [%], zakres 1-50 (domyslnie 5).");
+    Serial.println("               Wieksza = mniej czuly detektor fwd/rev.");
+    Serial.println("passlew:N    Slew rate PAS duty, zakres 1-100 (domyslnie 30).");
+    Serial.println("               Max zmiana duty na iteracje loop. Mniejszy = lagodniej.");
+    Serial.println("pashold:N    Forward holdoff [ms], zakres 50-2000 (domyslnie 300).");
+    Serial.println("               Czas pedalowania fwd wymagany do uznania kierunku.");
+    Serial.println("pasat        PAS auto-tune: mierzy sygnal 10s, ustawia optymalne");
+    Serial.println("               debounce, min polokres i asymetrie. Pedaluj rownomiernie!");
     Serial.println();
     Serial.println("---------- Limit pradowy ----------");
     Serial.println("ilim:N       Limit pradu fazowego [A], zakres 0-50. 0=brak limitu.");
@@ -4087,7 +4615,13 @@ static String executeCommand(const String& cmd) {
             return "Auto-tune juz w toku...";
         }
         // Inicjalizacja stanu auto-tune
-        g_foc_at_relay_amp = 30.0f;
+        // Relay amplitude: 15% aktualnego duty (proporcjonalny do punktu pracy).
+        // Stała 30 PWM przy niskim duty (np. 25=5%) dawała ±120% oscylację
+        // → silnik saturował → tiny amplituda → kosmiczne Ku → absurdalne Kp/Ki.
+        float ff = (float)g_bldc_state.duty_cycle;
+        g_foc_at_relay_amp = ff * 0.15f;
+        if (g_foc_at_relay_amp < 5.0f) g_foc_at_relay_amp = 5.0f;
+        if (g_foc_at_relay_amp > 50.0f) g_foc_at_relay_amp = 50.0f;
         g_foc_at_start_ms = (uint32_t)millis();
         g_foc_at_crossings = 0;
         g_foc_at_first_cross_ms = 0;
@@ -4190,6 +4724,80 @@ static String executeCommand(const String& cmd) {
         config_save();
         return cfg.pas_dir_invert ? "PAS kierunek: ODWROCONY (H<L=forward)" : "PAS kierunek: NORMALNY (H>L=forward)";
     }
+    if (cmd == "spddbg") {
+        Serial.println();
+        Serial.println("========== SPEED DEBUG ==========");
+        uint32_t sp = g_speed_period_us;
+        uint32_t last = g_speed_last_pulse_us;
+        uint32_t now_us = (uint32_t)esp_timer_get_time();
+        uint32_t age_us = (last > 0) ? (now_us - last) : 0;
+        Serial.printf("period_us (raw):  %lu\n", (unsigned long)sp);
+        Serial.printf("last_pulse:       %lu us ago\n", (unsigned long)age_us);
+        Serial.printf("pulse_count:      %lu (accepted)\n", (unsigned long)g_speed_pulse_count);
+        Serial.printf("reject_count:     %lu (debounce < %d us)\n", (unsigned long)g_speed_reject_count, SPEED_DEBOUNCE_US);
+        Serial.printf("outlier_count:    %lu (outside 1/3..3x median)\n", (unsigned long)g_speed_outlier_count);
+        Serial.printf("pulses_per_rev:   %d (kalibracja: spdcal, reczne: spdppr:N)\n", (int)g_speed_pulses_per_rev);
+        Serial.printf("median_buf[]:     %lu, %lu, %lu us\n",
+                      (unsigned long)g_speed_period_buf[0],
+                      (unsigned long)g_speed_period_buf[1],
+                      (unsigned long)g_speed_period_buf[2]);
+        Serial.printf("median_valid:     %d/3\n", (int)g_speed_period_valid);
+        Serial.printf("wheeltime_ms:     %u\n", (unsigned)g_bldc_state.wheeltime_ms);
+        Serial.printf("wheel_speed:      %.1f km/h\n", g_bldc_state.wheel_speed_kmh);
+        Serial.printf("P06 (wheel):      %d.%d\"\n",
+                      g_display.config.p06_wheel_size_x10 / 10,
+                      g_display.config.p06_wheel_size_x10 % 10);
+        Serial.printf("P07 (magnets):    %d\n", (int)g_display.config.p07_speed_magnets);
+        Serial.printf("P08 (speed lim):  %d km/h%s\n",
+                      (int)g_display.config.p08_speed_limit,
+                      g_display.config.p08_speed_limit == 0 ? " (brak limitu)" : "");
+        Serial.printf("PIN_SPEED state:  %d\n", digitalRead(PIN_SPEED));
+        Serial.println("=================================");
+        return "";
+    }
+    if (cmd == "spddbg0") {
+        g_speed_pulse_count = 0;
+        g_speed_reject_count = 0;
+        g_speed_outlier_count = 0;
+        g_speed_period_valid = 0;
+        g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
+        g_speed_last_accepted_us = 0;
+        return "SPEED liczniki wyzerowane";
+    }
+    if (cmd == "spdcal") {
+        if (g_spdcal_state != SPDCAL_IDLE) {
+            g_spdcal_state = SPDCAL_IDLE;
+            return "[SPDCAL] Anulowano.";
+        }
+        g_spdcal_state = SPDCAL_INIT;
+        return "";
+    }
+    if (cmd.startsWith("spdppr:")) {
+        int val = cmd.substring(7).toInt();
+        if (val >= 1 && val <= 20) {
+            g_speed_pulses_per_rev = (uint8_t)val;
+            config_get().speed_pulses_per_rev = (uint8_t)val;
+            config_save();
+            g_speed_period_valid = 0;  // reset mediany
+            g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
+            g_speed_last_accepted_us = 0;
+            return "SPEED pulses_per_rev: " + String(val);
+        }
+        return "Zakres 1-20";
+    }
+    if (cmd.startsWith("pwmfreq:")) {
+        int val = cmd.substring(8).toInt();
+        if (val >= 8000 && val <= 32000) {
+            uint16_t actual = applyPwmFrequency((uint16_t)val);
+            config_get().pwm_freq_hz = actual;
+            config_save();
+            return "PWM freq: " + String(actual) + " Hz";
+        }
+        return "Zakres 8000-32000 Hz";
+    }
+    if (cmd == "pwmfreq") {
+        return "PWM freq: " + String(g_pwm_freq_hz) + " Hz";
+    }
     if (cmd == "pasdbg") {
         Serial.println();
         Serial.println("========== PAS DEBUG ==========");
@@ -4202,7 +4810,7 @@ static String executeCommand(const String& cmd) {
         if (sum > 0) {
             Serial.printf("Duty H/L:   %lu%% / %lu%%\n", (unsigned long)(ht * 100 / sum), (unsigned long)(lt * 100 / sum));
             uint32_t diff = (ht > lt) ? (ht - lt) : (lt - ht);
-            Serial.printf("Asymetria:  %lu%% (pr\xF3g: %d%%)\n", (unsigned long)(diff * 100 / sum), PAS_DIR_MIN_ASYMMETRY);
+            Serial.printf("Asymetria:  %lu%% (pr\xF3g: %d%%)\n", (unsigned long)(diff * 100 / sum), (int)g_pas_dir_min_asymmetry);
         }
         Serial.printf("g_pas_forward:    %d (confidence: %d)\n", (int)g_pas_forward, (int)g_pas_dir_confidence);
         Serial.printf("edge_count:       %lu\n", (unsigned long)g_pas_edge_count);
@@ -4216,8 +4824,20 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_ramp:         %u ms\n", (unsigned)config_get().pas_ramp_ms);
         Serial.printf("pas_debounce:     %lu us (filter depth: %d, sample: %d us)\n",
                       (unsigned long)g_pas_debounce_us_isr, (int)g_pas_filter_depth, PAS_SAMPLE_INTERVAL_US);
+        Serial.printf("min_halfperiod:   %lu us (%u ms)\n", (unsigned long)g_pas_min_halfperiod_us, (unsigned)config_get().pas_min_halfperiod_ms);
+        Serial.printf("dir_asymmetry:    %d %%\n", (int)g_pas_dir_min_asymmetry);
+        Serial.printf("slew_rate_max:    %d\n", (int)g_pas_slew_rate_max);
+        Serial.printf("fwd_holdoff:      %u ms\n", (unsigned)g_pas_fwd_holdoff_ms);
         Serial.printf("P13 magnets:      %d\n", (int)g_display.config.p13_pas_magnets);
         Serial.println("================================");
+        return "";
+    }
+    if (cmd == "pasat") {
+        if (g_pasat_state != PASAT_IDLE) {
+            g_pasat_state = PASAT_IDLE;
+            return "[PASAT] Anulowano.";
+        }
+        g_pasat_state = PASAT_INIT;
         return "";
     }
     if (cmd.startsWith("passtart:")) {
@@ -4259,6 +4879,46 @@ static String executeCommand(const String& cmd) {
             return "PAS debounce: " + String(val) + " us (filter depth: " + String(depth) + ")";
         }
         return "Zakres 500-10000 us";
+    }
+    if (cmd.startsWith("pashalf:")) {
+        int val = cmd.substring(8).toInt();
+        if (val >= 1 && val <= 200) {
+            config_get().pas_min_halfperiod_ms = (uint8_t)val;
+            g_pas_min_halfperiod_us = (uint32_t)val * 1000;
+            config_save();
+            return "PAS min half-period: " + String(val) + " ms (" + String(val * 1000) + " us)";
+        }
+        return "Zakres 1-200 ms";
+    }
+    if (cmd.startsWith("pasasym:")) {
+        int val = cmd.substring(8).toInt();
+        if (val >= 1 && val <= 50) {
+            config_get().pas_dir_asymmetry_pct = (uint8_t)val;
+            g_pas_dir_min_asymmetry = (uint8_t)val;
+            config_save();
+            return "PAS asymetria kierunku: " + String(val) + " %";
+        }
+        return "Zakres 1-50 %";
+    }
+    if (cmd.startsWith("passlew:")) {
+        int val = cmd.substring(8).toInt();
+        if (val >= 1 && val <= 100) {
+            config_get().pas_slew_rate = (uint8_t)val;
+            g_pas_slew_rate_max = (uint16_t)val;
+            config_save();
+            return "PAS slew rate max: " + String(val);
+        }
+        return "Zakres 1-100";
+    }
+    if (cmd.startsWith("pashold:")) {
+        int val = cmd.substring(8).toInt();
+        if (val >= 50 && val <= 2000) {
+            config_get().pas_fwd_holdoff_ms = (uint16_t)val;
+            g_pas_fwd_holdoff_ms = (uint16_t)val;
+            config_save();
+            return "PAS forward holdoff: " + String(val) + " ms";
+        }
+        return "Zakres 50-2000 ms";
     }
     if (cmd.startsWith("ilim:")) {
         int val = cmd.substring(5).toInt();
@@ -4321,6 +4981,14 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pas_dbnc_us:   %u us (filter: %d probek x %d us)\n",
                       (unsigned)cfg.pas_debounce_us, (int)g_pas_filter_depth, PAS_SAMPLE_INTERVAL_US);
         Serial.println("               Czas potwierdzenia stanu PAS. Probkowanie co 500us, N zgodnych = zmiana stanu.");
+        Serial.printf("pas_halfp_ms:  %u ms (%lu us)\n", (unsigned)cfg.pas_min_halfperiod_ms, (unsigned long)g_pas_min_halfperiod_us);
+        Serial.println("               Min polokres PAS uznawany za poprawny impuls. Krotsze = szum. Komenda: pashalf:N");
+        Serial.printf("pas_asym_pct:  %u %%\n", (unsigned)cfg.pas_dir_asymmetry_pct);
+        Serial.println("               Prog asymetrii H/L do detekcji kierunku. Komenda: pasasym:N");
+        Serial.printf("pas_slew:      %u\n", (unsigned)cfg.pas_slew_rate);
+        Serial.println("               Maks. zmiana duty PAS na iteracje loop. Komenda: passlew:N");
+        Serial.printf("pas_holdoff:   %u ms\n", (unsigned)cfg.pas_fwd_holdoff_ms);
+        Serial.println("               Czas pedalowania fwd wymagany do stabilnego kierunku. Komenda: pashold:N");
         Serial.printf("disp_req:      %d (%s)\n", cfg.display_required, cfg.display_required ? "TAK" : "NIE");
         Serial.println("               Blokada silnika gdy wyswietlacz S866 nie jest polaczony.");
         Serial.printf("current_lim:   %d A (%s)\n", cfg.current_limit_a, cfg.current_limit_a ? "AKTYWNY" : "WYLACZONY");
@@ -4345,6 +5013,8 @@ static String executeCommand(const String& cmd) {
         Serial.println("               FOC: wzmocnienie calkujace PI osi D (strumien magnetyczny).");
         Serial.printf("foc_vmode:     %d (%s)\n", cfg.foc_voltage_mode, cfg.foc_voltage_mode ? "ON" : "OFF");
         Serial.println("               FOC tryb napieciowy: sterowanie napieciem bez PI. Do diagnostyki.");
+        Serial.printf("pwm_freq_hz:   %u Hz (runtime: %u Hz)\n", (unsigned)cfg.pwm_freq_hz, (unsigned)g_pwm_freq_hz);
+        Serial.println("               Czestotliwosc PWM. 8000-32000 Hz. Komenda: pwmfreq:N");
         Serial.printf("magic:         0x%08X %s\n", cfg.magic, (cfg.magic == CONFIG_MAGIC) ? "OK" : "BAD!");
         Serial.printf("version:       %d\n",      cfg.version);
         Serial.println("======================================");
@@ -4442,15 +5112,30 @@ static String executeCommand(const String& cmd) {
             cfg.foc_ki_q = cfg.foc_ki_d = FOC_KI_DEFAULT;
             cfg.foc_voltage_mode    = 0;
             cfg.pas_debounce_us     = PAS_DEBOUNCE_US_DEFAULT;
+            cfg.pas_min_halfperiod_ms  = 5;
+            cfg.pas_dir_asymmetry_pct  = 5;
+            cfg.pas_slew_rate          = 30;
+            cfg.pas_fwd_holdoff_ms     = 300;
             cfg.display_required    = 1;
             cfg.thr_samples         = 8;
             cfg.thr_outlier_thresh  = 150;
+            cfg.speed_pulses_per_rev = 1;
+            cfg.pwm_freq_hz         = 20000;
             // Zastosuj do runtime
             g_bldc_state.ramp_time_ms   = cfg.ramp_time_ms;
             g_bldc_state.regen_enabled  = false;
             g_pas_dir_invert_isr        = false;
             g_pas_debounce_us_isr       = PAS_DEBOUNCE_US_DEFAULT;
             { uint8_t d = (uint8_t)(PAS_DEBOUNCE_US_DEFAULT / PAS_SAMPLE_INTERVAL_US); g_pas_filter_depth = (d < 2) ? 2 : d; }
+            g_pas_min_halfperiod_us     = 5000;
+            g_pas_dir_min_asymmetry     = 5;
+            g_pas_slew_rate_max         = 30;
+            g_pas_fwd_holdoff_ms        = 300;
+            g_speed_pulses_per_rev      = 1;
+            g_speed_period_valid        = 0;
+            g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
+            g_speed_last_accepted_us    = 0;
+            applyPwmFrequency(20000);
             g_reverse_isr               = false;
             g_sine_hall_phase_offset    = 0;
             g_foc_pi_d.kp = g_foc_pi_q.kp = FOC_KP_DEFAULT;
@@ -4474,6 +5159,12 @@ static String executeCommand(const String& cmd) {
             cfg.foc_ki_d           = g_foc_pi_d.ki;
             cfg.foc_voltage_mode   = g_foc_voltage_mode ? 1 : 0;
             cfg.pas_debounce_us    = (uint16_t)g_pas_debounce_us_isr;
+            cfg.pas_min_halfperiod_ms  = (uint8_t)(g_pas_min_halfperiod_us / 1000);
+            cfg.pas_dir_asymmetry_pct  = g_pas_dir_min_asymmetry;
+            cfg.pas_slew_rate          = (uint8_t)g_pas_slew_rate_max;
+            cfg.pas_fwd_holdoff_ms     = g_pas_fwd_holdoff_ms;
+            cfg.speed_pulses_per_rev   = g_speed_pulses_per_rev;
+            cfg.pwm_freq_hz            = g_pwm_freq_hz;
             // display_required nie ma runtime var — zapisuje się bezpośrednio w cfg
             config_save();
             return "[CFG] Aktualne wartosci runtime zapisane do EEPROM.";
@@ -4493,6 +5184,17 @@ static String executeCommand(const String& cmd) {
             g_foc_voltage_mode = (c.foc_voltage_mode != 0);
             g_pas_debounce_us_isr = (uint32_t)c.pas_debounce_us;
             { uint8_t d = (uint8_t)(g_pas_debounce_us_isr / PAS_SAMPLE_INTERVAL_US); g_pas_filter_depth = (d < 2) ? 2 : d; }
+            g_pas_min_halfperiod_us = (uint32_t)c.pas_min_halfperiod_ms * 1000;
+            g_pas_dir_min_asymmetry = c.pas_dir_asymmetry_pct;
+            g_pas_slew_rate_max     = c.pas_slew_rate;
+            g_pas_fwd_holdoff_ms    = c.pas_fwd_holdoff_ms;
+            g_speed_pulses_per_rev  = c.speed_pulses_per_rev;
+            if (g_speed_pulses_per_rev < 1) g_speed_pulses_per_rev = 1;
+            g_speed_period_valid    = 0;  // reset mediany po reload
+            g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
+            g_speed_last_accepted_us = 0;
+            if (c.pwm_freq_hz >= 8000 && c.pwm_freq_hz <= 32000)
+                applyPwmFrequency(c.pwm_freq_hz);
             // display_required nie wymaga sync — czytany bezpośrednio z config_get()
             // Przełącz tryb silnika jeśli skonfigurowany tryb rozni się od bieżącego
             drive_mode_t target_mode = (drive_mode_t)c.drive_mode;
@@ -4613,6 +5315,14 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <p class="hint">Inwersja kierunku czujnika PAS. U&#380;yj gdy silnik nap&#281;dza przy peda&#322;owaniu do ty&#322;u.</p>
 <div class="row"><label>Debounce PAS (&#181;s)</label><input type="number" id="pas_db" min="500" max="10000" step="100"><button onclick="cmd('pasdbnc:'+v('pas_db'))">Ustaw</button></div>
 <p class="hint">Filtr cyfrowy PAS: pin pr&#243;bkowany co 500&#181;s, zmiana stanu wymaga N kolejnych zgodnych pr&#243;bek (N=debounce/500). Szpilki EMI &lt;N&#215;500&#181;s s&#261; odfiltrowane.</p>
+<div class="row"><label>Min p&#243;&#322;okres PAS (ms)</label><input type="number" id="pas_hp" min="1" max="200" step="1"><button onclick="cmd('pashalf:'+v('pas_hp'))">Ustaw</button></div>
+<p class="hint">Minimalny czas p&#243;&#322;okresu (HIGH lub LOW) uznawany za poprawny impuls PAS. Kr&#243;tsze impulsy odrzucane jako szum.</p>
+<div class="row"><label>Asymetria kierunku (%)</label><input type="number" id="pas_as" min="1" max="50" step="1"><button onclick="cmd('pasasym:'+v('pas_as'))">Ustaw</button></div>
+<p class="hint">Pr&#243;g asymetrii HIGH/LOW do detekcji kierunku. Wi&#281;kszy=mniej czu&#322;y ale stabilniejszy. Je&#347;li |H-L|/(H+L)&gt;pr&#243;g &rarr; kierunek rozpoznany.</p>
+<div class="row"><label>Slew rate PAS</label><input type="number" id="pas_sl" min="1" max="100" step="1"><button onclick="cmd('passlew:'+v('pas_sl'))">Ustaw</button></div>
+<p class="hint">Maks. zmiana wype&#322;nienia PAS na iteracj&#281; p&#281;tli g&#322;&#243;wnej (loop). Mniejszy=&#322;agodniejsze zmiany mocy.</p>
+<div class="row"><label>Forward holdoff (ms)</label><input type="number" id="pas_fh" min="50" max="2000" step="50"><button onclick="cmd('pashold:'+v('pas_fh'))">Ustaw</button></div>
+<p class="hint">Czas peda&#322;owania do przodu wymagany do uznania kierunku &quot;forward&quot; za stabilny (od momentu detekcji asymetrii).</p>
 </div></details>
 <details><summary>&#128295; Ustawienia systemowe</summary><div class="card">
 <div class="row"><label>Wymagany wy&#347;wietlacz</label><select id="disp_rq"><option value="1">TAK (silnik tylko z display)</option><option value="0">NIE (standalone OK)</option></select><button onclick="cmd('cfg:dispreq:'+v('disp_rq'))">Ustaw</button></div>
@@ -4639,7 +5349,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <details><summary>&#128190; EEPROM / NVS</summary><div class="card">
 <div class="row"><button onclick="sendR('cfg:save')">&#128190; Zapisz do EEPROM</button><button class="w" onclick="sendR('cfg:reload')">&#128194; Wczytaj z EEPROM</button><button class="r" onclick="cfgDef()">&#9888; Domy&#347;lne</button></div>
 <hr><p class="hint">Warto&#347;ci zapisane w NVS (EEPROM):</p>
-<div class="sg"><span class="sl">Tryb boot:</span><span class="sv" id="n_dm">-</span><span class="sl">Rampa:</span><span class="sv" id="n_ramp">-</span><span class="sl">Regen:</span><span class="sv" id="n_regen">-</span><span class="sl">Max krok duty:</span><span class="sv" id="n_step">-</span><span class="sl">Kierunek:</span><span class="sv" id="n_rev">-</span><span class="sl">Offset Hall:</span><span class="sv" id="n_soff">-</span><span class="sl">FOC Vmode:</span><span class="sv" id="n_fvolt">-</span><span class="sl">Kp_q / Ki_q:</span><span class="sv" id="n_focq">-</span><span class="sl">Kp_d / Ki_d:</span><span class="sv" id="n_focd">-</span><span class="sl">PAS debounce:</span><span class="sv" id="n_pdbnc">-</span><span class="sl">Wym. wy&#347;wietlacz:</span><span class="sv" id="n_dreq">-</span><span class="sl">Thr pr&#243;bki:</span><span class="sv" id="n_thrn">-</span><span class="sl">Thr odchylenie:</span><span class="sv" id="n_thrd">-</span></div>
+<div class="sg"><span class="sl">Tryb boot:</span><span class="sv" id="n_dm">-</span><span class="sl">Rampa:</span><span class="sv" id="n_ramp">-</span><span class="sl">Regen:</span><span class="sv" id="n_regen">-</span><span class="sl">Max krok duty:</span><span class="sv" id="n_step">-</span><span class="sl">Kierunek:</span><span class="sv" id="n_rev">-</span><span class="sl">Offset Hall:</span><span class="sv" id="n_soff">-</span><span class="sl">FOC Vmode:</span><span class="sv" id="n_fvolt">-</span><span class="sl">Kp_q / Ki_q:</span><span class="sv" id="n_focq">-</span><span class="sl">Kp_d / Ki_d:</span><span class="sv" id="n_focd">-</span><span class="sl">PAS start:</span><span class="sv" id="n_pstart">-</span><span class="sl">PAS stop:</span><span class="sv" id="n_pstop">-</span><span class="sl">PAS rampa:</span><span class="sv" id="n_pramp">-</span><span class="sl">PAS kierunek:</span><span class="sv" id="n_pdir">-</span><span class="sl">PAS debounce:</span><span class="sv" id="n_pdbnc">-</span><span class="sl">PAS min p&#243;&#322;okres:</span><span class="sv" id="n_phalf">-</span><span class="sl">PAS asymetria:</span><span class="sv" id="n_pasym">-</span><span class="sl">PAS slew rate:</span><span class="sv" id="n_pslew">-</span><span class="sl">PAS holdoff:</span><span class="sv" id="n_phold">-</span><span class="sl">Limit pr&#261;du:</span><span class="sv" id="n_ilim">-</span><span class="sl">Wym. wy&#347;wietlacz:</span><span class="sv" id="n_dreq">-</span><span class="sl">Thr pr&#243;bki:</span><span class="sv" id="n_thrn">-</span><span class="sl">Thr odchylenie:</span><span class="sv" id="n_thrd">-</span></div>
 </div></details>
 <details><summary>&#127919; Kolejka &#183; Komendy</summary><div class="card">
 <p class="hint">Komenda wykonana gdy P17&#8594;0 (WiFi wy&#322;&#261;czone, silnik dost&#281;pny)</p>
@@ -4691,6 +5401,10 @@ async function loadCfg(){
     el('pas_s').value=_c.pas_start_delay_ms;el('pas_t').value=_c.pas_stop_delay_ms;
     el('pas_r').value=_c.pas_ramp_ms;el('pas_d').value=_c.pas_dir_invert;
     el('pas_db').value=_c.pas_debounce_us||3000;
+    el('pas_hp').value=_c.pas_min_halfperiod_ms||5;
+    el('pas_as').value=_c.pas_dir_asymmetry_pct||5;
+    el('pas_sl').value=_c.pas_slew_rate||30;
+    el('pas_fh').value=_c.pas_fwd_holdoff_ms||300;
     el('disp_rq').value=_c.display_required||0;
     el('ilim').value=_c.current_limit_a||0;
     el('thr_n').value=_c.thr_samples||8;
@@ -4708,7 +5422,16 @@ async function loadCfg(){
     el('n_fvolt').textContent=_c.foc_voltage_mode?'ON':'OFF';el('n_fvolt').style.color=_c.foc_voltage_mode?'#f0883e':'#3fb950';
     el('n_focq').textContent=(_c.foc_kp_q||0).toFixed(3)+' / '+(_c.foc_ki_q||0).toFixed(3);
     el('n_focd').textContent=(_c.foc_kp_d||0).toFixed(3)+' / '+(_c.foc_ki_d||0).toFixed(3);
+    el('n_pstart').textContent=(_c.pas_start_delay_ms||0)+' ms';
+    el('n_pstop').textContent=(_c.pas_stop_delay_ms||0)+' ms';
+    el('n_pramp').textContent=(_c.pas_ramp_ms||0)+' ms';
+    el('n_pdir').textContent=_c.pas_dir_invert?'Odwr\u00f3cony':'Normalny';el('n_pdir').style.color=_c.pas_dir_invert?'#f0883e':'#3fb950';
     el('n_pdbnc').textContent=(_c.pas_debounce_us||3000)+' \u00b5s';
+    el('n_phalf').textContent=(_c.pas_min_halfperiod_ms||5)+' ms';
+    el('n_pasym').textContent=(_c.pas_dir_asymmetry_pct||5)+' %';
+    el('n_pslew').textContent=(_c.pas_slew_rate||30);
+    el('n_phold').textContent=(_c.pas_fwd_holdoff_ms||300)+' ms';
+    el('n_ilim').textContent=(_c.current_limit_a||0)+' A';el('n_ilim').style.color=(_c.current_limit_a>0)?'#3fb950':'#f0883e';
     el('n_dreq').textContent=_c.display_required?'TAK':'NIE';el('n_dreq').style.color=_c.display_required?'#3fb950':'#f0883e';
     el('n_thrn').textContent=_c.thr_samples||8;
     el('n_thrd').textContent=_c.thr_outlier_thresh||150;
@@ -4737,6 +5460,10 @@ static void webHandleApiConfig() {
         "\"foc_kp_q\":%.4f,\"foc_ki_q\":%.4f,"
         "\"foc_kp_d\":%.4f,\"foc_ki_d\":%.4f,"
         "\"pas_debounce_us\":%d,"
+        "\"pas_min_halfperiod_ms\":%d,"
+        "\"pas_dir_asymmetry_pct\":%d,"
+        "\"pas_slew_rate\":%d,"
+        "\"pas_fwd_holdoff_ms\":%d,"
         "\"display_required\":%d,"
         "\"current_limit_a\":%d,"
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
@@ -4751,6 +5478,10 @@ static void webHandleApiConfig() {
         (int)cfg.sine_hall_offset, (int)cfg.foc_voltage_mode,
         cfg.foc_kp_q, cfg.foc_ki_q, cfg.foc_kp_d, cfg.foc_ki_d,
         (int)cfg.pas_debounce_us,
+        (int)cfg.pas_min_halfperiod_ms,
+        (int)cfg.pas_dir_asymmetry_pct,
+        (int)cfg.pas_slew_rate,
+        (int)cfg.pas_fwd_holdoff_ms,
         (int)cfg.display_required,
         (int)cfg.current_limit_a,
         (int)cfg.thr_samples, (int)cfg.thr_outlier_thresh,

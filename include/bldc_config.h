@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  12
+#define CONFIG_VERSION  15
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -63,9 +63,15 @@ typedef struct __attribute__((packed)) {
     uint8_t         thr_samples;        ///< Ilość próbek ADC throttle w burst [2-16], domyślnie 8
     uint16_t        thr_outlier_thresh; ///< Max odchylenie od mediany do odrzucenia outlieru [ADC], domyślnie 150
     uint8_t         current_limit_a;    ///< Limit prądu fazowego [A]. 0=brak limitu, domyślnie 15A. Nadpisywany przez P14 z display.
+    uint8_t         pas_min_halfperiod_ms; ///< Min półokres PAS [ms] (debounce krawędzi). 1–200, domyślnie 5. Komenda: pashalf:N
+    uint8_t         pas_dir_asymmetry_pct; ///< Próg asymetrii do detekcji kierunku [%]. 1–50, domyślnie 5. Komenda: pasasym:N
+    uint8_t         pas_slew_rate;        ///< Max zmiana duty PAS na krok. 1–100, domyślnie 30 (~6% PWM). Komenda: passlew:N
+    uint16_t        pas_fwd_holdoff_ms;   ///< Holdoff reverse PAS [ms]. 50–2000, domyślnie 300. Komenda: pashold:N
+    uint8_t         speed_pulses_per_rev; ///< Impulsy SPEED na obrót koła. 1–20, domyślnie 1. Kalibracja: spdcal
+    uint16_t        pwm_freq_hz;          ///< Częstotliwość PWM [Hz]. 8000–32000, domyślnie 20000. Komenda: pwmfreq:N
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[20];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[12];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)

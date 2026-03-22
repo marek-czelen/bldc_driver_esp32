@@ -52,6 +52,12 @@ static void config_apply_defaults() {
     g_config.thr_samples         = 8;                               // Throttle: 8 próbek burst
     g_config.thr_outlier_thresh  = 150;                             // Throttle: odrzucaj > 150 od mediany
     g_config.current_limit_a     = 15;                              // Limit prądu: 15A domyślnie (0=brak limitu)
+    g_config.pas_min_halfperiod_ms = 5;                               // Min półokres PAS: 5 ms
+    g_config.pas_dir_asymmetry_pct = 5;                               // Próg asymetrii kierunku PAS: 5%
+    g_config.pas_slew_rate         = 30;                              // Slew rate PAS: 30 (~6% PWM/step)
+    g_config.pas_fwd_holdoff_ms    = 300;                             // Holdoff reverse PAS: 300 ms
+    g_config.speed_pulses_per_rev  = 1;                               // Impulsy SPEED na obrót: 1 (kalibracja: spdcal)
+    g_config.pwm_freq_hz           = 20000;                           // Częstotliwość PWM: 20 kHz (domyślna)
 }
 
 void config_init() {
