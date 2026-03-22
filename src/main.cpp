@@ -89,9 +89,17 @@ static uint16_t g_pwm_freq_hz = PWM_FREQUENCY;           ///< Aktualna częstotl
 static uint16_t applyPwmFrequency(uint16_t freq_hz);     ///< Forward declaration
 
 // Pomiar RPM z przejść Halla (aktualizowane w ISR timera)
-volatile uint8_t g_hall_prev_isr = 0;         ///< Poprzedni stan Halla w ISR
-volatile uint32_t g_hall_last_change_us = 0;  ///< micros() ostatniego przejścia
+volatile uint8_t g_hall_prev_isr = 0;         ///< Poprzedni POTWIERDZONY stan Halla w ISR
+volatile uint32_t g_hall_last_change_us = 0;  ///< micros() ostatniego potwierdzonego przejścia
 volatile uint32_t g_hall_period_us = 0;       ///< Okres między przejściami Halla [µs]
+
+// Multi-sample Hall confirmation (anty-EMI)
+// Nowy stan Halla musi się utrzymać przez HALL_CONFIRM_COUNT kolejnych
+// odczytów ISR (N×50µs przy 20kHz) zanim zostanie zaakceptowany.
+// Chroni przed glitchami EMI z PWM sprzęgającymi się w linie Halla.
+#define HALL_CONFIRM_COUNT      3              ///< Wymagane kolejne zgodne odczyty
+static uint8_t  g_hall_candidate = 0;          ///< Kandydat na nowy stan Halla
+static uint8_t  g_hall_confirm_cnt = 0;        ///< Ile razy z rzędu widzieliśmy kandydata
 
 // Sinusoidal commutation state — ported from bldc_driver_v2 (STM32, proven algorithm)
 // Continuous angle tracking with Hall correction, NOT snap-to-hall approach.
@@ -166,6 +174,22 @@ volatile int16_t  g_dbg_last_mc = 0;
 volatile int32_t  g_dbg_last_hall_err = 0;     ///< Ostatni błąd korekcji kąta Halla (Q16)
 volatile uint32_t g_dbg_snap_count = 0;        ///< Licznik pełnych snapów kąta (desync/crawl)
 volatile uint32_t g_dbg_corr_count = 0;        ///< Licznik łagodnych korekcji kąta
+volatile uint32_t g_dbg_hall_invalid = 0;      ///< Odrzucone stany 0/7
+volatile uint32_t g_dbg_hall_glitch = 0;       ///< Glitche EMI (kandydat zmieniony przed potwierdzeniem)
+volatile uint32_t g_dbg_hall_seq_reject = 0;   ///< Odrzucone (zła sekwencja sektora w SINUS/FOC)
+
+// ── Rozszerzona diagnostyka SINUS/FOC (running min/max resetowane co debug print) ──
+// Zbierane w ISR, wyświetlane i resetowane w printSineDebug()
+volatile int32_t  g_dbg_err_min_q16 = INT32_MAX; ///< Min błąd kąta na Hall edge (Q16) w oknie
+volatile int32_t  g_dbg_err_max_q16 = INT32_MIN; ///< Max błąd kąta na Hall edge (Q16) w oknie
+volatile uint32_t g_dbg_speed_min = 0xFFFFFFFF; ///< Min prędkość q16 w oknie
+volatile uint32_t g_dbg_speed_max = 0;          ///< Max prędkość q16 w oknie
+volatile uint32_t g_dbg_dt_min = 0xFFFFFFFF;    ///< Min okres Hall [µs] w oknie
+volatile uint32_t g_dbg_dt_max = 0;             ///< Max okres Hall [µs] w oknie
+volatile uint32_t g_dbg_snap_window = 0;        ///< Snapy w bieżącym oknie
+volatile uint32_t g_dbg_corr_window = 0;        ///< Korekcje w bieżącym oknie
+volatile int32_t  g_dbg_angle_at_hall = 0;      ///< Kąt (entry Q16) w momencie Hall (przed korekcją)
+volatile int32_t  g_dbg_expected_at_hall = 0;   ///< Oczekiwany kąt (entry Q16) wg tabeli sektorów
 
 // Pomiar RPM z pinu SPEED (GPIO ISR, dla silników przekładniowych, P07==1)
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
@@ -3252,14 +3276,39 @@ static void printSineDebug() {
         (unsigned)g_dbg_last_amp,
         (int)g_dbg_last_ma, (int)g_dbg_last_mb, (int)g_dbg_last_mc);
 
-    Serial.printf("ofs:%d ev[h:%lu en:%lu rej:%lu fb:%lu lastEn:%lums lastFb:%lums]\n",
+    Serial.printf("ofs:%d ev[h:%lu gli:%lu seq:%lu snp:%lu cor:%lu]\n",
         (int)g_sine_hall_phase_offset,
         (unsigned long)g_dbg_hall_edges,
-        (unsigned long)g_dbg_sine_enter_count,
-        (unsigned long)g_dbg_sine_start_reject_count,
-        (unsigned long)g_dbg_sine_fallback_count,
-        (unsigned long)g_dbg_last_sine_enter_ms,
-        (unsigned long)g_dbg_last_fallback_ms);
+        (unsigned long)g_dbg_hall_glitch,
+        (unsigned long)g_dbg_hall_seq_reject,
+        (unsigned long)g_dbg_snap_count,
+        (unsigned long)g_dbg_corr_count);
+
+    // ── Rozszerzona diagnostyka (running stats z okna ~200ms) ──
+    int32_t err_min_ent = g_dbg_err_min_q16 >> 16;
+    int32_t err_max_ent = g_dbg_err_max_q16 >> 16;
+    Serial.printf("  err[%ld..%ld] spd[%lu..%lu] dt[%lu..%lu]us snp/cor:%lu/%lu\n",
+        (long)err_min_ent, (long)err_max_ent,
+        (unsigned long)g_dbg_speed_min, (unsigned long)g_dbg_speed_max,
+        (unsigned long)g_dbg_dt_min, (unsigned long)g_dbg_dt_max,
+        (unsigned long)g_dbg_snap_window, (unsigned long)g_dbg_corr_window);
+    // Kąt obserwera vs oczekiwany kąt (z ostatniego Hall edge w oknie)
+    Serial.printf("  angH:%ld exp:%ld sec:%d dir:%d rev:%d\n",
+        (long)(g_dbg_angle_at_hall >> 16),
+        (long)(g_dbg_expected_at_hall >> 16),
+        (int)g_sine_last_hall_idx,
+        (int)g_sine_dir,
+        (int)g_reverse_isr);
+
+    // Reset running stats dla następnego okna
+    g_dbg_err_min_q16 = INT32_MAX;
+    g_dbg_err_max_q16 = INT32_MIN;
+    g_dbg_speed_min = 0xFFFFFFFF;
+    g_dbg_speed_max = 0;
+    g_dbg_dt_min = 0xFFFFFFFF;
+    g_dbg_dt_max = 0;
+    g_dbg_snap_window = 0;
+    g_dbg_corr_window = 0;
 }
 
 // ============================================================================
@@ -3300,127 +3349,148 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
     uint8_t hc = (GPIO.in >> PIN_HALL_SENSOR_C) & 1;
     uint8_t hall = (hc << 2) | (hb << 1) | ha;
 
-    // Pomiar czasu między przejściami Halla → RPM (niezależnie od stanu silnika)
-    // DEBOUNCE: ignoruj przejścia szybsze niż HALL_MIN_PERIOD_US.
-    // W trybie SINUS 6 FETów na center-aligned PWM generuje silne EMI,
-    // które sprzega się w linie Halla tworząc fałszywe przejścia.
-    // Bez debounce: hall_period = 50us → speed ucieka → kąt ucieka → desync.
-    if (hall != g_hall_prev_isr) {
-        uint32_t now_us = (uint32_t)esp_timer_get_time();
-        uint32_t dt_us = now_us - g_hall_last_change_us;
+    // ── Filtr Hall z wielopróbkowym potwierdzeniem (anty-EMI) ──
+    // 3 warstwy:
+    //   1. Odrzucenie nieprawidłowych stanów (0, 7)
+    //   2. Multi-sample: nowy stan musi utrzymać się HALL_CONFIRM_COUNT ticków ISR
+    //   3. Debounce czasowy: HALL_MIN_PERIOD_US od ostatniego potwierdzonego przejścia
+    // Pod obciążeniem PWM generuje silne EMI sprzęgające się w linie Halla,
+    // tworząc fałszywe przejścia. Glitch <150µs jest odrzucany.
 
-        // Debounce: akceptuj przejście tylko jeśli minęło wystarczająco dużo czasu
-        // od ostatniego POTWIERDZONEGO przejścia (lub pierwszy pomiar)
-        if (g_hall_last_change_us == 0 || dt_us >= HALL_MIN_PERIOD_US) {
-            g_dbg_hall_edges++;
-            g_dbg_last_hall = hall;
-            if (g_hall_last_change_us > 0) {
-                g_hall_period_us = dt_us;
-            }
-            g_hall_last_change_us = now_us;
-            g_hall_prev_isr = hall;
+    // Warstwa 1: odrzuć nieprawidłowe stany (brak/zwarcie czujnika)
+    if (hall == 0 || hall == 7) {
+        g_dbg_hall_invalid++;
+        g_hall_confirm_cnt = 0;  // reset potwierdzenia — przerwany ciąg
+    }
+    else if (hall != g_hall_prev_isr) {
+        // Warstwa 2: multi-sample confirmation
+        if (hall == g_hall_candidate) {
+            g_hall_confirm_cnt++;
+        } else {
+            // Kandydat się zmienił przed potwierdzeniem → prawdziwy glitch EMI
+            if (g_hall_confirm_cnt > 0) g_dbg_hall_glitch++;
+            g_hall_candidate = hall;
+            g_hall_confirm_cnt = 1;
+        }
 
-            // ── Sine/FOC mode: przetwarzanie przejścia Halla ──
-            // Port z bldc_driver_v2: bldc_hall_interrupt()
-            // FOC współdzieli angle tracking z SINUS (ten sam algorytm Q16)
-            if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
+        if (g_hall_confirm_cnt >= HALL_CONFIRM_COUNT) {
+            // Potwierdzony! Warstwa 3: debounce czasowy
+            g_hall_confirm_cnt = 0;
+            uint32_t now_us = (uint32_t)esp_timer_get_time();
+            uint32_t dt_us = now_us - g_hall_last_change_us;
 
-                int8_t new_idx = hallToSector(hall);
-                if (new_idx >= 0) {
+            if (g_hall_last_change_us == 0 || dt_us >= HALL_MIN_PERIOD_US) {
+                g_dbg_hall_edges++;
+                g_dbg_last_hall = hall;
+                if (g_hall_last_change_us > 0) {
+                    g_hall_period_us = dt_us;
+                }
+                g_hall_last_change_us = now_us;
+                g_hall_prev_isr = hall;
 
-                    int8_t old_idx = g_sine_last_hall_idx;
+                // ── Sine/FOC mode: przetwarzanie przejścia Halla ──
+                if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
+                    int8_t new_idx = hallToSector(hall);
+                    if (new_idx >= 0) {
+                        int8_t old_idx = g_sine_last_hall_idx;
 
-                    // Detekcja kierunku z sekwencji przejść Halla
-                    // Po remapie sektory ZAWSZE rosną dla poprawnej rotacji.
-                    if (old_idx >= 0) {
-                        int8_t fwd = (old_idx + 1) % 6;
-                        int8_t rev = (old_idx + 5) % 6;
-                        if (new_idx == fwd) {
-                            g_sine_dir = 1;   // prawidłowy kierunek
-                        } else if (new_idx == rev) {
-                            g_sine_dir = -1;  // cofanie się
+                        // Walidacja sekwencji: akceptuj tylko ±1 sektor
+                        // Przeskok >1 sektora = prawdopodobnie glitch EMI który
+                        // przeszedł multi-sample (np. stabilne pole EMI pod dużym obciążeniem).
+                        // W takim przypadku: aktualizuj timestamp/idx ale NIE koryguj kąta/prędkości.
+                        bool seq_valid = true;
+                        if (old_idx >= 0) {
+                            int8_t fwd = (old_idx + 1) % 6;
+                            int8_t rev = (old_idx + 5) % 6;
+                            if (new_idx == fwd) {
+                                g_sine_dir = 1;   // prawidłowy kierunek
+                            } else if (new_idx == rev) {
+                                g_sine_dir = -1;  // cofanie się
+                            } else {
+                                // Przeskok >1 sektora — podejrzany
+                                g_dbg_hall_seq_reject++;
+                                seq_valid = false;
+                            }
                         }
-                    }
 
-                    // --- Stall detection timestamp ---
-                    g_sine_last_hall_ms = (uint32_t)(now_us / 1000);
+                        // Stall detection timestamp — zawsze aktualizuj
+                        g_sine_last_hall_ms = (uint32_t)(now_us / 1000);
 
-                    // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
-                    if (dt_us >= HALL_MIN_PERIOD_US && dt_us < 500000) {
-                        uint32_t new_speed = 52428800UL / dt_us;
-                        uint32_t old_speed = g_sine_speed_q16;
-                        if (old_speed == 0) {
-                            g_sine_speed_q16 = new_speed;
-                        } else if (new_speed < old_speed) {
-                            // Deceleracja: szybki filtr 75/25 (new dominant).
-                            // Wolniejszy filtr powoduje opóźniony kąt → oscylacje momentu
-                            // szczególnie na silnikach z małą liczbą biegunów.
-                            g_sine_speed_q16 = (old_speed + new_speed * 3) >> 2;
-                        } else {
-                            // Akceleracja: filtr 50/50 (szybszy niż poprzedni 75/25).
-                            // Na DD z wieloma biegunami i tak działa gładko (dużo korekcji/obrót).
-                            // Na przekładniowym wolny filtr powoduje lag → pole ciągnie do tyłu.
-                            g_sine_speed_q16 = (old_speed + new_speed) >> 1;
-                        }
-                    }
+                        // Running stats: Hall period min/max
+                        if (dt_us < g_dbg_dt_min) g_dbg_dt_min = dt_us;
+                        if (dt_us > g_dbg_dt_max) g_dbg_dt_max = dt_us;
 
-                    // Korekcja kąta na przejściu Halla
-                    // Oczekiwany kąt = środek sektora + offset fazowy Halla
-                    int32_t expected_entry = (int32_t)new_idx * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
-                    if (expected_entry < 0) expected_entry += SINE_TABLE_SIZE;
-                    if (expected_entry >= SINE_TABLE_SIZE) expected_entry -= SINE_TABLE_SIZE;
-                    int32_t expected = expected_entry << 16;
-                    int32_t current = (int32_t)g_sine_angle_q16;
-                    int32_t err = expected - current;
-                    // Wrap error to [-48<<16, +48<<16] (half revolution)
-                    if (err > (int32_t)(SINE_TABLE_Q16_FULL >> 1)) err -= (int32_t)SINE_TABLE_Q16_FULL;
-                    if (err < -(int32_t)(SINE_TABLE_Q16_FULL >> 1)) err += (int32_t)SINE_TABLE_Q16_FULL;
+                        if (seq_valid) {
+                            // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
+                            if (dt_us >= HALL_MIN_PERIOD_US && dt_us < 500000) {
+                                uint32_t new_speed = 52428800UL / dt_us;
+                                uint32_t old_speed = g_sine_speed_q16;
+                                if (old_speed == 0) {
+                                    g_sine_speed_q16 = new_speed;
+                                } else if (new_speed < old_speed) {
+                                    g_sine_speed_q16 = (old_speed + new_speed * 3) >> 2;
+                                } else {
+                                    g_sine_speed_q16 = (old_speed + new_speed) >> 1;
+                                }
+                            }
 
-                    int32_t abs_err = (err >= 0) ? err : -err;
+                            // Korekcja kąta na przejściu Halla
+                            int32_t expected_entry = (int32_t)new_idx * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
+                            if (expected_entry < 0) expected_entry += SINE_TABLE_SIZE;
+                            if (expected_entry >= SINE_TABLE_SIZE) expected_entry -= SINE_TABLE_SIZE;
+                            int32_t expected = expected_entry << 16;
+                            int32_t current = (int32_t)g_sine_angle_q16;
+                            int32_t err = expected - current;
+                            if (err > (int32_t)(SINE_TABLE_Q16_FULL >> 1)) err -= (int32_t)SINE_TABLE_Q16_FULL;
+                            if (err < -(int32_t)(SINE_TABLE_Q16_FULL >> 1)) err += (int32_t)SINE_TABLE_Q16_FULL;
 
-                    g_dbg_last_hall_err = err;
+                            int32_t abs_err = (err >= 0) ? err : -err;
+                            g_dbg_last_hall_err = err;
+                            g_dbg_angle_at_hall = current;  // kąt PRZED korekcją
+                            g_dbg_expected_at_hall = expected;  // oczekiwany kąt wg tabeli
 
-                    if (g_sine_speed_q16 == 0) {
-                        // Przy starcie/crawl: pełny snap kąta na środek sektora
-                        g_sine_angle_q16 = (uint32_t)expected;
-                        g_dbg_snap_count++;
-                    } else if (abs_err > SINE_SNAP_THRESHOLD) {
-                        // Duży błąd (>90° elektr.) = desync → pełny snap
-                        // Zapobiega pozytywnej pętli zwrotnej: błąd→mniej momentu→stall
-                        g_sine_angle_q16 = (uint32_t)expected;
-                        g_dbg_snap_count++;
-                    } else {
-                        // Normalna praca: łagodna korekcja 1/2 błędu kąta
-                        int32_t new_angle = current + (err >> SINE_PHASE_CORR_SHIFT);
-                        if (new_angle < 0) new_angle += (int32_t)SINE_TABLE_Q16_FULL;
-                        if (new_angle >= (int32_t)SINE_TABLE_Q16_FULL) new_angle -= (int32_t)SINE_TABLE_Q16_FULL;
-                        g_sine_angle_q16 = (uint32_t)new_angle;
-                        g_dbg_corr_count++;
+                            // Running stats: err min/max, speed min/max
+                            if (err < g_dbg_err_min_q16) g_dbg_err_min_q16 = err;
+                            if (err > g_dbg_err_max_q16) g_dbg_err_max_q16 = err;
+                            { uint32_t spd = g_sine_speed_q16;
+                              if (spd < g_dbg_speed_min) g_dbg_speed_min = spd;
+                              if (spd > g_dbg_speed_max) g_dbg_speed_max = spd; }
+
+                            if (g_sine_speed_q16 == 0) {
+                                g_sine_angle_q16 = (uint32_t)expected;
+                                g_dbg_snap_count++;
+                                g_dbg_snap_window++;
+                            } else if (abs_err > SINE_SNAP_THRESHOLD) {
+                                g_sine_angle_q16 = (uint32_t)expected;
+                                g_dbg_snap_count++;
+                                g_dbg_snap_window++;
+                            } else {
+                                int32_t new_angle = current + (err >> SINE_PHASE_CORR_SHIFT);
+                                if (new_angle < 0) new_angle += (int32_t)SINE_TABLE_Q16_FULL;
+                                if (new_angle >= (int32_t)SINE_TABLE_Q16_FULL) new_angle -= (int32_t)SINE_TABLE_Q16_FULL;
+                                g_sine_angle_q16 = (uint32_t)new_angle;
+                                g_dbg_corr_count++;
+                                g_dbg_corr_window++;
 
 #if SINE_SPEED_CORR_ENABLE
-                        // PLL: korekcja prędkości proporcjonalna do błędu kąta
-                        // err>0 → kąt za wolny → prędkość za mała → zwiększ
-                        // err<0 → kąt za szybki → prędkość za duża → zmniejsz
-                        // Formuła: spd_corr = 0.25 × err × speed / sector_q16
-                        // (err>>8)×speed>>14 = err×speed>>22 ≈ /4M ≈ 0.25/sector
-                        int32_t err_s = err >> 8;
-                        int32_t spd_corr = (err_s * (int32_t)g_sine_speed_q16) >> 14;
-                        int32_t new_spd = (int32_t)g_sine_speed_q16 + spd_corr;
-                        if (new_spd < 0) new_spd = 0;
-                        g_sine_speed_q16 = (uint32_t)new_spd;
+                                int32_t err_s = err >> 8;
+                                int32_t spd_corr = (err_s * (int32_t)g_sine_speed_q16) >> 14;
+                                int32_t new_spd = (int32_t)g_sine_speed_q16 + spd_corr;
+                                if (new_spd < 0) new_spd = 0;
+                                g_sine_speed_q16 = (uint32_t)new_spd;
 #endif
-                    }
+                            }
+                        }
 
-                    g_sine_last_hall_idx = new_idx;
+                        g_sine_last_hall_idx = new_idx;
 
-                    // Licznik przejść Halla (statystyka, nie blokuje startu sinusa)
-                    if (g_sine_startup_count < 255) {
-                        g_sine_startup_count++;
+                        if (g_sine_startup_count < 255) {
+                            g_sine_startup_count++;
+                        }
                     }
                 }
             }
-        }
-        // else: szum EMI — ignoruj (nie aktualizuj prev ani timestamp)
+        } // else: potwierdzanie w toku (normalny przebieg)
     }
 
     // Tryb testu MOSFET — ISR nie dotyka kanałów LEDC, tylko mierzy Hall/prędkość
@@ -3596,13 +3666,21 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle ──
-    // CW: θ rośnie. CCW: θ maleje.
-    // Tabela g_hall_to_sector_ccw wyznacza malejace sektory dla CCW,
-    // wiec snap zawsze trafia poprawnie przy każdym przejsciu Halla.
+    // Kierunek avansowania kąta: z detekcji Halli (g_sine_dir), nie config.
+    // g_sine_dir = +1 → sektory rosną → kąt rośnie (CW w tabeli)
+    // g_sine_dir = -1 → sektory maleją → kąt maleje (CCW w tabeli)
+    // Crawl (spd==0): brak danych z Halli, użyj g_reverse_isr.
+    // Dlaczego NIE g_reverse_isr: BLOCK i SINUS mają odrębne wymagania.
+    // BLOCK jest reaktywny (Hall→fazy bezpośrednio). SINUS interpoluje
+    // kąt między Hallami i musi znać fizyczny kierunek rotacji,
+    // który może różnić się od konfiguracji rev (zależy od uzwojenia/Halli).
     if (!stalled) {
         uint32_t spd = real_speed;
         if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        if (g_reverse_isr) {
+        // Crawl: użyj kierunku z config (brak jeszcze danych z Halli)
+        // Praca normalna: użyj wykrytego kierunku z sekwencji Halli
+        bool dir_reverse = in_crawl ? g_reverse_isr : (g_sine_dir < 0);
+        if (dir_reverse) {
             if (g_sine_angle_q16 >= spd) {
                 g_sine_angle_q16 -= spd;
             } else {
@@ -3731,10 +3809,12 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
     bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle (identycznie jak SINUS) ──
+    // Kierunek z detekcji Halli (g_sine_dir), crawl → g_reverse_isr.
     if (!stalled) {
         uint32_t spd = real_speed;
         if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        if (g_reverse_isr) {
+        bool dir_reverse = in_crawl ? g_reverse_isr : (g_sine_dir < 0);
+        if (dir_reverse) {
             if (g_sine_angle_q16 >= spd) {
                 g_sine_angle_q16 -= spd;
             } else {
