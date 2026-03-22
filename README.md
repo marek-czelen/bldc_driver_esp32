@@ -1,11 +1,26 @@
 # BLDC Motor Driver — ESP32
 
-**Wersja firmware: 1.0.0** | CONFIG_VERSION: 11 | PlatformIO espressif32
+**Wersja firmware: 2.0.0** | CONFIG_VERSION: 12 | PlatformIO espressif32
 
 Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
 Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, **komutacja sinusoidalna** oraz **FOC (Field Oriented Control)**.  
 Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-startem i regulacją prędkości docelowej.  
 Konfiguracja przez **Serial 115200 baud** oraz **WiFi AP** (responsywny interfejs webowy).
+
+### Zmiany w v2.0.0 (względem v1.0.0)
+
+| Zmiana | v1.0 | v2.0 |
+|--------|------|------|
+| PWM peryferium | LEDC (6 kanałów) | **MCPWM** (3 operatory × 2 generatory) |
+| Tryb PWM | Edge-aligned | **Center-aligned (UP_DOWN counter)** |
+| Rozdzielczość PWM | 10-bit (0–1023) | **Period-based (0–500)** |
+| Timer ISR | hw_timer_t (osobny timer) | **MCPWM TEZ** (przerwanie w dolinie PWM) |
+| ISR safety | IRAM_ATTR | **IRAM_ATTR + ESP_INTR_FLAG_IRAM + direct LL register writes** |
+| Komutacja w ISR | `ledcWrite()` (driver API) | **Bezpośredni zapis rejestrów** (~5 ns, bez spinlocków) |
+| Shadow compare update | — | **TEZ-only** (symetryczne impulsy center-aligned) |
+| Prescaler | Automatyczny (LEDC) | **Jawny** (group=1, timer=8 → 20 MHz, period=500) |
+| Dead time | Software (IR2103 wewnętrzny) | **MCPWM bypass** (IR2103 ~520 ns wewnętrzny) |
+| CONFIG_VERSION | 11 | **12** (nowe pole: `current_limit_a`) |
 
 ---
 
@@ -75,7 +90,8 @@ Wszystkie definicje pinów znajdują się w `include/pinout.h`.
 > - `HIN = HIGH` → tranzystor high-side **WŁĄCZONY**  
 > - `LIN = LOW`  → tranzystor low-side  **WŁĄCZONY** (wejście odwrócone!)  
 > - `LIN = HIGH` → tranzystor low-side  **WYŁĄCZONY**  
-> W kodzie: PWM na HIN steruje prądem przez uzwojenie; LIN=0 (LEDC duty=0) włącza low-side.
+> W kodzie: MCPWM gen_A steruje HIN, gen_B steruje LIN. W trybie BLOCK: gen_A=PWM, gen_B=forced.  
+> W trybie SINUS/FOC: oba generatory dostają ten sam duty → IR2103 tworzy komplementarne przełączanie z dead-time ~520 ns.
 
 ### Wejścia analogowe (ADC)
 
@@ -181,11 +197,13 @@ PIn GPIO15 ma pull-up 10 kΩ na PCB — przy braku czujnika daje stałą wartoś
 ```
 platformio.ini      — konfiguracja PlatformIO (platforma, prędkość, partycje)
 include/
-  pinout.h          — wszystkie definicje GPIO, kanały LEDC, stałe PWM
+  pinout.h          — wszystkie definicje GPIO, stałe MCPWM (frequency, period, duty)
   bldc_types.h      — typy danych, struktury, enumeracje
+  bldc_config.h     — konfiguracja NVS (controller_config_t, CONFIG_VERSION=12)
   display_s866.h    — definicje protokołu wyświetlacza S866, struktury ramek
 src/
-  main.cpp          — cała logika aplikacji (komutacja, regen, pomiar prędkości/mocy)
+  main.cpp          — cała logika aplikacji (komutacja MCPWM, regen, pomiar prędkości/mocy)
+  bldc_config.cpp   — implementacja NVS (load/save/defaults)
   display_s866.cpp  — implementacja protokołu S866 (parsowanie RX, wysyłanie TX)
 ```
 
@@ -211,9 +229,9 @@ src/
 setup()
   │
   ├── initGPIO()           — konfiguracja pinów, bezpieczny stan MOSFETów
-  ├── initPWM()            — konfiguracja 6 kanałów LEDC (3 fazy × 2)
-  ├── allMosfetsOff()      — wyłączenie wszystkich tranzystorów
-  └── initCommutationTimer() — uruchomienie przerwania 20 kHz
+  ├── initPWM()            — konfiguracja MCPWM (3 operatory × 2 generatory, prescaler, period)
+  ├── allMosfetsOff()      — wyłączenie wszystkich tranzystorów (gen_force → FORCE_OFF)
+  └── initCommutationTimer() — rejestracja ISR na przerwanie TEZ Timer 0 (20 kHz)
 
 loop() [~wolna pętla, ~kilka kHz]
   ├── readAnalogInputs()   — ADC: VBAT, prądy, przepustnica, temp
@@ -235,7 +253,7 @@ onCommutationTimer() [ISR, 20 kHz = co 50 µs]
   ├── hamulec aktywny bez regen → allMosfetsOff() (coast)
   ├── sprawdzenie g_motor_enabled
   ├── dispatch trybu sterowania (g_mode_isr → BLOCK / SINUS / FOC)
-  └── ustawienie 6 kanałów LEDC zgodnie z tabelą komutacji danego trybu
+  └── ustawienie 3 operatorów MCPWM (gen_force + compare) zgodnie z trybem
 ```
 
 ### Separacja loop/ISR
@@ -278,12 +296,28 @@ Hall encoder daje 3-bitowy kod (wartości 1–6, 0 i 7 są błędem).
 > (np. zamiast 1→3→2→6→4→5, zmienić na 3→2→6→4→5→1).  
 > Jeśli kręci się w złym kierunku — użyć komendy `r` lub zamienić dowolne dwie fazy silnika.
 
-### PWM na high-side
+### PWM — MCPWM center-aligned
 
+- Peryferium: **MCPWM** (Motor Control PWM), MCPWM_UNIT_0
+- Tryb licznika: **UP_DOWN** (center-aligned) — symetryczne impulsy
 - Częstotliwość: **20 kHz** (powyżej słyszalności)
-- Rozdzielczość: **10 bitów** (0–1023)
-- `duty_cycle = 0` → silnik wyłączony
-- `duty_cycle = 1023` → 100% (pełne napięcie)
+- Timer: 160 MHz / prescaler_group(1) / prescaler_timer(8) = **20 MHz**, period = **500**
+- Rozdzielczość: **0–500** (compare value = peak period)
+- `duty = 0` → silnik wyłączony
+- `duty = 500` → 100% (pełne napięcie)
+- Shadow compare update: **TEZ-only** (symetryczne impulsy, brak asymetrii TEP)
+- Dead time: **bypass** (IR2103 wewnętrzny ~520 ns)
+
+**Sterowanie w ISR** odbywa się przez bezpośredni zapis rejestrów MCPWM (LL level),
+bez wywołań driver API (które używają spinlocków i nie są ISR-safe):
+
+| Tryb | gen_A (HIN) | gen_B (LIN) | gen_force.val |
+|------|-------------|-------------|---------------|
+| PWM (BLOCK HS) | PWM action | forced HIGH (LS OFF) | `0x0200` |
+| GND (BLOCK LS ON) | forced LOW | forced LOW (LS ON) | `0x0140` |
+| OFF (float) | forced LOW | forced HIGH (LS OFF) | `0x0240` |
+| Complementary (SIN/FOC) | PWM action | PWM action | `0x0000` |
+| Regen (LS PWM) | forced LOW | PWM action (inverted) | `0x0040` |
 
 ---
 
@@ -364,7 +398,7 @@ Halla daje realną prędkość — crawl wyłącza się automatycznie.
 
 ### Coast threshold (próg coastingu)
 
-Center-aligned PWM z bazą 512 przy małej amplitudzie generuje ~50% switching na
+Center-aligned PWM z bazą PWM_MAX_DUTY/2 (=250) przy małej amplitudzie generuje ~50% switching na
 wszystkich 6 FETach = **aktywne hamowanie elektromagnetyczne** (w odróżnieniu od
 trybu BLOCK, gdzie mały duty = tiny PWM na 1 fazie, reszta float).
 
@@ -406,9 +440,10 @@ Dzięki temu sekwencja peaków A→B→C jest zgodna z kierunkiem obrotu blokowe
 
 Dla każdej fazy:
 1. Interpolacja liniowa z tabeli: `sin_val = sine_interp_q16(angle + offset)`
-2. Duty: `duty = 512 + (sin_val × amplitude) >> 10`
-3. HIN i LIN dostają TEN SAM duty → IR2103 z odwróconym LIN tworzy
-   naturalnie komplementarne przełączanie z wbudowanym dead-time (~520 ns)
+2. Modulacja: `m = (sin_val × amplitude) >> 10` → zakres -amp..+amp
+3. **SVPWM centering:** `duty = offset + m`, gdzie `offset = PWM_MAX_DUTY/2 - (max+min)/2`
+4. MCPWM gen_A i gen_B dostają TEN SAM duty (tryb complementary, `gen_force = 0x0000`)
+5. IR2103 z odwróconym LIN tworzy komplementarne przełączanie z dead-time ~520 ns
 
 ### Strojenie offsetu fazy (Hall phase offset)
 
@@ -453,10 +488,10 @@ Całkowity czas: ~25 kroków × 1s = ~25 sekund (domyślne).
 | `SINE_CRAWL_SPEED_Q16` | 315 | Minimalna prędkość crawl ≈ 1 obr.elekt./s |
 | `SINE_STALL_FALLBACK_MS` | 400 ms | Minimalny timeout safety fallback |
 | `SINE_START_MAX_HALL_US` | 30000 µs | Max okres Halla do wejścia w SINUS |
-| `SINE_PHASE_CORR_SHIFT` | 3 | Korekcja kąta: 1/8 błędu na przejście Halla |
-| `SINE_SPEED_FILTER_SHIFT` | 2 | Filtr prędkości: 1/4 new + 3/4 old |
-| `SINE_SAFE_MAX_DUTY` | 75% PWM_MAX (767) | Limit bezpieczeństwa amplitudy (SVPWM) |
-| `SINE_MIN_AMPLITUDE` | 15 | Poniżej tego: coast (zapobiega hamowaniu EM) |
+| `SINE_PHASE_CORR_SHIFT` | 2 | Korekcja kąta: 1/4 błędu na przejście Halla |
+| `SINE_SPEED_FILTER_SHIFT` | 1 | Filtr prędkości: 1/2 new + 1/2 old |
+| `SINE_SAFE_MAX_DUTY` | 75% PWM_MAX (375) | Limit bezpieczeństwa amplitudy (SVPWM) |
+| `SINE_MIN_AMPLITUDE` | 8 | Poniżej tego: coast (zapobiega hamowaniu EM) |
 | `SINE_TABLE_SIZE` | 96 | Wpisów w tablicy sinusów (= 360° elektr.) |
 
 ### Aktywacja
@@ -471,21 +506,43 @@ Całkowity czas: ~25 kroków × 1s = ~25 sekund (domyślne).
 
 ## Timer sprzętowy i ISR
 
+Komutacja silnika odbywa się w przerwaniu **TEZ (Timer Equals Zero)** peryferium MCPWM.
+TEZ = dolina center-aligned PWM — optymalny moment na pomiar prądu (wszystkie low-side ON).
+
 ```cpp
-// Timer 0, prescaler 80 → 1 MHz ticks, alarm co 50 µs = 20 kHz
-commutationTimer = timerBegin(0, 80, true);
-timerAttachInterrupt(commutationTimer, &onCommutationTimer, true);
-timerAlarmWrite(commutationTimer, 50, true);
-timerAlarmEnable(commutationTimer);
+// Rejestracja ISR MCPWM z flagą IRAM (kod + dane w RAM, nie flash)
+mcpwm_isr_register(MCPWM_UNIT_0, onCommutationTimer, NULL,
+                    ESP_INTR_FLAG_IRAM, &g_mcpwm_isr_handle);
+// Włączenie przerwania TEZ dla Timer 0
+mcpwm_ll_intr_enable_timer_tez(&MCPWM0, 0, true);
 ```
 
-ISR jest oznaczona `IRAM_ATTR` — kod ISR jest ładowany do RAM (nie do flash cache), co gwarantuje deterministyczny czas wykonania nawet podczas dostępu flash przez inne operacje.
+**Częstotliwość ISR:** 20 kHz (identyczna z PWM — jedno przerwanie na cykl PWM).  
+**Wyzwalanie:** TEZ (Timer Equals Zero) = dolina center-aligned PWM.
+
+ISR jest oznaczona `IRAM_ATTR` i zarejestrowana z `ESP_INTR_FLAG_IRAM` —
+cały kod ISR i wywoływane funkcje muszą być w RAM (nie flash cache).
+Wszystkie helpery komutacji (`phaseX_PWM/Low/Off`, `mcpwm_phase_*`, `allMosfetsOff`,
+`hallToSector`, `sine_interp_q16`) mają atrybuty `static inline IRAM_ATTR`.
 
 W ISR odczyt Halli odbywa się bezpośrednio z rejestru hardware:
 ```cpp
 uint8_t ha = (GPIO.in >> PIN_HALL_SENSOR_A) & 1;
 ```
 To jest szybsze i bezpieczniejsze w ISR niż `digitalRead()`.
+
+Zapis PWM w ISR używa bezpośrednich zapisów rejestrów MCPWM (LL level):
+```cpp
+// Zapis compare value (~5 ns, bez spinlocków)
+mcpwm_ll_operator_set_compare_value(&MCPWM0, op, cmp, duty);
+// Zapis trybu generatora (force/PWM)
+MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_PWM;  // np. high-side PWM
+```
+
+**Dlaczego bezpośrednie rejestry zamiast driver API:**
+- `mcpwm_set_duty_type()` i inne funkcje driver używają `portENTER_CRITICAL()` (spinlock)
+- Spinlocki w ISR level 3 powodują crash (Guru Meditation: Cache disabled but cached memory region accessed)
+- Bezpośrednie zapisy LL są ~100× szybsze i ISR-safe
 
 ---
 
@@ -634,9 +691,12 @@ Transformacja motoring → regen:
 
 ### Sterowanie duty regen
 
-IR2103 LIN jest odwrócony, więc:
+IR2103 LIN jest odwrócony — MCPWM gen_B w trybie regen używa odwróconych akcji
+(GEN_B_ACTION_MODE1: UP=HIGH, DOWN=LOW), co daje odwrócone duty na LIN:
 ```cpp
-ledcWrite(LOW_channel, PWM_MAX_DUTY - regen_duty);
+MCPWM0.operators[op].generator[1].val = GEN_B_ACTION_MODE1;  // gen_B inverted
+mcpwm_set_compare_fast(op, 1, regen_duty);                     // compare_B = regen_duty
+MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_REGEN;        // gen_A=forceLOW, gen_B=PWM
 ```
 
 | duty | Efekt |
@@ -939,7 +999,7 @@ Stany:
    - `v_curr ∈ [V_target−3, V_target]` → liniowa redukcja 100%→0%
    - `v_curr ≥ V_target` → duty = 0
 
-4. **Slew rate limiter:** duty zmienia się max ±30 PWM na wywołanie (~3% z 1023).
+4. **Slew rate limiter:** duty zmienia się max ±30 PWM na wywołanie (~6% z 500).
    Przy ~2 kHz pętli = max ~60%/s. Zapobiega skokom duty.
 
 5. **Globalny limit P08:** stosowany osobno przez `applyGlobalSpeedLimit()` (dotyczy też manetki).
@@ -1250,7 +1310,7 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | Pole | Typ | Domyślnie | Opis |
 |---|---|---|---|
 | `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 11 | Wersja struktury (CONFIG_VERSION) |
+| `version` | uint16_t | 12 | Wersja struktury (CONFIG_VERSION) |
 | `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
 | `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
 | `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
@@ -1270,7 +1330,8 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | `display_required` | uint8_t | 1 | Blokada silnika bez wyświetlacza S866 (0/1) |
 | `thr_samples` | uint8_t | 8 | Liczba próbek ADC przepustnicy w burście (2–16) |
 | `thr_outlier_thresh` | uint16_t | 150 | Max odchylenie próbki od mediany ADC (10–2000) |
-| `_reserved[21]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
+| `current_limit_a` | uint8_t | 15 | Limit prądu fazowego [A] (0=brak, nadpisywany przez P14 z display) |
+| `_reserved[20]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
 
 ### Walidacja
 
@@ -1343,7 +1404,7 @@ foc_ki_d:      12.345
 foc_vmode:     0 (OFF)
                FOC tryb napieciowy: sterowanie napieciem bez PI. Do diagnostyki.
 magic:         0x424C4401 OK
-version:       11
+version:       12
 ======================================
 --- Runtime (bieżące) ---
 mode:          FOC
@@ -1372,7 +1433,7 @@ Procedura diagnostyczna umożliwiająca przetestowanie **pojedynczych tranzystor
 ### Zasada działania
 
 1. Silnik jest wyłączany (`DRIVE_MODE_DISABLED`)
-2. ISR komutacji **nie nadpisuje kanałów LEDC** (flaga `g_mosfet_test_active`)
+2. ISR komutacji **nie nadpisuje rejestrów MCPWM** (flaga `g_mosfet_test_active`)
 3. Wszystkie tranzystory ustawiane w stan bezpieczny (OFF)
 4. Na **jednym** wybranym tranzystorze ustawiany jest PWM (domyślnie **10%**, konfigurowalne 1-50%)
 5. Pozostałe 5 tranzystorów pozostaje wyłączonych
@@ -1405,13 +1466,13 @@ Zmiana duty jest natychmiastowa — jeśli test jest aktywny, PWM na bieżącym 
 
 ### Logika PWM w trybie testowym
 
+W trybie testowym używane są te same helpery MCPWM co w normalnej pracy:
 ```
-HIGH-side ON: ledcWrite(HIN_channel, test_duty)
-  → HIN = HIGH przez N% okresu → high-side MOSFET przewodzi N%
+HIGH-side ON: mcpwm_phase_pwm(op, test_duty)
+  → gen_A=PWM, compare=test_duty, gen_B=forced HIGH (LS OFF)
 
-LOW-side ON:  ledcWrite(LIN_channel, PWM_MAX_DUTY - test_duty)
-  → LIN = LOW przez N% okresu → low-side MOSFET przewodzi N%
-  (LIN jest odwrócony w IR2103!)
+LOW-side ON:  (gen_force = MCPWM_FORCE_GND na wybranym operatorze)
+  → gen_A=forced LOW (HS OFF), gen_B=forced LOW (LS ON)
 ```
 
 ### Procedura testowa
@@ -1452,7 +1513,7 @@ co daje potencjał do precyzyjnej regulacji momentu obrotowego.
 ### Architektura
 
 ```
-loop() (~2 kHz)                          ISR (20 kHz)
+loop() (~2 kHz)                          ISR (20 kHz, MCPWM TEZ)
 ───────────────                          ───────────
 
 ADC → EMA filtr                          Read Vd_i, Vq_i (volatile int32)
@@ -1463,7 +1524,7 @@ Park (Iα,Iβ → Id,Iq)                  Inverse Clarke (Vα,Vβ → Va,Vb,Vc)
    ↓                                        ↓
 PI(Id) + PI(Iq)                          SVPWM min-max centering
    ↓                                        ↓
-Vd = ff_d + korekta_d                    ledcWrite (6 kanałów)
+Vd = ff_d + korekta_d                    MCPWM register write (3 operatory)
 Vq = ff_q + korekta_q
    ↓
 Zapisz Vd_i, Vq_i (volatile int32)
@@ -1541,7 +1602,7 @@ Komenda `fvolt` przełącza FOC w **tryb napięciowy** (open-loop):
 |---|---|---|
 | `FOC_KP_DEFAULT` | 0.5 | Domyślne Kp regulatorów PI d/q [PWM/A] |
 | `FOC_KI_DEFAULT` | 5.0 | Domyślne Ki regulatorów PI d/q [PWM/(A·s)] |
-| `FOC_INTEGRAL_LIMIT` | SINE_SAFE_MAX_DUTY (767) | Absolutny max integrala |
+| `FOC_INTEGRAL_LIMIT` | SINE_SAFE_MAX_DUTY (375) | Absolutny max integrala |
 | `FOC_PI_CORR_LIMIT` | 100 | Max korekta PI wokół feedforward [±PWM] |
 | `FOC_IQ_MAX` | 10.0 | Maksymalny prąd Iq target [A] |
 | `FOC_LOOP_DT` | 0.0005 s | Przybliżony dt pętli prądowej (~2kHz) |
@@ -1704,18 +1765,20 @@ ale z ramą dq.
 
 ## Rozbudowa projektu
 
-### Zaimplementowane w wersji 1.0.0
+### Zaimplementowane w wersji 2.0.0
 
 | # | Funkcjonalność | Opis |
 |---|----------------|------|
-| 1 | **Komutacja sinusoidalna** | Komenda `S` / `m2` — tryb sinusoidalny z interpolacją kąta Hall |
-| 2 | **FOC (Field Oriented Control)** | Komenda `F` / `m3` — feedforward + PI, Park/Clarke, SVPWM, tryb napięciowy i PI |
-| 3 | **PAS — Pedal Assist Sensor** | Timer sampling 2 kHz, filtr cyfrowy, detekcja kierunku, soft-start, maszyna stanów |
-| 4 | **WiFi — interfejs WWW** | AP mode, responsive UI, REST API, kolejka komend trybu |
-| 5 | **Konfiguracja NVS (EEPROM)** | 21 parametrów, CONFIG_VERSION=11, Serial `cfg` + Web UI |
-| 6 | **Filtracja przepustnicy** | Ring buffer + median + odrzucanie outlierów (odporność na EMI) |
-| 7 | **Filtracja PAS** | Timer sampling 500 µs, N kolejnych zgodnych próbek (odporność na EMI) |
-| 8 | **Wyświetlacz S866** | Protokół 2, prędkość, moc, poziomy wspomagania, flaga `display_required` |
+| 1 | **MCPWM center-aligned PWM** | Migracja z LEDC na MCPWM: 3 operatory × 2 generatory, UP_DOWN counter, bezpośrednie rejestry LL w ISR |
+| 2 | **ISR w przerwaniu TEZ MCPWM** | Eliminacja osobnego hw_timer — ISR wyzwalana w dolinie PWM (optymalny pomiar prądu) |
+| 3 | **Komutacja sinusoidalna** | Komenda `S` / `m2` — tryb sinusoidalny z interpolacją kąta Hall, SVPWM |
+| 4 | **FOC (Field Oriented Control)** | Komenda `F` / `m3` — feedforward + PI, Park/Clarke, SVPWM, tryb napięciowy i PI |
+| 5 | **PAS — Pedal Assist Sensor** | Timer sampling 2 kHz, filtr cyfrowy, detekcja kierunku, soft-start, maszyna stanów |
+| 6 | **WiFi — interfejs WWW** | AP mode, responsive UI, REST API, kolejka komend trybu |
+| 7 | **Konfiguracja NVS (EEPROM)** | 22 parametry, CONFIG_VERSION=12, Serial `cfg` + Web UI |
+| 8 | **Filtracja przepustnicy** | Ring buffer + median + odrzucanie outlierów (odporność na EMI) |
+| 9 | **Filtracja PAS** | Timer sampling 500 µs, N kolejnych zgodnych próbek (odporność na EMI) |
+| 10 | **Wyświetlacz S866** | Protokół 2, prędkość, moc, poziomy wspomagania, flaga `display_required` |
 
 ### Planowane rozszerzenia
 
@@ -1757,6 +1820,6 @@ board_build.partitions = default.csv
 
 ---
 
-*Dokumentacja wygenerowana: 2026-03-21*  
-*Wersja firmware: 1.0.0 (BLOCK + SINUS + FOC + PAS + WiFi + NVS)*  
-*CONFIG_VERSION: 11 | controller_config_t: 64 bajty*
+*Dokumentacja wygenerowana: 2026-03-22*  
+*Wersja firmware: 2.0.0 (MCPWM center-aligned + BLOCK + SINUS + FOC + PAS + WiFi + NVS)*  
+*CONFIG_VERSION: 12 | controller_config_t: 64 bajty*

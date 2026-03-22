@@ -1,7 +1,7 @@
 /**
  * @file main.cpp
  * @brief BLDC Motor Driver — ESP32
- * @version 1.0.0
+ * @version 2.0.0
  *
  * Sterownik silnika BLDC (bezszczotkowego) 3-fazowego na ESP32.
  * Obsługiwane metody sterowania:
@@ -22,6 +22,14 @@
  * - Hamulec: debounce z licznikiem kolejnych odczytów
  * - Halle silnika: debounce w ISR komutacji (HALL_MIN_PERIOD_US)
  *
+ * ## PWM: MCPWM center-aligned (v2.0)
+ * Migracja z LEDC (edge-aligned, 10-bit) na MCPWM (center-aligned, period=500).
+ * Trzy operatory × 2 generatory (gen_A=HIN, gen_B=LIN) sterowane bezpośrednio
+ * przez zapisy rejestrów LL w ISR (~5 ns, bez spinlocków driver API).
+ * Prescaler: group=1, timer=8 → 20 MHz, period=500 → dokładnie 20 kHz.
+ * Shadow compare: TEZ-only → symetryczne impulsy center-aligned.
+ * Dead time: bypass (IR2103 wewnętrzny ~520 ns).
+ *
  * ## Sterowniki mostu
  * IR2103: HIN=active HIGH (high-side ON gdy HIGH),
  *         LIN=active LOW (low-side ON gdy LOW — logika odwrócona!).
@@ -34,7 +42,7 @@
  * w każdym przerwaniu TEZ i ustawia odpowiednie generatory MCPWM.
  *
  * ## Konfiguracja
- * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=11).
+ * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=12).
  * Interfejs: Serial 115200 baud + WiFi AP (P17=1) z responsywnym UI.
  *
  * ## Hardware
