@@ -1297,7 +1297,7 @@ void setup() {
     
     Serial.println("==========================================");
     Serial.println("  BLDC Motor Driver - ESP32");
-    Serial.println("  Wersja: 1.0.0");
+    Serial.println("  Wersja: 1.0.0  build:PLL_SIGN_FIX");
     Serial.println("  BLOCK / SINUS / FOC | PAS | WiFi");
     Serial.println("==========================================");
     Serial.println();
@@ -3435,6 +3435,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                             }
 
                             // Korekcja kąta na przejściu Halla
+                            // Snap point = środek sektora + offset.
                             int32_t expected_entry = (int32_t)new_idx * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
                             if (expected_entry < 0) expected_entry += SINE_TABLE_SIZE;
                             if (expected_entry >= SINE_TABLE_SIZE) expected_entry -= SINE_TABLE_SIZE;
@@ -3473,7 +3474,14 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                                 g_dbg_corr_window++;
 
 #if SINE_SPEED_CORR_ENABLE
+                                // Korekcja prędkości PLL.
+                                // err>0 = kąt za wolny (za mały/za duży wg kierunku)
+                                // Dla dir:+1 (kąt rośnie): err>0 → zwiększ prędkość (+)
+                                // Dla dir:-1 (kąt maleje): err<0 → kąt za wysoki = za wolny
+                                //   → potrzeba WIĘKSZEJ prędkości (więcej odejmowania)
+                                //   → ale err<0 dałby ujemną korektę → ODWRÓĆ znak!
                                 int32_t err_s = err >> 8;
+                                if (g_sine_dir < 0) err_s = -err_s;
                                 int32_t spd_corr = (err_s * (int32_t)g_sine_speed_q16) >> 14;
                                 int32_t new_spd = (int32_t)g_sine_speed_q16 + spd_corr;
                                 if (new_spd < 0) new_spd = 0;
