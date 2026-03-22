@@ -10,7 +10,9 @@
  *   - FOC (Field Oriented Control) — inverse Park/Clarke + SVPWM
  *
  * ## Architektura
- * Komutacja odbywa się w ISR timera sprzętowego (20 kHz), niezależnie od loop().
+ * Komutacja odbywa się w ISR MCPWM TEZ (Timer Equals Zero, 20 kHz),
+ * niezależnie od loop(). Center-aligned PWM (UP_DOWN counter) zapewnia
+ * synchroniczny pomiar prądu w dolinie PWM (wszystkie low-side ON).
  * Dzięki temu Serial.printf() i inne wolne operacje w loop() nie powodują
  * zakłóceń w sterowaniu silnikiem.
  *
@@ -23,12 +25,13 @@
  * ## Sterowniki mostu
  * IR2103: HIN=active HIGH (high-side ON gdy HIGH),
  *         LIN=active LOW (low-side ON gdy LOW — logika odwrócona!).
- * W LEDC: duty=0 na LIN = LOW = low-side ON,
- *         duty=PWM_MAX_DUTY na LIN = HIGH = low-side OFF.
+ * MCPWM center-aligned: gen_A(HIN) i gen_B(LIN) sterowane niezależnie.
+ * SINUS/FOC: oba generatory = ten sam duty (IR2103 complementary + dead time).
+ * BLOCK: gen_A=PWM, gen_B=force HIGH/LOW zależnie od stanu fazy.
  *
  * ## Przepływ danych
- * loop() czyta ADC/Hall/GPIO → aktualizuje zmienne volatile → ISR odczytuje je
- * w każdym przerwaniu i ustawia odpowiednie kanały LEDC.
+ * loop() czyta ADC/Hall/GPIO → aktualizuje zmienne volatile → ISR MCPWM odczytuje je
+ * w każdym przerwaniu TEZ i ustawia odpowiednie generatory MCPWM.
  *
  * ## Konfiguracja
  * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=11).
@@ -52,6 +55,10 @@
 #include "bldc_config.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include "driver/mcpwm.h"
+#include "soc/mcpwm_struct.h"
+#include "soc/mcpwm_reg.h"
+#include "hal/mcpwm_ll.h"
 
 // ============================================================================
 // Zmienne globalne
@@ -59,8 +66,12 @@
 
 bldc_state_t g_bldc_state;
 
-// Timer sprzętowy do komutacji
-hw_timer_t *commutationTimer = NULL;
+// MCPWM ISR handle (zastępuje hw_timer — komutacja w przerwaniu TEZ center-aligned)
+static intr_handle_t g_mcpwm_isr_handle = NULL;
+/// Flaga: ISR MCPWM przeczytał ADC prądu w dolinie PWM (center)
+volatile bool g_adc_ready_isr = false;
+/// Surowe odczyty ADC prądu z ISR (przeczytane w dolinie center-aligned PWM)
+volatile uint16_t g_phase_adc_raw_isr[3] = {0, 0, 0};
 volatile uint8_t g_hall_isr = 0;
 volatile uint16_t g_duty_isr = 0;
 volatile bool g_motor_enabled = false;
@@ -307,7 +318,7 @@ static const DRAM_ATTR int8_t g_hall_to_sector_ccw[8] = {
  * @brief Zwraca sektor (0-5) dla danego stanu Halla, z uwzględnieniem kierunku.
  * W CCW używa dedykowanej tabeli dla fizycznej sekwencji CCW rotora.
  */
-static inline int8_t hallToSector(uint8_t hall) {
+static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
     if (hall == 0 || hall == 7) return -1;
     return g_reverse_isr ? g_hall_to_sector_ccw[hall] : g_hall_to_sector[hall];
 }
@@ -354,7 +365,7 @@ static void resetSineTracking(uint8_t hall_state) {
 }
 #define SINE_SNAP_THRESHOLD     (24 << 16)       // błąd > 1/4 obrotu elektr. → pełny snap kąta
 #define SINE_SAFE_MAX_DUTY      (PWM_MAX_DUTY * 75 / 100)  // SVPWM: liniowy do 58%, overmod do 75%, powyżej szkodliwe harmoniczne
-#define SINE_MIN_AMPLITUDE      15              // poniżej tego coast (center-aligned 50% = hamowanie)
+#define SINE_MIN_AMPLITUDE      8               // poniżej tego coast (~1.5% PWM_MAX_DUTY)
 
 /// Debounce czujników Halla: minimalna przerwa między przejściami [us].
 /// W trybie SINUS 6 FETów przekłądają jednocześnie (center-aligned PWM),
@@ -368,7 +379,7 @@ static void resetSineTracking(uint8_t hall_state) {
 // ── FOC (Field Oriented Control) ──
 // Architektura: pętla prądowa w loop() (~2kHz), modulacja SVPWM w ISR (20kHz).
 // loop(): czyta prądy ADC → Clarke → Park → PI(Id,Iq) → zapisuje Vd,Vq (volatile)
-// ISR: czyta Vd,Vq → InvPark(θ) → InvClarke → SVPWM → ledcWrite
+// ISR: czyta Vd,Vq → InvPark(θ) → InvClarke → SVPWM → MCPWM
 // Kąt θ: współdzielony z SINUS (Hall tracking + interpolacja Q16)
 #define FOC_KP_DEFAULT      0.5f    ///< Domyślne Kp regulatora PI d/q (PWM/A)
 #define FOC_KI_DEFAULT      5.0f    ///< Domyślne Ki regulatora PI d/q (PWM/(A·s))
@@ -399,7 +410,7 @@ static void resetSineTracking(uint8_t hall_state) {
 void initGPIO();
 void initPWM();
 void initCommutationTimer();
-void allMosfetsOff();
+void IRAM_ATTR allMosfetsOff();
 void readAnalogInputs();
 void readHallSensors();
 void readDigitalInputs();
@@ -411,6 +422,19 @@ static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty);
 static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude);
 static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude);
 static inline int32_t IRAM_ATTR sine_interp_q16(uint32_t angle_q16);
+// Prototypy phase helpers (definicje poniżej ISR)
+static inline void IRAM_ATTR phaseA_PWM(uint16_t duty);
+static inline void IRAM_ATTR phaseA_Low();
+static inline void IRAM_ATTR phaseA_Off();
+static inline void IRAM_ATTR phaseB_PWM(uint16_t duty);
+static inline void IRAM_ATTR phaseB_Low();
+static inline void IRAM_ATTR phaseB_Off();
+static inline void IRAM_ATTR phaseC_PWM(uint16_t duty);
+static inline void IRAM_ATTR phaseC_Low();
+static inline void IRAM_ATTR phaseC_Off();
+static inline void IRAM_ATTR phaseA_RegenPWM(uint16_t duty);
+static inline void IRAM_ATTR phaseB_RegenPWM(uint16_t duty);
+static inline void IRAM_ATTR phaseC_RegenPWM(uint16_t duty);
 static void printSineDebug();
 static String executeCommand(const String& cmd);
 static String mosfetTestSet(const String& which);
@@ -418,6 +442,121 @@ static void mosfetTestPrintHelp();
 static void webConfigInit();
 static void webConfigStop();
 static void webConfigHandle();
+
+// ============================================================================
+// MCPWM inline helpers — ISR-safe, direct register writes
+// ============================================================================
+//
+// Architektura: MCPWM_UNIT_0, 3 operatory (po jednym na fazę), UP_DOWN counter.
+// Każdy operator: gen_A → HIN (high-side), gen_B → LIN (low-side).
+// Oba generatory sterowane niezależnie (dead time bypass — IR2103 ma wewnętrzny).
+//
+// Mapowanie:
+//   Operator 0 = Faza A: gen_A → GPIO32 (HIN_A), gen_B → GPIO33 (LIN_A)
+//   Operator 1 = Faza B: gen_A → GPIO25 (HIN_B), gen_B → GPIO26 (LIN_B)
+//   Operator 2 = Faza C: gen_A → GPIO27 (HIN_C), gen_B → GPIO14 (LIN_C)
+//
+// IR2103: HIN=active HIGH (HIGH → HS ON), LIN=active LOW (LOW → LS ON)
+// Kontrola za pomocą bezpośrednich zapisów do rejestrów gen_force i generator action (ISR-safe).
+//
+// Sekwencja stanów:
+//   PWM:   gen_A = PWM(duty), gen_B = forced HIGH (LIN=HIGH → LS OFF)
+//   GND:   gen_A = forced LOW (HS OFF), gen_B = forced LOW (LIN=LOW → LS ON)
+//   OFF:   gen_A = forced LOW (HS OFF), gen_B = forced HIGH (LIN=HIGH → LS OFF)
+//   SINUS/FOC: gen_A = gen_B = PWM(same_duty) — IR2103 robi complementary + dead time
+//   REGEN: gen_A = forced LOW (HS OFF), gen_B = PWM(inverted_duty: 0% = LS ON, 100% = LS OFF)
+
+// ── ISR-safe MCPWM register helpers (bezpośredni zapis do rejestrów, ~5ns) ──
+//
+// Wszystkie operacje poniżej omijają driver API (mcpwm_set_duty_type,
+// mcpwm_set_signal_high/low) które używają spinlocków i nie są ISR-safe.
+// Zamiast tego operujemy bezpośrednio na rejestrach MCPWM0.
+
+// ── Precomputed gen_force.val values ──
+// gen_cntuforce_upmethod (bits [5:0]) = 0 → update immediately
+// gen_a_cntuforce_mode (bits [7:6]): 0=disabled(PWM), 1=forceLOW, 2=forceHIGH
+// gen_b_cntuforce_mode (bits [9:8]): 0=disabled(PWM), 1=forceLOW, 2=forceHIGH
+#define MCPWM_FORCE_PWM     0x0200  // gen_A=PWM(0), gen_B=forceHIGH(2) → LS OFF
+#define MCPWM_FORCE_GND     0x0140  // gen_A=forceLOW(1), gen_B=forceLOW(1) → LS ON
+#define MCPWM_FORCE_OFF     0x0240  // gen_A=forceLOW(1), gen_B=forceHIGH(2) → float
+#define MCPWM_FORCE_COMPL   0x0000  // gen_A=PWM(0), gen_B=PWM(0) → complementary
+#define MCPWM_FORCE_REGEN   0x0040  // gen_A=forceLOW(1), gen_B=PWM(0) → regen
+
+// ── Precomputed generator action register values ──
+// Dla UP_DOWN counter (center-aligned PWM):
+//   utea/uteb = action on compare match, counting UP
+//   dtea/dteb = action on compare match, counting DOWN
+//   action: 0=no change, 1=low, 2=high, 3=toggle
+//
+// UP_DOWN: czas HIGH = 2×C, okres = 2×P → duty = C/P
+// Aby duty=0→0% i duty=P→100% (jak LEDC), potrzebujemy:
+//   counting UP + compare match → LOW  (koniec fazy HIGH)
+//   counting DOWN + compare match → HIGH (początek fazy HIGH)
+//
+// gen_A (generator[0]) reacts to compare_A:     MODE_0: utea=LOW(1)  dtea=HIGH(2)
+// gen_B (generator[1]) reacts to compare_B:     MODE_0: uteb=LOW(1)  dteb=HIGH(2)
+//                                    (active-low) MODE_1: uteb=HIGH(2) dteb=LOW(1)
+#define GEN_A_ACTION_MODE0  0x00020010  // utea=1 @bits[5:4], dtea=2 @bits[17:16]
+#define GEN_B_ACTION_MODE0  0x00080040  // uteb=1 @bits[7:6], dteb=2 @bits[19:18]
+#define GEN_B_ACTION_MODE1  0x00040080  // uteb=2 @bits[7:6], dteb=1 @bits[19:18]
+
+// Szybki zapis compare value (ISR-safe, ~5ns)
+static inline void IRAM_ATTR mcpwm_set_compare_fast(int op, int cmp, uint32_t val) {
+    mcpwm_ll_operator_set_compare_value(&MCPWM0, op, cmp, val);
+}
+
+/**
+ * @brief Ustawia fazę na PWM (high-side modulowany, low-side OFF).
+ * gen_A = PWM(duty, MODE_0), gen_B = forced HIGH (LIN=HIGH → LS OFF)
+ * ISR-safe: bezpośredni zapis do rejestrów, bez spinlocków.
+ */
+static inline void IRAM_ATTR mcpwm_phase_pwm(int op, uint16_t duty) {
+    MCPWM0.operators[op].generator[0].val = GEN_A_ACTION_MODE0;
+    mcpwm_set_compare_fast(op, 0, duty);
+    MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_PWM;
+}
+
+/**
+ * @brief Ustawia fazę na GND (high-side OFF, low-side ON).
+ * gen_A = forced LOW (HS OFF), gen_B = forced LOW (LIN=LOW → LS ON)
+ */
+static inline void IRAM_ATTR mcpwm_phase_gnd(int op) {
+    MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_GND;
+}
+
+/**
+ * @brief Ustawia fazę na float (oba OFF).
+ * gen_A = forced LOW (HS OFF), gen_B = forced HIGH (LIN=HIGH → LS OFF)
+ */
+static inline void IRAM_ATTR mcpwm_phase_off(int op) {
+    MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_OFF;
+}
+
+/**
+ * @brief Ustawia fazę na SINUS/FOC (oba generatory = ten sam duty, komplementarny przez IR2103).
+ * gen_A = PWM(duty, MODE_0), gen_B = PWM(duty, MODE_0) — IR2103 tworzy komplementarne + dead time.
+ * ISR-safe: bezpośredni zapis do rejestrów.
+ */
+static inline void IRAM_ATTR mcpwm_phase_complementary(int op, uint32_t duty) {
+    MCPWM0.operators[op].generator[0].val = GEN_A_ACTION_MODE0;
+    MCPWM0.operators[op].generator[1].val = GEN_B_ACTION_MODE0;
+    mcpwm_set_compare_fast(op, 0, duty);
+    mcpwm_set_compare_fast(op, 1, duty);
+    MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_COMPL;
+}
+
+/**
+ * @brief Ustawia fazę na regen PWM (HS OFF, LS modulowany).
+ * gen_A = forced LOW (HS OFF)
+ * gen_B = PWM inverted (MODE_1): duty=0→LS ON, duty=MAX→LS OFF
+ * Przy PWM OFF: prąd indukcyjny przez body diodę HS → Vbat (regeneracja)
+ * ISR-safe: bezpośredni zapis do rejestrów.
+ */
+static inline void IRAM_ATTR mcpwm_phase_regen(int op, uint16_t regen_duty) {
+    MCPWM0.operators[op].generator[1].val = GEN_B_ACTION_MODE1;
+    mcpwm_set_compare_fast(op, 1, regen_duty);
+    MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_REGEN;
+}
 
 // Dzielnik napięcia VBAT: 1M (góra) / 33k (dół)
 static const float kVbatRTop = 1130000.0f;
@@ -691,7 +830,7 @@ static uint8_t g_pas_speed_ma_idx = 0;
 static bool g_pas_speed_ma_full = false;
 
 /// Maksymalna zmiana duty PAS na jedno wywołanie (slew rate)
-/// ~3% PWM_MAX_DUTY = 30 (przy 1023 max). Przy 2kHz loop = ~60%/s max.
+/// ~3% PWM_MAX_DUTY. Przy 2kHz loop = ~60%/s max.
 #define PAS_SLEW_RATE_MAX  30
 /// Czas podtrzymania stanu forward po krótkim "reverse" [ms]
 /// Zapobiega chwilowemu wyłączeniu PAS na szumie kierunku.
@@ -1108,6 +1247,31 @@ void setup() {
     // Inicjalizacja PWM
     initPWM();
     Serial.println("[OK] PWM zainicjalizowane");
+
+    // Diagnostyka rejestrów MCPWM po initPWM
+    for (int op = 0; op < 3; op++) {
+        Serial.printf("[MCPWM] Op%d: genA=0x%08X genB=0x%08X force=0x%08X stmp=0x%08X cfg0=0x%08X dt=0x%08X\n",
+            op,
+            MCPWM0.operators[op].generator[0].val,
+            MCPWM0.operators[op].generator[1].val,
+            MCPWM0.operators[op].gen_force.val,
+            MCPWM0.operators[op].gen_stmp_cfg.val,
+            MCPWM0.operators[op].gen_cfg0.val,
+            MCPWM0.operators[op].dt_cfg.val);
+    }
+    Serial.printf("[MCPWM] Timer0: cfg0=0x%08X period=%d\n",
+        MCPWM0.timer[0].timer_cfg0.val,
+        MCPWM0.timer[0].timer_cfg0.timer_period);
+    // Pokaż faktyczną częstotliwość PWM
+    {
+        uint32_t grp_pre = mcpwm_ll_group_get_clock_prescale(&MCPWM0);
+        uint32_t tmr_pre = mcpwm_ll_timer_get_clock_prescale(&MCPWM0, 0);
+        uint32_t period  = MCPWM0.timer[0].timer_cfg0.timer_period;
+        uint32_t timer_clk = 160000000UL / grp_pre / tmr_pre;
+        uint32_t pwm_hz = (period > 0) ? timer_clk / (2 * period) : 0;
+        Serial.printf("[MCPWM] group_pre=%u timer_pre=%u timer_clk=%u Hz  PWM=%u Hz\n",
+            grp_pre, tmr_pre, timer_clk, pwm_hz);
+    }
 
     // Upewnienie się, że wszystkie MOSFETy są wyłączone
     allMosfetsOff();
@@ -2017,47 +2181,100 @@ void initGPIO() {
  *   - duty=PWM_MAX_DUTY → LIN=HIGH → low-side OFF (bezpieczny stan domyślny)
  *   - duty=0            → LIN=LOW  → low-side ON (przewodzi prąd do GND)
  *
- * Parametry PWM:
- * - Częstotliwość: PWM_FREQUENCY = 20 kHz (powyżej słyszalności)
- * - Rozdzielczość: PWM_RESOLUTION = 10 bit (wartości 0–1023)
+ * Parametry PWM (MCPWM center-aligned):
+ * - Częstotliwość: PWM_FREQUENCY = 20 kHz (UP_DOWN counter → symmetric)
+ * - Rozdzielczość timera: 20 MHz → period = 500 counts (0..500)
+ * - Dead time: bypass (IR2103 ma wewnętrzny ~520ns)
+ * - Synchronizacja: Timer 1,2 zsynchronizowane z Timer 0 (TEZ)
  *
- * @note Po initPWM() wszystkie kanały LOW mają duty=PWM_MAX_DUTY (stan OFF).
+ * @note Po initPWM() wszystkie fazy są w stanie float (OFF).
  * allMosfetsOff() wywołuje to samo, ale jest idempotentna.
  */
 void initPWM() {
-    // Konfiguracja kanałów LEDC dla sterowania PWM mostków
-    // Na razie tylko konfiguracja - PWM nieaktywne (duty=0)
-    
-    // Faza A - High-side
-    ledcSetup(PWM_CHANNEL_A_HIGH, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcAttachPin(PIN_PWM_A_HIGH, PWM_CHANNEL_A_HIGH);
-    ledcWrite(PWM_CHANNEL_A_HIGH, 0);
+    // GPIO init — przypisanie pinów do MCPWM
+    mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, PIN_PWM_A_HIGH);  // Op0 gen_A → HIN_A
+    mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0B, PIN_PWM_A_LOW);   // Op0 gen_B → LIN_A
+    mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1A, PIN_PWM_B_HIGH);  // Op1 gen_A → HIN_B
+    mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1B, PIN_PWM_B_LOW);   // Op1 gen_B → LIN_B
+    mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM2A, PIN_PWM_C_HIGH);  // Op2 gen_A → HIN_C
+    mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM2B, PIN_PWM_C_LOW);   // Op2 gen_B → LIN_C
 
-    // Faza A - Low-side (pamiętaj: IR2103 LIN jest odwrócony!)
-    // Duty=PWM_MAX_DUTY oznacza LIN=HIGH czyli low-side OFF
-    ledcSetup(PWM_CHANNEL_A_LOW, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcAttachPin(PIN_PWM_A_LOW, PWM_CHANNEL_A_LOW);
-    ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);  // LIN=HIGH -> low-side OFF
+    // ── Konfiguracja timerów: UP_DOWN (center-aligned), 20 kHz ──
+    // mcpwm_init() ustawia GPIO matrix, operator binding, counter mode itp.
+    // Częstotliwość podana tutaj NIE jest dokładna — prescalery i period
+    // wymuszamy ręcznie poniżej, żeby uzyskać DOKŁADNIE 20 kHz z period=500.
+    mcpwm_config_t pwm_config;
+    pwm_config.frequency = PWM_FREQUENCY;     // orientacyjna, nadpisana poniżej
+    pwm_config.cmpr_a = 0.0f;               // duty A = 0%
+    pwm_config.cmpr_b = 0.0f;               // duty B = 0%
+    pwm_config.duty_mode = MCPWM_DUTY_MODE_0;  // active high
+    pwm_config.counter_mode = MCPWM_UP_DOWN_COUNTER;  // center-aligned!
 
-    // Faza B - High-side
-    ledcSetup(PWM_CHANNEL_B_HIGH, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcAttachPin(PIN_PWM_B_HIGH, PWM_CHANNEL_B_HIGH);
-    ledcWrite(PWM_CHANNEL_B_HIGH, 0);
+    mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_0, &pwm_config);
+    mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_1, &pwm_config);
+    mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_2, &pwm_config);
 
-    // Faza B - Low-side
-    ledcSetup(PWM_CHANNEL_B_LOW, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcAttachPin(PIN_PWM_B_LOW, PWM_CHANNEL_B_LOW);
-    ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+    // ── Wymuszenie prescalerów + period dla DOKŁADNIE 20 kHz PWM ──
+    // Timer clock = 160 MHz / group_pre / timer_pre = MCPWM_TIMER_RESOLUTION (20 MHz)
+    // PWM freq (UP_DOWN) = timer_clk / (2 × period) = 20M / (2×500) = 20 kHz
+    // BEZ TEGO: mcpwm_init() dobiera prescaler pod swoją period (np. 200),
+    //           a wymuszenie period=500 obniża freq do ~16 kHz (SŁYSZALNE!)
+    mcpwm_ll_group_set_clock_prescale(&MCPWM0, 1);  // group_clk = 160 MHz
+    for (int t = 0; t < 3; t++) {
+        mcpwm_ll_timer_set_clock_prescale(&MCPWM0, t, 160000000UL / MCPWM_TIMER_RESOLUTION);
+        mcpwm_ll_timer_set_peak(&MCPWM0, t, MCPWM_TIMER_PERIOD, true);
+    }
 
-    // Faza C - High-side
-    ledcSetup(PWM_CHANNEL_C_HIGH, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcAttachPin(PIN_PWM_C_HIGH, PWM_CHANNEL_C_HIGH);
-    ledcWrite(PWM_CHANNEL_C_HIGH, 0);
+    // ── Synchronizacja timerów: Timer 1,2 syncowane z Timer 0 (TEZ) ──
+    // Timer 0: master — generuje sync na TEZ (Timer Equals Zero)
+    mcpwm_sync_config_t sync_master = {};
+    sync_master.sync_sig = MCPWM_SELECT_TIMER0_SYNC;
+    sync_master.timer_val = 0;
+    sync_master.count_direction = MCPWM_TIMER_DIRECTION_UP;
 
-    // Faza C - Low-side
-    ledcSetup(PWM_CHANNEL_C_LOW, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcAttachPin(PIN_PWM_C_LOW, PWM_CHANNEL_C_LOW);
-    ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+    // Timer 0 generuje sync przy TEZ
+    mcpwm_set_timer_sync_output(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_SWSYNC_SOURCE_TEZ);
+    // Timer 1,2 syncują się z Timer 0
+    mcpwm_sync_configure(MCPWM_UNIT_0, MCPWM_TIMER_1, &sync_master);
+    mcpwm_sync_configure(MCPWM_UNIT_0, MCPWM_TIMER_2, &sync_master);
+
+    // ── Dead time: bypass (IR2103 ma wewnętrzny ~520ns dead time) ──
+    mcpwm_deadtime_enable(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_DEADTIME_BYPASS, 0, 0);
+    mcpwm_deadtime_enable(MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM_DEADTIME_BYPASS, 0, 0);
+    mcpwm_deadtime_enable(MCPWM_UNIT_0, MCPWM_TIMER_2, MCPWM_DEADTIME_BYPASS, 0, 0);
+
+    // Startuj timery
+    mcpwm_start(MCPWM_UNIT_0, MCPWM_TIMER_0);
+    mcpwm_start(MCPWM_UNIT_0, MCPWM_TIMER_1);
+    mcpwm_start(MCPWM_UNIT_0, MCPWM_TIMER_2);
+
+    // ── Konfiguracja generatorów: action registers + force upmethod ──
+    // mcpwm_init() ustawia gen_cntuforce_upmethod=32 (disable update).
+    // Nasze ISR helpery zapisują gen_force.val bezpośrednio, więc potrzebujemy
+    // upmethod=0 (immediate). Zapisz generator action registers (MODE_0)
+    // i ustaw force upmethod na immediate dla wszystkich 3 operatorów.
+    for (int op = 0; op < 3; op++) {
+        MCPWM0.operators[op].generator[0].val = GEN_A_ACTION_MODE0;
+        MCPWM0.operators[op].generator[1].val = GEN_B_ACTION_MODE0;
+        // force upmethod = 0 (immediate), force modes = 0 (disabled/PWM)
+        MCPWM0.operators[op].gen_force.val = 0;
+
+        // ── Compare shadow: update TYLKO na TEZ (nie TEZ+TEP!) ──
+        // mcpwm_init() ustawia TEZ+TEP (stmp_cfg=0x33). W center-aligned PWM
+        // to powoduje ASYMETRYCZNE impulsy: rampa UP używa starych wartości
+        // compare, a DOWN nowych (po TEP shadow transfer). Szum!
+        // TEZ-only → obie rampy używają tej samej wartości → symetryczny PWM.
+        mcpwm_ll_operator_enable_update_compare_on_tez(&MCPWM0, op, 0, true);   // cmpr_a: TEZ ✓
+        mcpwm_ll_operator_enable_update_compare_on_tep(&MCPWM0, op, 0, false);  // cmpr_a: !TEP
+        mcpwm_ll_operator_enable_update_compare_on_tez(&MCPWM0, op, 1, true);   // cmpr_b: TEZ ✓
+        mcpwm_ll_operator_enable_update_compare_on_tep(&MCPWM0, op, 1, false);  // cmpr_b: !TEP
+
+        // Action register update: immediate (ważne przy przejściach BLOCK↔SIN/FOC)
+        mcpwm_ll_operator_update_action_at_once(&MCPWM0, op);
+    }
+
+    // Inicjalny stan: wszystkie fazy OFF (float)
+    allMosfetsOff();
 }
 
 // ============================================================================
@@ -2065,10 +2282,10 @@ void initPWM() {
 // ============================================================================
 
 /**
- * @brief Przełącza wszystkie tranzystory w stan OFF (stan bezpieczny).
+ * @brief Przełącza wszystkie tranzystory w stan OFF (stan bezpieczny / float).
  *
- * IR2103: high-side OFF = HIN=LOW (duty=0),
- *         low-side OFF  = LIN=HIGH (duty=PWM_MAX_DUTY, bo logika odwrócona).
+ * MCPWM: gen_A = forced LOW (HIN=LOW → HS OFF),
+ *         gen_B = forced HIGH (LIN=HIGH → LS OFF, bo IR2103 LIN odwrócony).
  *
  * Wywoływana:
  * - po initPWM() podczas startu
@@ -2078,16 +2295,10 @@ void initPWM() {
  *
  * @note Bezpieczna do wywołania z loop() i z ISR.
  */
-void allMosfetsOff() {
-    // High-side OFF: HIN=LOW (duty=0)
-    ledcWrite(PWM_CHANNEL_A_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_B_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-
-    // Low-side OFF: LIN=HIGH (duty=MAX, bo LIN jest odwrócony w IR2103)
-    ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-    ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-    ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+void IRAM_ATTR allMosfetsOff() {
+    mcpwm_phase_off(0);  // Faza A
+    mcpwm_phase_off(1);  // Faza B
+    mcpwm_phase_off(2);  // Faza C
 }
 
 // ============================================================================
@@ -2577,9 +2788,12 @@ static void printSineDebug() {
  * Bit N = stan GPIO N. Czytanie rejestru trwa ~5 ns vs ~1 µs dla digitalRead().
  *
  * @warning Nie wolno tu używać: malloc, Serial, delay, mutex, nor F() string.
- * @warning ledcWrite() jest bezpieczne z ISR (operuje na rejestrach LEDC).
+ * @warning Funkcje MCPWM force/duty są ISR-safe (operują na rejestrach sprzętowych).
  */
-void IRAM_ATTR onCommutationTimer() {
+void IRAM_ATTR onCommutationTimer(void *arg) {
+    // Skasuj flagę przerwania TEZ Timer 0
+    mcpwm_ll_intr_clear_timer_tez_status(&MCPWM0, 1 << 0);
+
     // Odczyt Halli ZAWSZE — pomiar prędkości nawet gdy silnik wyłączony
     uint8_t ha = (GPIO.in >> PIN_HALL_SENSOR_A) & 1;
     uint8_t hb = (GPIO.in >> PIN_HALL_SENSOR_B) & 1;
@@ -2702,23 +2916,13 @@ void IRAM_ATTR onCommutationTimer() {
         if (g_regen_active_isr && g_regen_duty_isr > 0) {
             regenCommutateISR(hall, g_regen_duty_isr);
         } else {
-            ledcWrite(PWM_CHANNEL_A_HIGH, 0);
-            ledcWrite(PWM_CHANNEL_B_HIGH, 0);
-            ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-            ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            allMosfetsOff();
         }
         return;
     }
 
     if (!g_motor_enabled) {
-        ledcWrite(PWM_CHANNEL_A_HIGH, 0);
-        ledcWrite(PWM_CHANNEL_B_HIGH, 0);
-        ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-        ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-        ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-        ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+        allMosfetsOff();
         return;
     }
 
@@ -2771,8 +2975,7 @@ void IRAM_ATTR onCommutationTimer() {
             break;  // kontynuuj do komutacji blokowej poniżej
         default:
             // Tryb DISABLED → bezpieczny stan
-            ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-            ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+            allMosfetsOff();
             return;
     }
 
@@ -2780,40 +2983,13 @@ void IRAM_ATTR onCommutationTimer() {
     uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
 
     switch (bh) {
-        case 1:
-            ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
-            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-            break;
-        case 3:
-            ledcWrite(PWM_CHANNEL_A_HIGH, d);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
-            break;
-        case 2:
-            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, 0);
-            break;
-        case 6:
-            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
-            ledcWrite(PWM_CHANNEL_B_HIGH, d);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_C_HIGH, 0);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-            break;
-        case 4:
-            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, 0);
-            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-            break;
-        case 5:
-            ledcWrite(PWM_CHANNEL_A_HIGH, 0);   ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);
-            ledcWrite(PWM_CHANNEL_B_HIGH, 0);   ledcWrite(PWM_CHANNEL_B_LOW, 0);
-            ledcWrite(PWM_CHANNEL_C_HIGH, d);   ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-            break;
-        default:
-            ledcWrite(PWM_CHANNEL_A_HIGH, 0); ledcWrite(PWM_CHANNEL_B_HIGH, 0); ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-            ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY); ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
-            break;
+        case 1: phaseA_PWM(d); phaseB_Low(); phaseC_Off(); break;
+        case 3: phaseA_PWM(d); phaseB_Off(); phaseC_Low(); break;
+        case 2: phaseA_Off(); phaseB_PWM(d); phaseC_Low(); break;
+        case 6: phaseA_Low(); phaseB_PWM(d); phaseC_Off(); break;
+        case 4: phaseA_Low(); phaseB_Off(); phaseC_PWM(d); break;
+        case 5: phaseA_Off(); phaseB_Low(); phaseC_PWM(d); break;
+        default: allMosfetsOff(); break;
     }
 }
 
@@ -2822,25 +2998,23 @@ void IRAM_ATTR onCommutationTimer() {
 // ============================================================================
 
 /**
- * @brief Konfiguruje i uruchamia timer sprzętowy dla ISR komutacji.
+ * @brief Konfiguruje i uruchamia ISR komutacji na przerwaniu MCPWM TEZ.
  *
  * Konfiguracja:
- * - Timer 0 (z 4 dostępnych: 0, 1, 2, 3)
- * - Prescaler = 80 → tick = 1 µs (80 MHz APB / 80 = 1 MHz)
- * - Auto-reload = true (powtarza się co alarm)
- * - Alarm = 50 µs → częstotliwość ISR = 1/50µs = 20 kHz
- * - Edge interrupt = true
+ * - MCPWM_UNIT_0, Timer 0 TEZ (Timer Equals Zero) interrupt
+ * - Częstotliwość ISR = 20 kHz (= częstotliwość PWM, center-aligned)
+ * - ISR wywoływana w dolinie PWM (counter=0) — wszystkie low-side ON
+ *   → optymalny moment na odczyt ADC prądu (INA180A2 mierzy gdy LS przewodzi)
  *
- * @note Timer APB clock = 80 MHz (stały, niezależny od CPU frequency)
- * @note Po tej funkcji ISR onCommutationTimer() będzie wywoływana od razu.
- *       Dlatego allMosfetsOff() musi być wywołana PRZED initCommutationTimer().
+ * @note allMosfetsOff() musi być wywołana PRZED initCommutationTimer().
  */
 void initCommutationTimer() {
-    // Timer 0, prescaler 80 -> 1 MHz (1 us tick), alarm co 50 us = 20 kHz
-    commutationTimer = timerBegin(0, 80, true);
-    timerAttachInterrupt(commutationTimer, &onCommutationTimer, true);
-    timerAlarmWrite(commutationTimer, 50, true);
-    timerAlarmEnable(commutationTimer);
+    // Rejestruj globalny ISR MCPWM
+    mcpwm_isr_register(MCPWM_UNIT_0, onCommutationTimer, NULL,
+                        ESP_INTR_FLAG_IRAM,
+                        &g_mcpwm_isr_handle);
+    // Włącz przerwanie TEZ dla Timer 0 (= dolina center-aligned PWM)
+    mcpwm_ll_intr_enable_timer_tez(&MCPWM0, 0, true);
 }
 
 // ============================================================================
@@ -2881,7 +3055,7 @@ static inline int32_t IRAM_ATTR sine_interp_q16(uint32_t angle_q16) {
  *   Phase B = sin(θ + 240°)    — offset 64 wpisów (96×2/3)
  *
  * ## PWM center-aligned complementary
- *   duty = 512 + (sine_val × amplitude) >> 10
+ *   duty = PWM_MAX_DUTY/2 + (sine_val × amplitude) >> 10
  *   HIN = LIN = duty → IR2103 produkuje komplementarne switching z dead-time
  *
  * @param hall      Aktualny stan Halla [C:B:A] 1-6
@@ -2950,7 +3124,7 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     int32_t sin_b = sine_interp_q16(angle_b);
     int32_t sin_c = sine_interp_q16(angle_c);
 
-    // amplitude: 0..PWM_MAX_DUTY(1023), z ograniczeniem bezpieczeństwa
+    // amplitude: 0..PWM_MAX_DUTY, z ograniczeniem bezpieczeństwa
     int32_t amp = (int32_t)((amplitude > SINE_SAFE_MAX_DUTY) ? SINE_SAFE_MAX_DUTY : amplitude);
     g_dbg_last_amp = (uint16_t)amp;
 
@@ -2963,13 +3137,13 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     g_dbg_last_mc = (int16_t)mc;
 
     // ── 5. Write LEDC — SVPWM (Space Vector PWM / min-max centering) ──
-    // Zamiast stałej bazy 512, przesuwamy wszystkie 3 modulacje razem tak,
+    // Zamiast stałej bazy PWM_MAX_DUTY/2, przesuwamy wszystkie 3 modulacje razem tak,
     // żeby mieściły się w zakresie 0..PWM_MAX_DUTY bez klipowania.
-    // Offset = 512 - (max+min)/2 to zero-sequence (common-mode) składowa,
+    // Offset = PWM_MAX_DUTY/2 - (max+min)/2 to zero-sequence (common-mode) składowa,
     // która nie wpływa na napięcie linia-linia, ale zwiększa zakres liniowy
     // o 15.5% (z Vbus*√3/2 do Vbus) — identycznie jak SVPWM.
     //
-    // Bez SVPWM: amp > 512 → klipowanie → brak wzrostu napięcia fundamentalnego
+    // Bez SVPWM: amp > PWM_MAX_DUTY/2 → klipowanie → brak wzrostu napięcia fundamentalnego
     // Z SVPWM:   amp do ~591 → pełny Vbus bez zniekształceń
     //
     // IR2103: HIN i LIN dostają TEN SAM duty → komplementarne przełączanie
@@ -2982,7 +3156,7 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
         int32_t mx = ma;
         if (mb > mx) mx = mb;
         if (mc > mx) mx = mc;
-        int32_t offset = 512 - ((mx + mn) >> 1);
+        int32_t offset = (PWM_MAX_DUTY / 2) - ((mx + mn) >> 1);
 
         int32_t da = offset + ma;
         if (da < 0) da = 0;
@@ -2996,12 +3170,9 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
         if (dc < 0) dc = 0;
         if (dc > (int32_t)PWM_MAX_DUTY) dc = (int32_t)PWM_MAX_DUTY;
 
-        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
-        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
-        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
-        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
-        ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc);
-        ledcWrite(PWM_CHANNEL_C_LOW,  (uint32_t)dc);
+        mcpwm_phase_complementary(0, (uint32_t)da);
+        mcpwm_phase_complementary(1, (uint32_t)db);
+        mcpwm_phase_complementary(2, (uint32_t)dc);
     }
 }
 
@@ -3023,7 +3194,7 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
  * 3. Inverse Clarke: Va=Vα, Vb=(-Vα+√3·Vβ)/2, Vc=(-Vα-√3·Vβ)/2
  *    (√3 ≈ 1774/1024 w Q10)
  * 4. SVPWM min-max centering
- * 5. ledcWrite
+ * 5. MCPWM set duty
  *
  * @param hall      Aktualny stan Halla [C:B:A] 1-6
  * @param amplitude Duty z przepustnicy/rampy — używane tylko jako guard (>SINE_MIN_AMPLITUDE)
@@ -3110,7 +3281,7 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
         int32_t mx = va;
         if (vb > mx) mx = vb;
         if (vc > mx) mx = vc;
-        int32_t offset = 512 - ((mx + mn) >> 1);
+        int32_t offset = (PWM_MAX_DUTY / 2) - ((mx + mn) >> 1);
 
         int32_t da = offset + va;
         if (da < 0) da = 0;
@@ -3124,12 +3295,9 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
         if (dc_duty < 0) dc_duty = 0;
         if (dc_duty > (int32_t)PWM_MAX_DUTY) dc_duty = (int32_t)PWM_MAX_DUTY;
 
-        ledcWrite(PWM_CHANNEL_A_HIGH, (uint32_t)da);
-        ledcWrite(PWM_CHANNEL_A_LOW,  (uint32_t)da);
-        ledcWrite(PWM_CHANNEL_B_HIGH, (uint32_t)db);
-        ledcWrite(PWM_CHANNEL_B_LOW,  (uint32_t)db);
-        ledcWrite(PWM_CHANNEL_C_HIGH, (uint32_t)dc_duty);
-        ledcWrite(PWM_CHANNEL_C_LOW,  (uint32_t)dc_duty);
+        mcpwm_phase_complementary(0, (uint32_t)da);
+        mcpwm_phase_complementary(1, (uint32_t)db);
+        mcpwm_phase_complementary(2, (uint32_t)dc_duty);
     }
 }
 
@@ -3148,56 +3316,47 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
 //    4   | LOW (low-on)| OFF (float) | PWM (high)
 //    5   | OFF (float) | LOW (low-on)| PWM (high)
 
-// Pomocnicze inline do ustawiania stanu fazy
+// Pomocnicze inline do ustawiania stanu fazy — wrapper na MCPWM helpers
 /**
  * @brief Faza A: wyjście PWM (high-side ON z modulacją, low-side OFF).
  * @param duty Wypełnienie PWM 0–PWM_MAX_DUTY.
  */
-static inline void phaseA_PWM(uint16_t duty) {
-    ledcWrite(PWM_CHANNEL_A_HIGH, duty);         // HIN = PWM
-    ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);  // LIN = HIGH -> low-side OFF
+static inline void IRAM_ATTR phaseA_PWM(uint16_t duty) {
+    mcpwm_phase_pwm(0, duty);
 }
 /** @brief Faza A: podłączona do GND (high-side OFF, low-side ON). */
-static inline void phaseA_Low() {
-    ledcWrite(PWM_CHANNEL_A_HIGH, 0);             // HIN = LOW -> high-side OFF
-    ledcWrite(PWM_CHANNEL_A_LOW, 0);              // LIN = LOW -> low-side ON
+static inline void IRAM_ATTR phaseA_Low() {
+    mcpwm_phase_gnd(0);
 }
 /** @brief Faza A: pływająca (oba tranzystory OFF). */
-static inline void phaseA_Off() {
-    ledcWrite(PWM_CHANNEL_A_HIGH, 0);             // HIN = LOW -> high-side OFF
-    ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY);   // LIN = HIGH -> low-side OFF
+static inline void IRAM_ATTR phaseA_Off() {
+    mcpwm_phase_off(0);
 }
 
 /** @brief Faza B: PWM (high-side ON, low-side OFF). @param duty 0–PWM_MAX_DUTY. */
-static inline void phaseB_PWM(uint16_t duty) {
-    ledcWrite(PWM_CHANNEL_B_HIGH, duty);
-    ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+static inline void IRAM_ATTR phaseB_PWM(uint16_t duty) {
+    mcpwm_phase_pwm(1, duty);
 }
 /** @brief Faza B: GND (high-side OFF, low-side ON). */
-static inline void phaseB_Low() {
-    ledcWrite(PWM_CHANNEL_B_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_B_LOW, 0);
+static inline void IRAM_ATTR phaseB_Low() {
+    mcpwm_phase_gnd(1);
 }
 /** @brief Faza B: pływająca (oba OFF). */
-static inline void phaseB_Off() {
-    ledcWrite(PWM_CHANNEL_B_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY);
+static inline void IRAM_ATTR phaseB_Off() {
+    mcpwm_phase_off(1);
 }
 
 /** @brief Faza C: PWM (high-side ON, low-side OFF). @param duty 0–PWM_MAX_DUTY. */
-static inline void phaseC_PWM(uint16_t duty) {
-    ledcWrite(PWM_CHANNEL_C_HIGH, duty);
-    ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+static inline void IRAM_ATTR phaseC_PWM(uint16_t duty) {
+    mcpwm_phase_pwm(2, duty);
 }
 /** @brief Faza C: GND (high-side OFF, low-side ON). */
-static inline void phaseC_Low() {
-    ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_C_LOW, 0);
+static inline void IRAM_ATTR phaseC_Low() {
+    mcpwm_phase_gnd(2);
 }
 /** @brief Faza C: pływająca (oba OFF). */
-static inline void phaseC_Off() {
-    ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY);
+static inline void IRAM_ATTR phaseC_Off() {
+    mcpwm_phase_off(2);
 }
 
 // ============================================================================
@@ -3207,14 +3366,10 @@ static inline void phaseC_Off() {
 /**
  * @brief Faza A: regen PWM (high-side OFF, low-side PWM).
  * @param duty Siła hamowania 0–PWM_MAX_DUTY (0=brak zwarcia, MAX=pełne zwarcie).
- *
- * IR2103 LIN odwrócony: duty=0 → LIN=LOW → LS ON,
- * więc LEDC duty = PWM_MAX_DUTY - regen_duty.
- * Przy PWM OFF (LS wyłączony) prąd indukcyjny płynie przez body diodę HS do V+.
+ * MCPWM: gen_A forced LOW (HS OFF), gen_B = active-low PWM (LIN=LOW → LS ON).
  */
 static inline void IRAM_ATTR phaseA_RegenPWM(uint16_t duty) {
-    ledcWrite(PWM_CHANNEL_A_HIGH, 0);                          // HIN=LOW → HS OFF
-    ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY - duty);         // LS PWM (odwrócone)
+    mcpwm_phase_regen(0, duty);
 }
 
 /**
@@ -3222,8 +3377,7 @@ static inline void IRAM_ATTR phaseA_RegenPWM(uint16_t duty) {
  * @param duty Siła hamowania 0–PWM_MAX_DUTY.
  */
 static inline void IRAM_ATTR phaseB_RegenPWM(uint16_t duty) {
-    ledcWrite(PWM_CHANNEL_B_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY - duty);
+    mcpwm_phase_regen(1, duty);
 }
 
 /**
@@ -3231,8 +3385,7 @@ static inline void IRAM_ATTR phaseB_RegenPWM(uint16_t duty) {
  * @param duty Siła hamowania 0–PWM_MAX_DUTY.
  */
 static inline void IRAM_ATTR phaseC_RegenPWM(uint16_t duty) {
-    ledcWrite(PWM_CHANNEL_C_HIGH, 0);
-    ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY - duty);
+    mcpwm_phase_regen(2, duty);
 }
 
 // ============================================================================
@@ -3309,7 +3462,7 @@ static void IRAM_ATTR regenCommutateISR(uint8_t hall, uint16_t regen_duty) {
  * @param duty      Wypełnienie PWM 0–PWM_MAX_DUTY
  *
  * @note Jeśli hallState == 0 lub 7 (błąd czujników) → allMosfetsOff() + fault=true.
- * @note Używa pomocniczych funkcji phaseX_PWM/Low/Off() zamiast bezpośrednich ledcWrite().
+ * @note Używa pomocniczych funkcji phaseX_PWM/Low/Off() (MCPWM wrappers).
  */
 void blockCommutate(uint8_t hallState, uint16_t duty) {
     // Walidacja stanu Halla
@@ -3384,7 +3537,7 @@ void printHelp() {
     Serial.println("d          Wylacz silnik (duty=0, wszystkie MOSFET OFF = wolnobieg)");
     Serial.println();
     Serial.println("---------- Sterowanie moca (duty cycle) ----------");
-    Serial.println("+          Zwieksz duty o 5% (wzgledem PWM_MAX_DUTY=1023)");
+    Serial.println("+          Zwieksz duty o 5% (wzgledem PWM_MAX_DUTY)");
     Serial.println("-          Zmniejsz duty o 5%");
     Serial.println("0-100      Ustaw duty bezposrednio [%]. Np. '50' = 50% mocy.");
     Serial.println("             0=wylaczony, 100=pelna moc. Dziala w trybie manual.");
@@ -3585,8 +3738,8 @@ static void mosfetTestPrintHelp() {
  * ustawia allMosfetsOff() a potem włącza TYLKO wybrany tranzystor.
  *
  * Logika IR2103:
- *   HIGH-side ON: ledcWrite(HIN_channel, g_mosfet_test_duty)
- *   LOW-side  ON: ledcWrite(LIN_channel, PWM_MAX_DUTY - g_mosfet_test_duty)
+ *   HIGH-side ON: mcpwm_phase_pwm(op, g_mosfet_test_duty)
+ *   LOW-side  ON: mcpwm_phase_regen(op, g_mosfet_test_duty)
  *                 — LIN=LOW przez X% (wejście odwrócone IR2103)
  *
  * @param cmd Komenda "tXY" gdzie X={A,B,C} Y={H,L}
@@ -3623,26 +3776,28 @@ static String mosfetTestSet(const String& cmd) {
     // Bezpieczny stan — wszystko OFF
     allMosfetsOff();
 
-    // Wybór kanału i ustawienie PWM
+    // Wybór kanału i ustawienie PWM (MCPWM)
+    // HIGH-side: gen_A = PWM(duty), gen_B = forced HIGH (LS OFF)
+    // LOW-side: gen_A = forced LOW (HS OFF), gen_B = active-low PWM (LS ON)
     uint16_t duty = g_mosfet_test_duty;
     const char* pinInfo = "";
     if (phase == 'A' && side == 'H') {
-        ledcWrite(PWM_CHANNEL_A_HIGH, duty);
+        mcpwm_phase_pwm(0, duty);
         pinInfo = "GPIO32 HIN_A";
     } else if (phase == 'A' && side == 'L') {
-        ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY - duty);
+        mcpwm_phase_regen(0, duty);
         pinInfo = "GPIO33 LIN_A";
     } else if (phase == 'B' && side == 'H') {
-        ledcWrite(PWM_CHANNEL_B_HIGH, duty);
+        mcpwm_phase_pwm(1, duty);
         pinInfo = "GPIO25 HIN_B";
     } else if (phase == 'B' && side == 'L') {
-        ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY - duty);
+        mcpwm_phase_regen(1, duty);
         pinInfo = "GPIO26 LIN_B";
     } else if (phase == 'C' && side == 'H') {
-        ledcWrite(PWM_CHANNEL_C_HIGH, duty);
+        mcpwm_phase_pwm(2, duty);
         pinInfo = "GPIO27 HIN_C";
     } else if (phase == 'C' && side == 'L') {
-        ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY - duty);
+        mcpwm_phase_regen(2, duty);
         pinInfo = "GPIO14 LIN_C";
     }
 
@@ -3673,12 +3828,12 @@ static String mosfetTestSetDuty(int pct) {
         uint16_t duty = g_mosfet_test_duty;
         char phase = g_mosfet_test_phase;
         char side  = g_mosfet_test_side;
-        if (phase == 'A' && side == 'H') ledcWrite(PWM_CHANNEL_A_HIGH, duty);
-        else if (phase == 'A' && side == 'L') ledcWrite(PWM_CHANNEL_A_LOW, PWM_MAX_DUTY - duty);
-        else if (phase == 'B' && side == 'H') ledcWrite(PWM_CHANNEL_B_HIGH, duty);
-        else if (phase == 'B' && side == 'L') ledcWrite(PWM_CHANNEL_B_LOW, PWM_MAX_DUTY - duty);
-        else if (phase == 'C' && side == 'H') ledcWrite(PWM_CHANNEL_C_HIGH, duty);
-        else if (phase == 'C' && side == 'L') ledcWrite(PWM_CHANNEL_C_LOW, PWM_MAX_DUTY - duty);
+        if (phase == 'A' && side == 'H') mcpwm_phase_pwm(0, duty);
+        else if (phase == 'A' && side == 'L') mcpwm_phase_regen(0, duty);
+        else if (phase == 'B' && side == 'H') mcpwm_phase_pwm(1, duty);
+        else if (phase == 'B' && side == 'L') mcpwm_phase_regen(1, duty);
+        else if (phase == 'C' && side == 'H') mcpwm_phase_pwm(2, duty);
+        else if (phase == 'C' && side == 'L') mcpwm_phase_regen(2, duty);
 
         char buf[96];
         snprintf(buf, sizeof(buf), "Test duty: %d%% — zaktualizowano Faza %c %s-side",

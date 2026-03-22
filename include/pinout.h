@@ -149,36 +149,43 @@
 #define PIN_EXT_3               16  // GPIO16
 
 // ============================================================================
-// Konfiguracja PWM (LEDC)
+// Konfiguracja PWM (MCPWM — center-aligned complementary)
 // ============================================================================
+//
+// Architektura MCPWM:
+//   MCPWM_UNIT_0 z 3 operatorami, UP_DOWN counter (center-aligned / symmetric).
+//   Każdy operator steruje parą HIN/LIN jednej fazy (komplementarnie + dead time).
+//   Wszystkie 3 timery zsynchronizowane → fazowe centrum w tym samym momencie.
+//   ADC trigger: ISR na TEZ (Timer Equals Zero) = wszystkie low-side ON = okno pomiarowe.
+//
+// IR2103: HIN=active HIGH, LIN=active LOW
+//   gen_A → HIN = normalny PWM (active high)
+//   gen_B → LIN = komplementarny (odwrócony) z dead-time
+//   Typ dead-time: MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE
+//     gen_A: PWM + rising edge delay (RED)
+//     gen_B: ~PWM (complement) + falling edge delay (FED)
+//
+// Timer resolution: 20 MHz (prescaler = 8 z 160 MHz grupy)
+// Period (UP_DOWN): 500 counts = 20 kHz (20M / 500 / 2 = 20k)
+// Zakres duty: compare 0..500 (proporcjonalny do okresu, NIE 0..1023!)
+// Dead time: ~500ns = 10 ticks @ 20MHz (RED=10, FED=10)
 
 /** @brief Częstotliwość PWM dla sterowników MOSFET [Hz] */
 #define PWM_FREQUENCY           20000
 
-/** @brief Rozdzielczość PWM [bity] */
-#define PWM_RESOLUTION          10
+/** @brief Rozdzielczość timera MCPWM [Hz] — prescaler wewnętrzny */
+#define MCPWM_TIMER_RESOLUTION  20000000
 
-/** @brief Maksymalna wartość PWM (2^PWM_RESOLUTION - 1) */
-#define PWM_MAX_DUTY            ((1 << PWM_RESOLUTION) - 1)
+/** @brief Okres timera MCPWM (half-period for UP_DOWN = resolution / frequency / 2) */
+#define MCPWM_TIMER_PERIOD      (MCPWM_TIMER_RESOLUTION / PWM_FREQUENCY / 2)
 
-/**
- * @defgroup ledc_channels Kanały LEDC
- * @brief Przypisanie kanałów LEDC do sterowania mostkami irR2103.
- *
- * ESP32 ma 16 kanałów LEDC (0-15). Każda faza wymaga 2 kanałów (HIGH + LOW).
- * Kanały 0-5 są używane dla faz A, B, C.
- *
- * Uwaga o LIN (LOW kanały):
- *   duty=0            → pin=LOW  → LIN=LOW  → low-side MOSFET ON (przewodzi)
- *   duty=PWM_MAX_DUTY → pin=HIGH → LIN=HIGH → low-side MOSFET OFF (bezpieczny stan)
- * @{
- */
-#define PWM_CHANNEL_A_HIGH      0   ///< Kanał LEDC: Faza A high-side (HIN)
-#define PWM_CHANNEL_A_LOW       1   ///< Kanał LEDC: Faza A low-side (LIN, logika odwrócona)
-#define PWM_CHANNEL_B_HIGH      2   ///< Kanał LEDC: Faza B high-side (HIN)
-#define PWM_CHANNEL_B_LOW       3   ///< Kanał LEDC: Faza B low-side (LIN, logika odwrócona)
-#define PWM_CHANNEL_C_HIGH      4   ///< Kanał LEDC: Faza C high-side (HIN)
-#define PWM_CHANNEL_C_LOW       5   ///< Kanał LEDC: Faza C low-side (LIN, logika odwrócona)
-/** @} */
+/** @brief Maksymalna wartość duty (compare value = half period) */
+#define PWM_MAX_DUTY            MCPWM_TIMER_PERIOD
+
+/** @brief Dead time rising edge delay [ticks timer resolution] (~500ns @ 20MHz) */
+#define MCPWM_DEAD_TIME_RED     10
+
+/** @brief Dead time falling edge delay [ticks timer resolution] (~500ns @ 20MHz) */
+#define MCPWM_DEAD_TIME_FED     10
 
 #endif // PINOUT_H
