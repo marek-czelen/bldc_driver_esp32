@@ -67,6 +67,8 @@
 #include "soc/mcpwm_struct.h"
 #include "soc/mcpwm_reg.h"
 #include "hal/mcpwm_ll.h"
+#include "driver/adc.h"           // adc1_config_width/channel_atten
+#include "soc/sens_struct.h"      // SENS — direct register access for ISR-safe ADC
 
 // ============================================================================
 // Zmienne globalne
@@ -80,6 +82,10 @@ static intr_handle_t g_mcpwm_isr_handle = NULL;
 volatile bool g_adc_ready_isr = false;
 /// Surowe odczyty ADC prądu z ISR (przeczytane w dolinie center-aligned PWM)
 volatile uint16_t g_phase_adc_raw_isr[3] = {0, 0, 0};
+/// Flaga: ISR może czytać ADC1 (false=loop() czyta ADC1, ISR pomija)
+volatile bool g_adc_isr_active = false;
+/// Licznik timeoutów ADC w ISR (diagnostyka)
+volatile uint32_t g_adc_timeout_count = 0;
 volatile uint8_t g_hall_isr = 0;
 volatile uint16_t g_duty_isr = 0;
 volatile bool g_motor_enabled = false;
@@ -87,6 +93,11 @@ volatile bool g_brake_isr = false;
 volatile drive_mode_t g_mode_isr = DRIVE_MODE_DISABLED;   ///< Tryb sterowania (do ISR)
 static uint16_t g_pwm_freq_hz = PWM_FREQUENCY;           ///< Aktualna częstotliwość PWM [Hz]
 static uint16_t applyPwmFrequency(uint16_t freq_hz);     ///< Forward declaration
+
+// Debug Hall — śledzenie komutacji w ISR
+volatile uint8_t  g_dbg_hall_raw_isr = 0;       ///< Ostatni surowy odczyt Hall z GPIO
+volatile uint8_t  g_dbg_hall_filt_isr = 0;      ///< Ostatni przefiltrowany Hall użyty do komutacji
+volatile uint8_t  g_dbg_commut_path = 0;        ///< 0=off, 1=block, 2=sinus, 3=foc, 4=block_startup
 
 // Pomiar RPM z przejść Halla (aktualizowane w ISR timera)
 volatile uint8_t g_hall_prev_isr = 0;         ///< Poprzedni POTWIERDZONY stan Halla w ISR
@@ -383,7 +394,8 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
 #define SINE_PHASE_A_OFFSET     0               // faza referencyjna
 #define SINE_PHASE_B_OFFSET     64              // 96*2/3 = 240°
 #define SINE_PHASE_C_OFFSET     32              // 96/3 = 120°
-#define SINE_STARTUP_COMMUT     12              // komutacji blokowych przed sinus
+#define SINE_STARTUP_COMMUT     18              // przejść Halla w BLOCK przed przejściem na SINUS/FOC (3 obroty el.)
+#define SINE_BLOCK_SPEED_THRESHOLD  10000       // Q16 speed poniżej tego → BLOCK zamiast SINUS/FOC (stall/oscylacja)
 #define SINE_STALL_FREEZE_MS    200             // ms bez Halla → zamrożenie kąta
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prędkość startowa ≈ 1 obr.elekt./s (52428800/166666)
 #define SINE_STALL_FALLBACK_MS  400             // minimalny timeout fallback (histereza, anty-szarpanie)
@@ -636,6 +648,12 @@ static const unsigned long AUTO_STATUS_INTERVAL_MS = 100;
 static bool g_debugSine = false;
 static unsigned long g_lastDebugSineMs = 0;
 static const unsigned long DEBUG_SINE_INTERVAL_MS = 200;
+static bool g_debugCurrent = false;
+static unsigned long g_lastDebugCurrentMs = 0;
+static const unsigned long DEBUG_CURRENT_INTERVAL_MS = 500;
+static bool g_debugHall = false;
+static unsigned long g_lastDebugHallMs = 0;
+static const unsigned long DEBUG_HALL_INTERVAL_MS = 200;
 
 // Bufor na komendy numeryczne
 static String serialBuffer = "";
@@ -1297,7 +1315,7 @@ void setup() {
     
     Serial.println("==========================================");
     Serial.println("  BLDC Motor Driver - ESP32");
-    Serial.println("  Wersja: 1.0.0  build:PLL_SIGN_FIX");
+    Serial.println("  Wersja: 1.0.0  build:ADC_SYNC_BLKSTART");
     Serial.println("  BLOCK / SINUS / FOC | PAS | WiFi");
     Serial.println("==========================================");
     Serial.println();
@@ -1330,6 +1348,15 @@ void setup() {
     // Inicjalizacja GPIO
     initGPIO();
     Serial.println("[OK] GPIO zainicjalizowane");
+
+    // Konfiguracja ADC1 dla pomiaru prądu fazowego w ISR (direct register access)
+    // analogRead() konfiguruje kanały przy pierwszym wywołaniu, ale ISR omija sterownik
+    // i czyta rejestry bezpośrednio → trzeba skonfigurować kanały jawnie.
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_3, ADC_ATTEN_DB_12);  // Phase A (GPIO39)
+    adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_12);  // Phase B (GPIO34)
+    adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_12);  // Phase C (GPIO35)
+    Serial.println("[OK] ADC1 skonfigurowany (prądy fazowe, 12-bit, 11dB atten)");
 
     // Przerwanie na pinie SPEED (czujnik zewnętrzny — aktywne przy P07<=1)
     attachInterrupt(digitalPinToInterrupt(PIN_SPEED), onSpeedPulse, FALLING);
@@ -1386,7 +1413,8 @@ void setup() {
 
     // Timer sprzętowy do komutacji (co 50 us = 20 kHz)
     initCommutationTimer();
-    Serial.println("[OK] Timer komutacji uruchomiony (20 kHz)");
+    g_adc_isr_active = true;  // włącz odczyt ADC prądu w ISR po pełnej konfiguracji
+    Serial.println("[OK] Timer komutacji uruchomiony (20 kHz) + ADC prądu w ISR TEZ");
 
     // Zastosuj częstotliwość PWM z NVS (jeśli inna niż domyślna 20 kHz)
     if (cfg.pwm_freq_hz >= 8000 && cfg.pwm_freq_hz <= 32000 && cfg.pwm_freq_hz != PWM_FREQUENCY) {
@@ -2212,7 +2240,12 @@ void loop() {
 
     // Aktualizacja zmiennych ISR z głównego stanu
     g_hall_isr = g_bldc_state.hall_state;
-    g_duty_isr = g_bldc_state.duty_cycle;
+    {
+        uint16_t raw_duty = g_bldc_state.duty_cycle;
+        uint16_t min_duty = ((uint16_t)config_get().duty_min_pct * PWM_MAX_DUTY) / 100;
+        if (raw_duty > 0 && raw_duty < min_duty) raw_duty = 0;
+        g_duty_isr = raw_duty;
+    }
     g_motor_enabled = (g_bldc_state.mode != DRIVE_MODE_DISABLED) &&
         (g_bldc_state.duty_cycle > 0 || g_bldc_state.mode == DRIVE_MODE_SINUS || g_bldc_state.mode == DRIVE_MODE_FOC);
     g_brake_isr = g_bldc_state.brake_active;
@@ -2234,11 +2267,9 @@ void loop() {
         if (g_bldc_state.phase_current[2] > maxI) maxI = g_bldc_state.phase_current[2];
         g_maxI_now = maxI;
 
-        // EMA filtr prądu dla limitera — odrzuca szpilki ADC z niesynchr. samplingiem.
-        // INA180A2 z low-side shuntem: ADC nie zsynchr. z PWM → transjenty
-        // przełączania dają odczyty 20-33A z zasilacza 3A.
-        // EMA α=0.15 → τ≈3ms przy loop ~1kHz. Wystarczająco szybki na ochronę,
-        // wystarczająco wolny na odrzucenie pojedynczych szpilek.
+        // EMA filtr prądu dla limitera — wygładza szum ADC.
+        // ADC zsynchronizowany z PWM (ISR TEZ) → odczyty stabilne.
+        // EMA α=0.15 → τ≈3ms przy loop ~1kHz.
         g_ilim_current_ema += ILIMIT_EMA_ALPHA * (maxI - g_ilim_current_ema);
         if (g_ilim_current_ema < 0.0f) g_ilim_current_ema = 0.0f;
         g_maxI_filtered = g_ilim_current_ema;
@@ -2527,6 +2558,46 @@ void loop() {
     if (g_debugSine && (millis() - g_lastDebugSineMs >= DEBUG_SINE_INTERVAL_MS)) {
         g_lastDebugSineMs = millis();
         printSineDebug();
+    }
+
+    // Debug prądów co 500ms
+    if (g_debugCurrent && (millis() - g_lastDebugCurrentMs >= DEBUG_CURRENT_INTERVAL_MS)) {
+        g_lastDebugCurrentMs = millis();
+        float maxI = fmaxf(g_bldc_state.phase_current[0],
+                           fmaxf(g_bldc_state.phase_current[1], g_bldc_state.phase_current[2]));
+        float dutyPct = (float)g_bldc_state.duty_cycle * 100.0f / PWM_MAX_DUTY;
+        // Idc ≈ Ifaz × duty (przybliżenie prądu DC bus z zasilacza)
+        float idcEst = g_ilim_current_ema * dutyPct / 100.0f;
+        Serial.printf("[I] A=%5.2f B=%5.2f C=%5.2f | max=%5.2f ema=%5.2f Idc~%.1f | d=%3.0f%% lim=%d fct=%.2f | raw=%u/%u/%u to=%lu\n",
+            g_bldc_state.phase_current[0],
+            g_bldc_state.phase_current[1],
+            g_bldc_state.phase_current[2],
+            maxI, g_ilim_current_ema, idcEst,
+            dutyPct, (int)getEffectiveCurrentLimit(),
+            g_current_limit_factor,
+            (unsigned)g_phase_adc_raw_isr[0], (unsigned)g_phase_adc_raw_isr[1], (unsigned)g_phase_adc_raw_isr[2],
+            (unsigned long)g_adc_timeout_count);
+    }
+
+    // Debug Hall co 200ms — śledzenie komutacji
+    if (g_debugHall && (millis() - g_lastDebugHallMs >= DEBUG_HALL_INTERVAL_MS)) {
+        g_lastDebugHallMs = millis();
+        const char* pathNames[] = {"OFF", "BLK", "SIN", "FOC", "B-S"};
+        uint8_t p = g_dbg_commut_path;
+        if (p > 4) p = 0;
+        Serial.printf("[H] raw=%d filt=%d sec=%d | spd=%lu stup=%u dir=%d | path=%s d=%u | edges=%lu glitch=%lu inv=%lu seqrej=%lu\n",
+            (int)g_dbg_hall_raw_isr,
+            (int)g_dbg_hall_filt_isr,
+            (int)g_sine_last_hall_idx,
+            (unsigned long)g_sine_speed_q16,
+            (unsigned)g_sine_startup_count,
+            (int)g_sine_dir,
+            pathNames[p],
+            (unsigned)g_duty_isr,
+            (unsigned long)g_dbg_hall_edges,
+            (unsigned long)g_dbg_hall_glitch,
+            (unsigned long)g_dbg_hall_invalid,
+            (unsigned long)g_dbg_hall_seq_reject);
     }
 
     // Debug FOC co 200ms
@@ -2831,36 +2902,30 @@ void IRAM_ATTR allMosfetsOff() {
  *       przy uruchomieniu firmware (filtr EMA stabilizuje się po ~50 iteracjach).
  */
 void readAnalogInputs() {
-    // Odczyt napięcia baterii
+    // Odczyt napięcia baterii — ADC1_CH0 (GPIO36)
+    // Guard: wyłącz ISR ADC na czas odczytu, bo ISR też używa ADC1.
+    g_adc_isr_active = false;
     uint16_t batteryRaw = analogRead(PIN_BATTERY_VOLTAGE);
+    g_adc_isr_active = true;
 
-    // ── Odczyt prądów fazowych: przepleciony burst × 3 + mediana ──
-    // ADC nie jest zsynchronizowany z PWM (LEDC nie ma triggera ADC).
-    // INA180A2 low-side mierzy prąd tylko gdy low-side MOSFET ON.
-    // analogRead() trafia losowo w: (a) low-side ON → prawdziwy prąd,
-    // (b) low-side OFF → ≈0, (c) transient przełączania → szpilka.
-    // Przeplecione czytanie (A,B,C,A,B,C,A,B,C) rozciąga 9 odczytów
-    // na ~4-9 cykli PWM → maksymalizuje szansę trafienia w low-side ON.
-    // Mediana z 3 próbek odrzuca zarówno szpilkę jak i zero.
+    // ── Odczyt prądów fazowych: zsynchronizowany z PWM (ISR TEZ) ──
+    // ISR onCommutationTimer czyta ADC prądu w dolinie center-aligned PWM
+    // (counter=0, wszystkie low-side ON) → odczyt stabilny, bez szpilek.
+    // Gdy ISR nie dostarczył danych (np. przed uruchomieniem timera),
+    // fallback na analogRead() z medianą (stare zachowanie).
     uint16_t phaseA_raw, phaseB_raw, phaseC_raw;
-    {
-        uint16_t sa[3], sb[3], sc[3];
-        for (uint8_t i = 0; i < 3; i++) {
-            sa[i] = analogRead(PIN_PHASE_A_CURRENT);
-            sb[i] = analogRead(PIN_PHASE_B_CURRENT);
-            sc[i] = analogRead(PIN_PHASE_C_CURRENT);
-        }
-        // Sortowanie sieci (sorting network) — 3 porównania dla 3 elementów
-        #define MEDIAN3(arr) do { \
-            if (arr[0] > arr[1]) { uint16_t t = arr[0]; arr[0] = arr[1]; arr[1] = t; } \
-            if (arr[1] > arr[2]) { uint16_t t = arr[1]; arr[1] = arr[2]; arr[2] = t; } \
-            if (arr[0] > arr[1]) { uint16_t t = arr[0]; arr[0] = arr[1]; arr[1] = t; } \
-        } while(0)
-        MEDIAN3(sa); MEDIAN3(sb); MEDIAN3(sc);
-        #undef MEDIAN3
-        phaseA_raw = sa[1];  // mediana
-        phaseB_raw = sb[1];
-        phaseC_raw = sc[1];
+    if (g_adc_ready_isr) {
+        phaseA_raw = g_phase_adc_raw_isr[0];
+        phaseB_raw = g_phase_adc_raw_isr[1];
+        phaseC_raw = g_phase_adc_raw_isr[2];
+        g_adc_ready_isr = false;
+    } else {
+        // Fallback: bezpośredni odczyt (przed init ISR lub ISR nieaktywny)
+        g_adc_isr_active = false;
+        phaseA_raw = analogRead(PIN_PHASE_A_CURRENT);
+        phaseB_raw = analogRead(PIN_PHASE_B_CURRENT);
+        phaseC_raw = analogRead(PIN_PHASE_C_CURRENT);
+        g_adc_isr_active = true;
     }
 
     // Przepustnica: bufor kołowy N próbek (1 na iterację loop) + mediana
@@ -2960,10 +3025,9 @@ void readAnalogInputs() {
     g_foc_ib_signed = ib;
     g_foc_ic_signed = ic;
 
-    // FOC: EMA filtr prądów — wygładza sporadyczne odczyty z niesynchr. ADC.
-    // INA180A2 mierzy prąd tylko gdy low-side ON (center-aligned PWM).
-    // analogRead() trafia w low-side ON ~50% czasu → reszta to zera.
-    // EMA uśrednia to do stabilnego feedbacku dla PI regulatorów.
+    // FOC: EMA filtr prądów — wygładza szum ADC.
+    // ADC zsynchronizowany z PWM (ISR TEZ) → odczyty stabilne, bez szpilek.
+    // EMA wygładza niewielki szum kwantyzacji SAR ADC.
     if (g_bldc_state.mode == DRIVE_MODE_FOC) {
         g_foc_ia_ema += FOC_CURRENT_EMA_ALPHA * (ia - g_foc_ia_ema);
         g_foc_ib_ema += FOC_CURRENT_EMA_ALPHA * (ib - g_foc_ib_ema);
@@ -3339,9 +3403,42 @@ static void printSineDebug() {
  * @warning Nie wolno tu używać: malloc, Serial, delay, mutex, nor F() string.
  * @warning Funkcje MCPWM force/duty są ISR-safe (operują na rejestrach sprzętowych).
  */
+
+// ── ISR-safe ADC1 read — bezpośredni dostęp do rejestrów SAR ADC ──
+// analogRead() używa mutex → nie wolno w ISR.
+// Ta funkcja omija sterownik i czyta SAR ADC1 bezpośrednio (~3µs).
+// Wymaga wcześniejszej konfiguracji kanału (adc1_config_channel_atten w setup).
+// Timeout: max ~5µs (1200 cykli @240MHz) — zapobiega blokowaniu ISR
+// gdy ADC jest zajęty przez analogRead() z loop().
+static uint16_t IRAM_ATTR adc1_read_isr(uint8_t channel) {
+    // Upewnij się, że SAR ADC1 jest w trybie RTC (software trigger)
+    SENS.sar_meas_start1.meas1_start_force = 1;  // force start by software
+    SENS.sar_read_ctrl.sar1_dig_force = 0;        // SAR1 controlled by RTC, not DIG
+    SENS.sar_meas_start1.sar1_en_pad = (1 << channel);
+    SENS.sar_meas_start1.meas1_start_sar = 0;
+    SENS.sar_meas_start1.meas1_start_sar = 1;
+    // Timeout: ~1200 iteracji ≈ 5µs @240MHz. Normalnie konwersja trwa ~2µs.
+    uint32_t timeout = 1200;
+    while (!SENS.sar_meas_start1.meas1_done_sar && --timeout) {}
+    if (timeout == 0) { g_adc_timeout_count++; return 0; }  // ADC busy — zwróć 0
+    return SENS.sar_meas_start1.meas1_data_sar;
+}
+
 void IRAM_ATTR onCommutationTimer(void *arg) {
     // Skasuj flagę przerwania TEZ Timer 0
     mcpwm_ll_intr_clear_timer_tez_status(&MCPWM0, 1 << 0);
+
+    // ── Odczyt ADC prądu w dolinie PWM (TEZ) ──
+    // TEZ = counter=0 w center-aligned: wszystkie low-side ON → prąd shuntu stabilny.
+    // Czytaj NATYCHMIAST po wejściu do ISR, zanim okno zero-vector się skończy.
+    // Trzy odczyty ~9µs — mieści się w oknie zero-vector (≥6µs przy 75% duty).
+    // Flaga g_adc_isr_active=false gdy loop() czyta ADC1 (battery) → unikamy konfliktu HW.
+    if (g_adc_isr_active) {
+        g_phase_adc_raw_isr[0] = adc1_read_isr(ADC1_CHANNEL_3);  // Phase A (GPIO39)
+        g_phase_adc_raw_isr[1] = adc1_read_isr(ADC1_CHANNEL_6);  // Phase B (GPIO34)
+        g_phase_adc_raw_isr[2] = adc1_read_isr(ADC1_CHANNEL_7);  // Phase C (GPIO35)
+        g_adc_ready_isr = true;
+    }
 
     // Odczyt Halli ZAWSZE — pomiar prędkości nawet gdy silnik wyłączony
     uint8_t ha = (GPIO.in >> PIN_HALL_SENSOR_A) & 1;
@@ -3501,6 +3598,14 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         } // else: potwierdzanie w toku (normalny przebieg)
     }
 
+    // ── Od tego momentu: używaj PRZEFILTROWANEGO Halla do komutacji ──
+    // Surowy `hall` z GPIO.in może mieć glitche EMI (transient na 1 tick ISR).
+    // g_hall_prev_isr = potwierdzony stan (3 zgodne odczyty + debounce 200µs).
+    // Komutacja BLOCK/SINUS/FOC musi używać stabilnego stanu.
+    g_dbg_hall_raw_isr = hall;  // diagnostyka: surowy vs filtrowany
+    hall = g_hall_prev_isr;
+    g_dbg_hall_filt_isr = hall;
+
     // Tryb testu MOSFET — ISR nie dotyka kanałów LEDC, tylko mierzy Hall/prędkość
     if (g_mosfet_test_active) {
         return;
@@ -3539,6 +3644,10 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                 g_dbg_sine_fallback_count++;
                 g_dbg_last_fallback_ms = now_ms;
             }
+            // Stall → powrót do BLOCK startup (reaktywna komutacja z Halli)
+            // Bez tego: prędkość=0 + startup_count>=6 → sinusCommutateISR z crawl
+            // → pole leci dookoła → silnik się "miota".
+            g_sine_startup_count = 0;
             g_sine_last_hall_ms = now_ms;
         }
     }
@@ -3559,14 +3668,32 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
     // Dispatch trybu sterowania
     switch (g_mode_isr) {
         case DRIVE_MODE_SINUS:
-            // Sinus mode — zawsze sinusoidalny (bez block startup)
-            sinusCommutateISR(hall, d);
-            return;
         case DRIVE_MODE_FOC:
-            // FOC — inverse Park + SVPWM z Vd/Vq z loop()
-            focCommutateISR(hall, d);
+            // ── Max Torque Startup: snap kąt do optymalnej pozycji Hall ──
+            // Gdy prędkość < threshold: rotor stoi lub oscyluje.
+            // Snap kąt do hall_sector_center + skalibrowany offset (sat) →
+            // pole statorowe prostopadłe do rotora (max Iq, max moment).
+            // SINUS/FOC SVPWM generuje gładkie sinusoidalne prądy pod tym kątem.
+            // Nie używamy BLOCK — SINUS daje precyzyjniejszy wektor momentu.
+            if (g_sine_speed_q16 < SINE_BLOCK_SPEED_THRESHOLD) {
+                int8_t sec = hallToSector(hall);
+                if (sec >= 0) {
+                    int32_t entry = (int32_t)sec * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
+                    if (entry < 0) entry += SINE_TABLE_SIZE;
+                    if (entry >= SINE_TABLE_SIZE) entry -= SINE_TABLE_SIZE;
+                    g_sine_angle_q16 = (uint32_t)entry << 16;
+                }
+            }
+            if (g_mode_isr == DRIVE_MODE_SINUS) {
+                g_dbg_commut_path = 2;  // SINUS
+                sinusCommutateISR(hall, d);
+            } else {
+                g_dbg_commut_path = 3;  // FOC
+                focCommutateISR(hall, d);
+            }
             return;
         case DRIVE_MODE_BLOCK:
+            g_dbg_commut_path = 1;  // BLOCK
             break;  // kontynuuj do komutacji blokowej poniżej
         default:
             // Tryb DISABLED → bezpieczny stan
@@ -3664,30 +3791,17 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     }
 
     // ── 1. Stall freeze: brak przejścia Halla > 200ms → nie avansuj kąta ──
-    // WYJĄTEK: w trybie crawl (speed==0) zawsze avansuj — crawl jest wolny
-    // (~1 obr.elekt./s) i nie generuje niebezpiecznych prądów.
-    // Bez tego wyjątku: stall freeze blokuje crawl → silnik nigdy nie ruszy → deadlock.
+    // Gdy speed==0 → nie avansuj (dispatch już użył BLOCK, tu nie powinniśmy trafić).
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t since_hall = now_ms - g_sine_last_hall_ms;
     uint32_t real_speed = g_sine_speed_q16;
-    bool in_crawl = (real_speed == 0);
-    bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
+    bool stalled = (real_speed < SINE_BLOCK_SPEED_THRESHOLD) || (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle ──
     // Kierunek avansowania kąta: z detekcji Halli (g_sine_dir), nie config.
-    // g_sine_dir = +1 → sektory rosną → kąt rośnie (CW w tabeli)
-    // g_sine_dir = -1 → sektory maleją → kąt maleje (CCW w tabeli)
-    // Crawl (spd==0): brak danych z Halli, użyj g_reverse_isr.
-    // Dlaczego NIE g_reverse_isr: BLOCK i SINUS mają odrębne wymagania.
-    // BLOCK jest reaktywny (Hall→fazy bezpośrednio). SINUS interpoluje
-    // kąt między Hallami i musi znać fizyczny kierunek rotacji,
-    // który może różnić się od konfiguracji rev (zależy od uzwojenia/Halli).
     if (!stalled) {
         uint32_t spd = real_speed;
-        if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        // Crawl: użyj kierunku z config (brak jeszcze danych z Halli)
-        // Praca normalna: użyj wykrytego kierunku z sekwencji Halli
-        bool dir_reverse = in_crawl ? g_reverse_isr : (g_sine_dir < 0);
+        bool dir_reverse = (g_sine_dir < 0);
         if (dir_reverse) {
             if (g_sine_angle_q16 >= spd) {
                 g_sine_angle_q16 -= spd;
@@ -3813,15 +3927,12 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t since_hall = now_ms - g_sine_last_hall_ms;
     uint32_t real_speed = g_sine_speed_q16;
-    bool in_crawl = (real_speed == 0);
-    bool stalled = !in_crawl && (since_hall > SINE_STALL_FREEZE_MS);
+    bool stalled = (real_speed < SINE_BLOCK_SPEED_THRESHOLD) || (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle (identycznie jak SINUS) ──
-    // Kierunek z detekcji Halli (g_sine_dir), crawl → g_reverse_isr.
     if (!stalled) {
         uint32_t spd = real_speed;
-        if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
-        bool dir_reverse = in_crawl ? g_reverse_isr : (g_sine_dir < 0);
+        bool dir_reverse = (g_sine_dir < 0);
         if (dir_reverse) {
             if (g_sine_angle_q16 >= spd) {
                 g_sine_angle_q16 -= spd;
@@ -4163,6 +4274,8 @@ void printHelp() {
     Serial.println("             P05=poziomy assist, P06=rozmiar kola, P07=magnesy/polpary,");
     Serial.println("             P08=limit predkosci [km/h], P10=tryb jazdy, P13=magnesy PAS.");
     Serial.println("gdbg       Debug SINUS/BLOCK ON/OFF (co 200ms: hall idx, predkosc, duty)");
+    Serial.println("idbg       Debug pradow fazowych ON/OFF (co 500ms: Ia,Ib,Ic, max, EMA, limit, factor)");
+    Serial.println("hdbg       Debug Hall ON/OFF (co 200ms: raw/filtered hall, sector, speed, path, edges)");
     Serial.println();
     Serial.println("---------- Offset fazy sinusa (SINUS/FOC) ----------");
     Serial.println("so         Pokaz aktualny offset fazy [-48..+48], 1 wpis = 3.75 deg el.");
@@ -4612,6 +4725,16 @@ static String executeCommand(const String& cmd) {
         g_debugSine = !g_debugSine;
         g_lastDebugSineMs = millis();
         return g_debugSine ? "Debug SINUS: ON" : "Debug SINUS: OFF";
+    }
+    if (cmd == "idbg") {
+        g_debugCurrent = !g_debugCurrent;
+        g_lastDebugCurrentMs = millis();
+        return g_debugCurrent ? "Debug prądów: ON (co 500ms)" : "Debug prądów: OFF";
+    }
+    if (cmd == "hdbg") {
+        g_debugHall = !g_debugHall;
+        g_lastDebugHallMs = millis();
+        return g_debugHall ? "Debug Hall: ON (co 200ms)" : "Debug Hall: OFF";
     }
     // ── FOC: strojenie i diagnostyka ──
     if (cmd == "fdbg") {
@@ -5337,6 +5460,15 @@ static String executeCommand(const String& cmd) {
                 return "Throttle outlier thresh: " + String(val);
             }
             return "Zakres 10-2000";
+        }
+        if (cmd.startsWith("cfg:dutymin:")) {
+            int val = cmd.substring(12).toInt();
+            if (val >= 0 && val <= 50) {
+                cfg.duty_min_pct = (uint8_t)val;
+                config_save();
+                return "Min duty: " + String(val) + "% (ponizej = 0)";
+            }
+            return "Zakres 0-50 %";
         }
         return "Nieznany parametr cfg";
     }

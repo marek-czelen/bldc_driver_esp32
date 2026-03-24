@@ -58,6 +58,7 @@ static void config_apply_defaults() {
     g_config.pas_fwd_holdoff_ms    = 300;                             // Holdoff reverse PAS: 300 ms
     g_config.speed_pulses_per_rev  = 1;                               // Impulsy SPEED na obrót: 1 (kalibracja: spdcal)
     g_config.pwm_freq_hz           = 20000;                           // Częstotliwość PWM: 20 kHz (domyślna)
+    g_config.duty_min_pct          = 10;                              // Min duty: 10% (poniżej → 0)
 }
 
 void config_init() {
