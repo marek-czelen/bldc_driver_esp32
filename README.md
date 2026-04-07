@@ -1,6 +1,6 @@
 # BLDC Motor Driver — ESP32
 
-**Wersja firmware: 2.0.0** | CONFIG_VERSION: 12 | PlatformIO espressif32
+**Wersja firmware: 2.0.0** | CONFIG_VERSION: 16 | PlatformIO espressif32
 
 Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
 Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, **komutacja sinusoidalna** oraz **FOC (Field Oriented Control)**.  
@@ -20,7 +20,7 @@ Konfiguracja przez **Serial 115200 baud** oraz **WiFi AP** (responsywny interfej
 | Shadow compare update | — | **TEZ-only** (symetryczne impulsy center-aligned) |
 | Prescaler | Automatyczny (LEDC) | **Jawny** (group=1, timer=8 → 20 MHz, period=500) |
 | Dead time | Software (IR2103 wewnętrzny) | **MCPWM bypass** (IR2103 ~520 ns wewnętrzny) |
-| CONFIG_VERSION | 11 | **12** (nowe pole: `current_limit_a`) |
+| CONFIG_VERSION | 11 | **16** (rozszerzona struktura config; aktualny stan kodu) |
 
 ---
 
@@ -199,7 +199,7 @@ platformio.ini      — konfiguracja PlatformIO (platforma, prędkość, partycj
 include/
   pinout.h          — wszystkie definicje GPIO, stałe MCPWM (frequency, period, duty)
   bldc_types.h      — typy danych, struktury, enumeracje
-  bldc_config.h     — konfiguracja NVS (controller_config_t, CONFIG_VERSION=12)
+  bldc_config.h     — konfiguracja NVS (controller_config_t, CONFIG_VERSION=16)
   display_s866.h    — definicje protokołu wyświetlacza S866, struktury ramek
 src/
   main.cpp          — cała logika aplikacji (komutacja MCPWM, regen, pomiar prędkości/mocy)
@@ -1310,7 +1310,7 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | Pole | Typ | Domyślnie | Opis |
 |---|---|---|---|
 | `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 12 | Wersja struktury (CONFIG_VERSION) |
+| `version` | uint16_t | 16 | Wersja struktury (CONFIG_VERSION) |
 | `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
 | `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
 | `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
@@ -1775,7 +1775,7 @@ ale z ramą dq.
 | 4 | **FOC (Field Oriented Control)** | Komenda `F` / `m3` — feedforward + PI, Park/Clarke, SVPWM, tryb napięciowy i PI |
 | 5 | **PAS — Pedal Assist Sensor** | Timer sampling 2 kHz, filtr cyfrowy, detekcja kierunku, soft-start, maszyna stanów |
 | 6 | **WiFi — interfejs WWW** | AP mode, responsive UI, REST API, kolejka komend trybu |
-| 7 | **Konfiguracja NVS (EEPROM)** | 22 parametry, CONFIG_VERSION=12, Serial `cfg` + Web UI |
+| 7 | **Konfiguracja NVS (EEPROM)** | 22 parametry, CONFIG_VERSION=16, Serial `cfg` + Web UI |
 | 8 | **Filtracja przepustnicy** | Ring buffer + median + odrzucanie outlierów (odporność na EMI) |
 | 9 | **Filtracja PAS** | Timer sampling 500 µs, N kolejnych zgodnych próbek (odporność na EMI) |
 | 10 | **Wyświetlacz S866** | Protokół 2, prędkość, moc, poziomy wspomagania, flaga `display_required` |
@@ -1822,4 +1822,4 @@ board_build.partitions = default.csv
 
 *Dokumentacja wygenerowana: 2026-03-22*  
 *Wersja firmware: 2.0.0 (MCPWM center-aligned + BLOCK + SINUS + FOC + PAS + WiFi + NVS)*  
-*CONFIG_VERSION: 12 | controller_config_t: 64 bajty*
+*CONFIG_VERSION: 16 | controller_config_t: 64 bajty*

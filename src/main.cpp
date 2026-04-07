@@ -42,7 +42,7 @@
  * w każdym przerwaniu TEZ i ustawia odpowiednie generatory MCPWM.
  *
  * ## Konfiguracja
- * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=13).
+ * NVS (EEPROM): 64-bajtowa struktura controller_config_t (CONFIG_VERSION=16).
  * Interfejs: Serial 115200 baud + WiFi AP (P17=1) z responsywnym UI.
  *
  * ## Hardware
@@ -437,6 +437,12 @@ static void resetSineTracking(uint8_t hall_state) {
 /// Bez debounce: hall_period_us = 50us → speed_q16 = 1M → kąt ucieka → desync.
 /// 200us = 4 ticki ISR, bezpieczne do ~50k eRPM (daleko poza realnym motorem).
 #define HALL_MIN_PERIOD_US      200
+// Przy starcie/postoju SINUS/FOC szpilki EMI potrafią wygenerować szybkie pseudo-przejścia
+// Hall, które kręcą wektor pola mimo zablokowanego koła. Podnosimy wtedy minimalny okres.
+#define HALL_MIN_PERIOD_STARTUP_US 1000
+// Reverse-step lock tylko przy niskim duty (manetka lekko otwarta), żeby nie blokować
+// rzeczywistego cofania przy mocnym hamowaniu/odwrotnym momencie.
+#define SINE_DIR_LOCK_DUTY_PCT  20
 #define DEFAULT_P07_STANDALONE  90              // domyślne P07 gdy brak wyświetlacza (6 × 15 par biegunów)
 
 // ── FOC (Field Oriented Control) ──
@@ -3476,7 +3482,13 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             uint32_t now_us = (uint32_t)esp_timer_get_time();
             uint32_t dt_us = now_us - g_hall_last_change_us;
 
-            if (g_hall_last_change_us == 0 || dt_us >= HALL_MIN_PERIOD_US) {
+            uint32_t min_hall_period_us = HALL_MIN_PERIOD_US;
+            if ((g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) &&
+                g_sine_speed_q16 < SINE_BLOCK_SPEED_THRESHOLD) {
+                min_hall_period_us = HALL_MIN_PERIOD_STARTUP_US;
+            }
+
+            if (g_hall_last_change_us == 0 || dt_us >= min_hall_period_us) {
                 g_dbg_hall_edges++;
                 g_dbg_last_hall = hall;
                 if (g_hall_last_change_us > 0) {
@@ -3502,7 +3514,18 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                             if (new_idx == fwd) {
                                 g_sine_dir = 1;   // prawidłowy kierunek
                             } else if (new_idx == rev) {
-                                g_sine_dir = -1;  // cofanie się
+                                // Przy zablokowanym kole i małym duty szum Hall często wygląda jak
+                                // naprzemienne ±1 sektor. Blokujemy takie "cofanie" na starcie.
+                                uint16_t duty_lock_th = (uint16_t)(PWM_MAX_DUTY * SINE_DIR_LOCK_DUTY_PCT / 100);
+                                bool startup_lock =
+                                    (g_sine_speed_q16 < SINE_BLOCK_SPEED_THRESHOLD) &&
+                                    (g_duty_isr <= duty_lock_th);
+                                if (startup_lock) {
+                                    g_dbg_hall_seq_reject++;
+                                    seq_valid = false;
+                                } else {
+                                    g_sine_dir = -1;  // cofanie się
+                                }
                             } else {
                                 // Przeskok >1 sektora — podejrzany
                                 g_dbg_hall_seq_reject++;
@@ -3519,7 +3542,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
 
                         if (seq_valid) {
                             // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
-                            if (dt_us >= HALL_MIN_PERIOD_US && dt_us < 500000) {
+                            if (dt_us >= min_hall_period_us && dt_us < 500000) {
                                 uint32_t new_speed = 52428800UL / dt_us;
                                 uint32_t old_speed = g_sine_speed_q16;
                                 if (old_speed == 0) {
