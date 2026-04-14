@@ -80,8 +80,13 @@ bldc_state_t g_bldc_state;
 static intr_handle_t g_mcpwm_isr_handle = NULL;
 /// Flaga: ISR MCPWM przeczytał ADC prądu w dolinie PWM (center)
 volatile bool g_adc_ready_isr = false;
-/// Surowe odczyty ADC prądu z ISR (przeczytane w dolinie center-aligned PWM)
+/// Akumulator surowych odczytów ADC prądu z ISR (uśrednianie wielu cykli PWM)
+volatile uint32_t g_phase_adc_sum_isr[3] = {0, 0, 0};
+volatile uint16_t g_phase_adc_cnt_isr = 0;
+/// Ostatni surowy odczyt ADC (do diagnostyki idbg)
 volatile uint16_t g_phase_adc_raw_isr[3] = {0, 0, 0};
+/// Spinlock synchronizacji ISR ↔ loop dla akumulatora ADC prądu
+static portMUX_TYPE g_adc_mux = portMUX_INITIALIZER_UNLOCKED;
 /// Flaga: ISR może czytać ADC1 (false=loop() czyta ADC1, ISR pomija)
 volatile bool g_adc_isr_active = false;
 /// Licznik timeoutów ADC w ISR (diagnostyka)
@@ -1368,7 +1373,7 @@ void IRAM_ATTR onPasSampleTimer(void* arg) {
  * 3. Timer uruchamiany jako ostatni — od tego momentu ISR działa
  */
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(921600);
     delay(1000);
     
     Serial.println("==========================================");
@@ -3013,10 +3018,25 @@ void readAnalogInputs() {
     // fallback na analogRead() z medianą (stare zachowanie).
     uint16_t phaseA_raw, phaseB_raw, phaseC_raw;
     if (g_adc_ready_isr) {
-        phaseA_raw = g_phase_adc_raw_isr[0];
-        phaseB_raw = g_phase_adc_raw_isr[1];
-        phaseC_raw = g_phase_adc_raw_isr[2];
+        // Pobierz uśrednione odczyty z akumulatora ISR (wiele cykli PWM)
+        portENTER_CRITICAL(&g_adc_mux);
+        uint32_t sa = g_phase_adc_sum_isr[0];
+        uint32_t sb = g_phase_adc_sum_isr[1];
+        uint32_t sc = g_phase_adc_sum_isr[2];
+        uint16_t cnt = g_phase_adc_cnt_isr;
+        g_phase_adc_sum_isr[0] = 0;
+        g_phase_adc_sum_isr[1] = 0;
+        g_phase_adc_sum_isr[2] = 0;
+        g_phase_adc_cnt_isr = 0;
         g_adc_ready_isr = false;
+        portEXIT_CRITICAL(&g_adc_mux);
+        if (cnt > 0) {
+            phaseA_raw = (uint16_t)(sa / cnt);
+            phaseB_raw = (uint16_t)(sb / cnt);
+            phaseC_raw = (uint16_t)(sc / cnt);
+        } else {
+            phaseA_raw = phaseB_raw = phaseC_raw = 0;
+        }
     } else {
         // Fallback: bezpośredni odczyt (przed init ISR lub ISR nieaktywny)
         g_adc_isr_active = false;
@@ -3225,14 +3245,17 @@ void printDiagnostics() {
         if (thrPct > 100) thrPct = 100;
     }
 
-    Serial.printf("%s%s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
+    Serial.printf("%s%s D:%d/%d%% d_isr:%u CLF:%.2f V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f Imax:%.2f H:%d%d%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
         modeNames[g_bldc_state.mode],
         g_reverse_isr ? "<" : ">",
         dutyPct, targetPct,
+        (unsigned)g_duty_isr,
+        g_current_limit_factor,
         g_bldc_state.battery_voltage,
         g_bldc_state.phase_current[0],
         g_bldc_state.phase_current[1],
         g_bldc_state.phase_current[2],
+        g_ilim_current_ema,
         (g_bldc_state.hall_state >> 2) & 1,
         (g_bldc_state.hall_state >> 1) & 1,
         g_bldc_state.hall_state & 1,
@@ -3519,9 +3542,20 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
     // Trzy odczyty ~9µs — mieści się w oknie zero-vector (≥6µs przy 75% duty).
     // Flaga g_adc_isr_active=false gdy loop() czyta ADC1 (battery) → unikamy konfliktu HW.
     if (g_adc_isr_active) {
-        g_phase_adc_raw_isr[0] = adc1_read_isr(ADC1_CHANNEL_3);  // Phase A (GPIO39)
-        g_phase_adc_raw_isr[1] = adc1_read_isr(ADC1_CHANNEL_6);  // Phase B (GPIO34)
-        g_phase_adc_raw_isr[2] = adc1_read_isr(ADC1_CHANNEL_7);  // Phase C (GPIO35)
+        uint16_t a = adc1_read_isr(ADC1_CHANNEL_3);  // Phase A (GPIO39)
+        uint16_t b = adc1_read_isr(ADC1_CHANNEL_6);  // Phase B (GPIO34)
+        uint16_t c = adc1_read_isr(ADC1_CHANNEL_7);  // Phase C (GPIO35)
+        // Zachowaj ostatni raw do diagnostyki (idbg)
+        g_phase_adc_raw_isr[0] = a;
+        g_phase_adc_raw_isr[1] = b;
+        g_phase_adc_raw_isr[2] = c;
+        // Akumuluj do uśredniania w loop()
+        portENTER_CRITICAL_ISR(&g_adc_mux);
+        g_phase_adc_sum_isr[0] += a;
+        g_phase_adc_sum_isr[1] += b;
+        g_phase_adc_sum_isr[2] += c;
+        g_phase_adc_cnt_isr++;
+        portEXIT_CRITICAL_ISR(&g_adc_mux);
         g_adc_ready_isr = true;
     }
 
