@@ -7,21 +7,6 @@ Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, 
 Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-startem i regulacją prędkości docelowej.  
 Konfiguracja przez **Serial 115200 baud** oraz **WiFi AP** (responsywny interfejs webowy).
 
-### Zmiany w v2.0.0 (względem v1.0.0)
-
-| Zmiana | v1.0 | v2.0 |
-|--------|------|------|
-| PWM peryferium | LEDC (6 kanałów) | **MCPWM** (3 operatory × 2 generatory) |
-| Tryb PWM | Edge-aligned | **Center-aligned (UP_DOWN counter)** |
-| Rozdzielczość PWM | 10-bit (0–1023) | **Period-based (0–500)** |
-| Timer ISR | hw_timer_t (osobny timer) | **MCPWM TEZ** (przerwanie w dolinie PWM) |
-| ISR safety | IRAM_ATTR | **IRAM_ATTR + ESP_INTR_FLAG_IRAM + direct LL register writes** |
-| Komutacja w ISR | `ledcWrite()` (driver API) | **Bezpośredni zapis rejestrów** (~5 ns, bez spinlocków) |
-| Shadow compare update | — | **TEZ-only** (symetryczne impulsy center-aligned) |
-| Prescaler | Automatyczny (LEDC) | **Jawny** (group=1, timer=8 → 20 MHz, period=500) |
-| Dead time | Software (IR2103 wewnętrzny) | **MCPWM bypass** (IR2103 ~520 ns wewnętrzny) |
-| CONFIG_VERSION | 11 | **16** (rozszerzona struktura config; aktualny stan kodu) |
-
 ---
 
 ## Spis treści
@@ -104,7 +89,7 @@ Wszystkie definicje pinów znajdują się w `include/pinout.h`.
 | 32   | Temperatura FET       | ADC1_CH4  |
 
 > **Uwaga GPIO12 (MTDI):**  
-> GPIO12 jest pinem strap ESP32 (teraz używany jako PIN_PWM_A_HIGH). Jeśli ma pull-up przy starcie, zmienia napięcie VDD_SDIO z 3.3 V na 1.8 V, co uniemożliwia programowanie flash. **Nie podłączać pull-up do GPIO12**; stosować pull-down lub pozostawić floating.
+> GPIO12 jest pinem strap ESP32 (używany jako PIN_PWM_A_HIGH). Jeśli ma pull-up przy starcie, zmienia napięcie VDD_SDIO z 3.3 V na 1.8 V, co uniemożliwia programowanie flash. **Nie podłączać pull-up do GPIO12**; stosować pull-down lub pozostawić floating.
 
 ### Czujniki Halla
 
@@ -290,6 +275,30 @@ Hall encoder daje 3-bitowy kod (wartości 1–6, 0 i 7 są błędem).
 > (np. zamiast 1→3→2→6→4→5, zmienić na 3→2→6→4→5→1).  
 > Jeśli kręci się w złym kierunku — użyć komendy `r` lub zamienić dowolne dwie fazy silnika.
 
+### Crossfade fazowy (wygładzanie przejść komutacji)
+
+W trybie BLOCK każda zmiana stanu Halla powoduje skokowe przełączenie fazy PWM (skok pola o 60° elektr.), co generuje słyszalny terkot. Aby go wyeliminować, zaimplementowano **crossfade fazowy**:
+
+- Przy przejściu komutacyjnym stara faza PWM **wygasza się liniowo** od `d` do `0`
+- Jednocześnie nowa faza PWM **rozjaśnia się liniowo** od `0` do `d`
+- Przejścia Low↔Off (ścieżka GND) przełączają się natychmiast (nie generują hałasu)
+- Crossfade trwa `BLOCK_CROSS_TICKS` tików ISR (domyślnie 8 × 50 µs = **400 µs**)
+
+```
+  Stare duty: ████████████████▓▓▓▓▒▒▒▒░░░░        (gaśnie)
+  Nowe duty:                  ░░░░▒▒▒▒▓▓▓▓████████ (narasta)
+              ──────────────────────────────────────→czas
+              │  crossfade (400µs)  │
+```
+
+Jeśli kolejne przejście Halla nastąpi przed końcem crossfade, nowe przejście automatycznie przerywa bieżące i rozpoczyna następny crossfade.
+
+| Stała | Wartość | Opis |
+|---|---|---|
+| `BLOCK_CROSS_TICKS` | 8 | Tiki ISR crossfade (8 × 50 µs = 400 µs) |
+
+> **Strojenie:** Przy wolnych obrotach można zwiększyć (12–16 = 600–800 µs) dla jeszcze cichszej pracy. Przy szybkich obrotach zmniejszyć (4–6 = 200–300 µs) — crossfade nie powinien trwać dłużej niż ~30% okresu Halla.
+
 ### PWM — MCPWM center-aligned
 
 - Peryferium: **MCPWM** (Motor Control PWM), MCPWM_UNIT_0
@@ -366,8 +375,9 @@ angle += speed_q16
 Prędkość `speed_q16` = (16 × 50) << 16 / hall_period_us = 52428800 / hall_period_us,
 obliczana w loop() (dzielenie 32-bit w ISR na ESP32 powoduje LoadStoreError).
 
-Na przejściu Halla kąt jest KORYGOWANY (nie nadpisywany) — o 1/8 różnicy między
-oczekiwanym a aktualnym. To daje płynne śledzenie bez skoków.
+Na przejściu Halla kąt jest KORYGOWANY (nie nadpisywany) — o pełną różnicę między
+oczekiwanym a aktualnym (`SINE_PHASE_CORR_SHIFT = 0`). To daje precyzyjne śledzenie
+bez dryfu — kąt trafia dokładnie w środek sektora po każdym przejściu Halla.
 
 ### Start sinusoidalny (bez block startup)
 
@@ -482,11 +492,40 @@ Całkowity czas: ~25 kroków × 1s = ~25 sekund (domyślne).
 | `SINE_CRAWL_SPEED_Q16` | 315 | Minimalna prędkość crawl ≈ 1 obr.elekt./s |
 | `SINE_STALL_FALLBACK_MS` | 400 ms | Minimalny timeout safety fallback |
 | `SINE_START_MAX_HALL_US` | 30000 µs | Max okres Halla do wejścia w SINUS |
-| `SINE_PHASE_CORR_SHIFT` | 2 | Korekcja kąta: 1/4 błędu na przejście Halla |
-| `SINE_SPEED_FILTER_SHIFT` | 1 | Filtr prędkości: 1/2 new + 1/2 old |
+| `SINE_PHASE_CORR_SHIFT` | 0 | Korekcja kąta: pełny błąd na przejście Halla |
 | `SINE_SAFE_MAX_DUTY` | 75% PWM_MAX (375) | Limit bezpieczeństwa amplitudy (SVPWM) |
 | `SINE_MIN_AMPLITUDE` | 8 | Poniżej tego: coast (zapobiega hamowaniu EM) |
 | `SINE_TABLE_SIZE` | 96 | Wpisów w tablicy sinusów (= 360° elektr.) |
+
+### Per-sector speed (kompensacja nierównych Halli)
+
+Czujniki Halla w silniku mogą być nierównomiernie rozmieszczone — np. 3 sektory
+mają okresy ~1000 µs, a 3 pozostałe ~1200 µs (rozrzut 30–40%). Przy użyciu
+globalnej prędkości kąt „szarpie" na przejściach między wąskimi i szerokimi sektorami.
+
+Rozwiązanie: tablica `g_sine_sector_speed[6]` pamięta **ostatnią zmierzoną prędkość**
+dla każdego sektora. Przy wejściu w nowy sektor PLL używa zapamiętanej prędkości
+tego sektora (zamiast globalnej), co eliminuje oscylacje kąta:
+
+```
+Sektor wychodzący: g_sine_sector_speed[old] = 3/4 × measured + 1/4 × old  (filtr)
+Sektor wchodzący:  speed = g_sine_sector_speed[new]  (użycie zapamiętanej)
+```
+
+Jeśli sektor jest odwiedzany po raz pierwszy (speed = 0), używana jest
+bieżąca zmierzona prędkość jako fallback.
+
+### PLL — korekcja prędkości
+
+Na każdym przejściu Halla, oprócz korekcji kąta, PLL koryguje też prędkość:
+
+```
+speed_err = (expected_angle - actual_angle)
+speed += speed_err >> 13   // wzmocnienie PLL (2× silniejsze niż >>14)
+```
+
+To domyka pętlę PLL — kąt jest korygowany natychmiast, a prędkość jest
+dostosowywana stopniowo, co eliminuje systematyczny dryf.
 
 ### Aktywacja
 
@@ -789,7 +828,7 @@ thr_ema += α × (burst_avg − thr_ema)
 | `thr_outlier_thresh` | 150 | `cfg:thrdelta:N` | Max odchylenie od mediany (10–2000) |
 | `kThrottleFilterAlpha` | 0.15 | — | Stała EMA (w kodzie) |
 
-> **Uwaga:** Przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają teraz z **ADC1** — nie ma konfliktu z WiFi.  
+> **Uwaga:** Przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają z **ADC1** — nie ma konfliktu z WiFi.  
 > Odczyty ADC przepustnicy i temperatury FET działają poprawnie niezależnie od stanu WiFi.
 
 ### Mapowanie proporcjonalne (wspólny algorytm BLOCK / SINUS / FOC)
@@ -1166,6 +1205,7 @@ P13 magnets:      12
 | `sat:M:N:S`    | Auto-tune zakres M..N krok S |
 | `man`          | Manual duty ON/OFF (manetka ignorowana) |
 | `gdbg`         | Debug SINUS/BLOCK ON/OFF (co 200ms) |
+| `cdbg`         | Debug zdarzeniowy ON/OFF (ring buffer: przejścia Halla, kąt, duty) |
 | **FOC** | |
 | `F` / `m3`     | Włącz tryb FOC |
 | `foc`          | Pokaż status FOC (Vd/Vq, Id/Iq, PI, EMA) |
@@ -1281,7 +1321,7 @@ Przejście P17: 1→0 jest jedynym momentem kiedy kolejka trybu (`B`, `S`, `F`) 
 
 ### ADC a WiFi
 
-W nowej wersji PCB przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają z **ADC1**, który **nie koliduje z WiFi**. Nie ma już potrzeby blokowania odczytów ADC podczas aktywnego WiFi.
+Przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają z **ADC1**, który **nie koliduje z WiFi**.
 
 Jedyne piny ADC2 nie są używane do pomiarów analogowych — konflikt ADC2/WiFi nie dotyczy tej konfiguracji.
 
@@ -1429,8 +1469,8 @@ Procedura diagnostyczna umożliwiająca przetestowanie **pojedynczych tranzystor
 
 | Komenda | Tranzystor | Pin ESP32 | IR2103 |
 |---------|-----------|-----------|--------|
-| `tAH`   | Faza A HIGH-side | GPIO32 | HIN_A |
-| `tAL`   | Faza A LOW-side  | GPIO33 | LIN_A |
+| `tAH`   | Faza A HIGH-side | GPIO12 | HIN_A |
+| `tAL`   | Faza A LOW-side  | GPIO13 | LIN_A |
 | `tBH`   | Faza B HIGH-side | GPIO25 | HIN_B |
 | `tBL`   | Faza B LOW-side  | GPIO26 | LIN_B |
 | `tCH`   | Faza C HIGH-side | GPIO27 | HIN_C |
@@ -1747,12 +1787,12 @@ ale z ramą dq.
 
 ## Rozbudowa projektu
 
-### Zaimplementowane w wersji 2.0.0
+### Zaimplementowane
 
 | # | Funkcjonalność | Opis |
 |---|----------------|------|
-| 1 | **MCPWM center-aligned PWM** | Migracja z LEDC na MCPWM: 3 operatory × 2 generatory, UP_DOWN counter, bezpośrednie rejestry LL w ISR |
-| 2 | **ISR w przerwaniu TEZ MCPWM** | Eliminacja osobnego hw_timer — ISR wyzwalana w dolinie PWM (optymalny pomiar prądu) |
+| 1 | **MCPWM center-aligned PWM** | 3 operatory × 2 generatory, UP_DOWN counter, bezpośrednie rejestry LL w ISR |
+| 2 | **ISR w przerwaniu TEZ MCPWM** | ISR wyzwalana w dolinie PWM (optymalny pomiar prądu, 20 kHz) |
 | 3 | **Komutacja sinusoidalna** | Komenda `S` / `m2` — tryb sinusoidalny z interpolacją kąta Hall, SVPWM |
 | 4 | **FOC (Field Oriented Control)** | Komenda `F` / `m3` — feedforward + PI, Park/Clarke, SVPWM, tryb napięciowy i PI |
 | 5 | **PAS — Pedal Assist Sensor** | Timer sampling 2 kHz, filtr cyfrowy, detekcja kierunku, soft-start, maszyna stanów |
@@ -1761,6 +1801,9 @@ ale z ramą dq.
 | 8 | **Filtracja przepustnicy** | Ring buffer + median + odrzucanie outlierów (odporność na EMI) |
 | 9 | **Filtracja PAS** | Timer sampling 500 µs, N kolejnych zgodnych próbek (odporność na EMI) |
 | 10 | **Wyświetlacz S866** | Protokół 2, prędkość, moc, poziomy wspomagania, flaga `display_required` |
+| 11 | **Crossfade blokowy** | Płynne przejścia duty między fazami przy komutacji (eliminacja terkotu) |
+| 12 | **PLL per-sector speed** | Kompensacja nierównych Halli — per-sektor prędkość, pełna korekcja kąta |
+| 13 | **Debug zdarzeniowy** | Ring buffer 64 zdarzeń, komenda `cdbg`, logi przejść Halla z kątem i duty |
 
 ### Planowane rozszerzenia
 
@@ -1802,6 +1845,6 @@ board_build.partitions = default.csv
 
 ---
 
-*Dokumentacja wygenerowana: 2026-03-22*  
+*Dokumentacja wygenerowana: 2026-04-14*  
 *Wersja firmware: 2.0.0 (MCPWM center-aligned + BLOCK + SINUS + FOC + PAS + WiFi + NVS)*  
 *CONFIG_VERSION: 16 | controller_config_t: 64 bajty*
