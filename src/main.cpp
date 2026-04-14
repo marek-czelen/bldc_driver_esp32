@@ -116,6 +116,7 @@ static uint8_t  g_hall_confirm_cnt = 0;        ///< Ile razy z rzędu widzieliś
 // Continuous angle tracking with Hall correction, NOT snap-to-hall approach.
 volatile uint32_t g_sine_angle_q16 = 0;       ///< Kąt elektr. w wpisach tabeli (Q16, 0..96<<16)
 volatile uint32_t g_sine_speed_q16 = 0;       ///< Prędkość: wpisów tabeli na tick ISR (Q16)
+volatile uint32_t g_sine_sector_speed[6] = {0}; ///< Prędkość per-sector (kompensacja nierównych Halli)
 volatile uint8_t  g_sine_running = 0;          ///< 1 = tryb sinusoidalny aktywny, 0 = block startup
 volatile uint8_t  g_sine_startup_count = 0;    ///< Licznik komutacji blokowych przed przejściem na sinus
 volatile int8_t   g_sine_last_hall_idx = -1;   ///< Ostatni indeks Halla w sekwencji (0-5, -1=unknown)
@@ -201,6 +202,38 @@ volatile uint32_t g_dbg_snap_window = 0;        ///< Snapy w bieżącym oknie
 volatile uint32_t g_dbg_corr_window = 0;        ///< Korekcje w bieżącym oknie
 volatile int32_t  g_dbg_angle_at_hall = 0;      ///< Kąt (entry Q16) w momencie Hall (przed korekcją)
 volatile int32_t  g_dbg_expected_at_hall = 0;   ///< Oczekiwany kąt (entry Q16) wg tabeli sektorów
+
+// ── Event-driven debug: ring buffer zdarzeń ISR → loop() ──
+// ISR wypełnia na zmianę Halla / komutacji, loop() drukuje
+#define DBG_EVT_RING_SIZE 64
+struct dbg_evt_t {
+    uint32_t ts_us;           ///< Timestamp zdarzenia [µs]
+    uint8_t  hall_raw;        ///< Surowy Hall [C:B:A] z GPIO.in
+    uint8_t  hall_filt;       ///< Przefiltrowany Hall użyty do komutacji
+    uint8_t  mode;            ///< drive_mode_t (0=OFF,1=BLK,2=SIN,3=FOC)
+    int8_t   sector_old;      ///< Poprzedni sektor (0-5, -1=unknown)
+    int8_t   sector_new;      ///< Nowy sektor
+    int8_t   dir;             ///< Kierunek: +1 forward, -1 reverse
+    uint8_t  startup_cnt;     ///< g_sine_startup_count
+    uint32_t angle_q16;       ///< Kąt po korekcji
+    uint32_t speed_q16;       ///< Prędkość Q16
+    uint32_t hall_period_us;  ///< Okres między edge Halla [µs]
+    uint16_t duty;            ///< Duty z przepustnicy/rampy
+    int16_t  da, db, dc;      ///< Duty zastosowane na fazach A/B/C
+    uint16_t adc_a, adc_b, adc_c; ///< Surowy ADC prądu faz
+    int32_t  foc_vd, foc_vq;  ///< FOC: napięcia Vd/Vq (tylko tryb FOC)
+    uint8_t  flags;           ///< b0=stalled, b1=snap, b2=seq_reject, b3=reverse
+};
+volatile dbg_evt_t g_dbg_evt_ring[DBG_EVT_RING_SIZE];
+volatile uint8_t g_dbg_evt_wr = 0;      ///< Indeks zapisu (ISR)
+volatile uint8_t g_dbg_evt_rd = 0;      ///< Indeks odczytu (loop)
+volatile uint32_t g_dbg_evt_overflow = 0; ///< Licznik utraconych zdarzeń
+static bool g_debugCommutation = false;   ///< Włączone komendą 'cdbg'
+
+// Duty zastosowane na fazach (ustawiane w sinusCommutateISR/focCommutateISR/block)
+volatile int16_t g_dbg_last_da = 0;
+volatile int16_t g_dbg_last_db = 0;
+volatile int16_t g_dbg_last_dc = 0;
 
 // Pomiar RPM z pinu SPEED (GPIO ISR, dla silników przekładniowych, P07==1)
 volatile uint32_t g_speed_last_pulse_us = 0;  ///< micros() ostatniego impulsu SPEED
@@ -400,13 +433,31 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prędkość startowa ≈ 1 obr.elekt./s (52428800/166666)
 #define SINE_STALL_FALLBACK_MS  400             // minimalny timeout fallback (histereza, anty-szarpanie)
 #define SINE_START_MAX_HALL_US  30000           // max okres Halla (min prędkość) do wejścia w SINUS
-#define SINE_PHASE_CORR_SHIFT   1               // korekcja 1/2 błędu na przejście Halla
-                                                // (było 2 = 1/4, ale silniki z małą liczbą
-                                                //  biegunów mają mało korekcji/obrót → drift)
+#define SINE_PHASE_CORR_SHIFT   0               // korekcja pełnego błędu na przejście Halla
+                                                // Hall jest wiarygodne → nie filtruj o połowę
 #define SINE_SPEED_CORR_ENABLE  1               // PLL: korekcja prędkości na przejściu Halla
                                                 // err>0 = kąt za wolny → zwiększ prędkość
                                                 // err<0 = kąt za szybki → zmniejsz prędkość
-#define SINE_SPEED_FILTER_SHIFT 1               // filtr prędkości: 1/2 new + 1/2 old
+#define SINE_SPEED_FILTER_SHIFT 1               // filtr prędkości (unused, rate-limiter zamiast EMA)
+#define SINE_SPEED_MAX_CHANGE_PCT 30            // max zmiana prędkości na Hall edge [%]
+
+// Block crossfade: płynne przejście PWM między fazami przy komutacji
+// Stara faza PWM wygasza duty do 0, nowa faza PWM rozjaśnia od 0 do d
+// Eliminuje skokowy przeskok prądu (główne źródło terkotu blokowego)
+#define BLOCK_CROSS_TICKS       8               // tiki crossfade (8×50µs = 400µs)
+static volatile uint8_t  g_block_cross_cnt = 0; ///< Tiki pozostałe crossfade (0 = normalny tryb)
+static volatile uint8_t  g_block_old_bh = 0;    ///< Remapowany Hall PRZED przejściem
+
+// Tabela stanów faz per remapowany Hall: 0=Off, 1=Low, 2=PWM
+static const DRAM_ATTR uint8_t g_block_phase_tbl[7][3] = {
+    {0,0,0},  // 0: invalid
+    {2,1,0},  // 1: A=PWM B=Low  C=Off
+    {0,2,1},  // 2: A=Off  B=PWM C=Low
+    {2,0,1},  // 3: A=PWM B=Off  C=Low
+    {1,0,2},  // 4: A=Low  B=Off  C=PWM
+    {0,1,2},  // 5: A=Off  B=Low  C=PWM
+    {1,2,0},  // 6: A=Low  B=PWM C=Off
+};
 
 /**
  * @brief Resetuje tracker kąta SINUS/FOC do środka aktualnego sektora Halla.
@@ -421,6 +472,7 @@ static void resetSineTracking(uint8_t hall_state) {
     g_sine_startup_count = 0;
     g_sine_last_hall_idx = -1;
     g_sine_speed_q16 = 0;
+    for (int i = 0; i < 6; i++) g_sine_sector_speed[i] = 0;
     g_sine_dir = 1;
     g_sine_last_hall_ms = (uint32_t)esp_timer_get_time() / 1000;
     g_sine_angle_q16 = (uint32_t)init_entry << 16;
@@ -650,7 +702,7 @@ static const uint16_t THROTTLE_MAX_RAW   = 2600;  // 100% duty
 // Auto-status
 static bool g_autoStatus = false;
 static unsigned long g_lastAutoStatusMs = 0;
-static const unsigned long AUTO_STATUS_INTERVAL_MS = 100;
+static const unsigned long AUTO_STATUS_INTERVAL_MS = 500;
 static bool g_debugSine = false;
 static unsigned long g_lastDebugSineMs = 0;
 static const unsigned long DEBUG_SINE_INTERVAL_MS = 200;
@@ -2606,6 +2658,47 @@ void loop() {
             (unsigned long)g_dbg_hall_seq_reject);
     }
 
+    // ── Event-driven debug: drukuj zdarzenia z ring buffera ISR ──
+    if (g_debugCommutation) {
+        static const char* modeTag[] = {"OFF", "BLK", "SIN", "FOC"};
+        uint8_t printed = 0;
+        while (g_dbg_evt_rd != g_dbg_evt_wr && printed < 16) {
+            volatile dbg_evt_t* ev = &g_dbg_evt_ring[g_dbg_evt_rd];
+            uint8_t m = ev->mode;
+            if (m > 3) m = 0;
+            float angDeg = (float)ev->angle_q16 / 65536.0f * 3.75f;
+            Serial.printf("[CE] t=%lu H:%d>%d s:%d>%d dir:%+d spd:%lu ang:%.1f dt:%luus "
+                          "d:%u dA:%d dB:%d dC:%d Ia:%u Ib:%u Ic:%u %s stup:%u%s%s%s",
+                (unsigned long)ev->ts_us,
+                (int)ev->hall_raw, (int)ev->hall_filt,
+                (int)ev->sector_old, (int)ev->sector_new,
+                (int)ev->dir,
+                (unsigned long)ev->speed_q16,
+                angDeg,
+                (unsigned long)ev->hall_period_us,
+                (unsigned)ev->duty,
+                (int)ev->da, (int)ev->db, (int)ev->dc,
+                (unsigned)ev->adc_a, (unsigned)ev->adc_b, (unsigned)ev->adc_c,
+                modeTag[m],
+                (unsigned)ev->startup_cnt,
+                (ev->flags & 2) ? " SNAP" : "",
+                (ev->flags & 4) ? " SEQREJ" : "",
+                (ev->flags & 8) ? " REV" : "");
+            if (m == 3) {
+                Serial.printf(" Vd:%ld Vq:%ld", (long)ev->foc_vd, (long)ev->foc_vq);
+            }
+            Serial.println();
+            g_dbg_evt_rd = (g_dbg_evt_rd + 1) & (DBG_EVT_RING_SIZE - 1);
+            printed++;
+        }
+        // Raportuj overflow (utracone zdarzenia)
+        uint32_t ovf = g_dbg_evt_overflow;
+        if (ovf > 0) {
+            g_dbg_evt_overflow = 0;
+            Serial.printf("[CE] OVERFLOW: %lu events lost\n", (unsigned long)ovf);
+        }
+    }
+
     // Debug FOC co 200ms
     if (g_foc_debug && g_bldc_state.mode == DRIVE_MODE_FOC
         && (millis() - g_foc_last_debug_ms >= 200)) {
@@ -3481,6 +3574,12 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                     g_hall_period_us = dt_us;
                 }
                 g_hall_last_change_us = now_us;
+
+                // Block crossfade: zapisz stary remapowany Hall PRZED aktualizacją
+                if (g_mode_isr == DRIVE_MODE_BLOCK && g_hall_prev_isr >= 1 && g_hall_prev_isr <= 6) {
+                    g_block_old_bh = g_reverse_isr ? g_hall_reverse_map[g_hall_prev_isr] : g_hall_prev_isr;
+                    g_block_cross_cnt = BLOCK_CROSS_TICKS;
+                }
                 g_hall_prev_isr = hall;
 
                 // ── Sine/FOC mode: przetwarzanie przejścia Halla ──
@@ -3488,6 +3587,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                     int8_t new_idx = hallToSector(hall);
                     if (new_idx >= 0) {
                         int8_t old_idx = g_sine_last_hall_idx;
+                        bool is_snap = false;
 
                         // Walidacja sekwencji: akceptuj tylko ±1 sektor
                         // Przeskok >1 sektora = prawdopodobnie glitch EMI który
@@ -3527,16 +3627,28 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                         if (dt_us > g_dbg_dt_max) g_dbg_dt_max = dt_us;
 
                         if (seq_valid) {
-                            // --- Aktualizacja prędkości NATYCHMIAST w ISR ---
+                            // --- Aktualizacja prędkości per-sector ---
+                            // Halle mogą być nierówno rozmieszczone (30-40%),
+                            // globalna prędkość nie działa → zapamiętaj czas
+                            // każdego sektora osobno.
                             if (dt_us >= min_hall_period_us && dt_us < 500000) {
                                 uint32_t new_speed = 52428800UL / dt_us;
-                                uint32_t old_speed = g_sine_speed_q16;
-                                if (old_speed == 0) {
-                                    g_sine_speed_q16 = new_speed;
-                                } else if (new_speed < old_speed) {
-                                    g_sine_speed_q16 = (old_speed + new_speed * 3) >> 2;
+                                // old_idx = sektor WYCHODZĄCY (właśnie zmierzony)
+                                if (old_idx >= 0 && old_idx < 6) {
+                                    uint32_t prev = g_sine_sector_speed[old_idx];
+                                    if (prev == 0) {
+                                        g_sine_sector_speed[old_idx] = new_speed;
+                                    } else {
+                                        // Lekki filtr: 3/4 new + 1/4 old
+                                        g_sine_sector_speed[old_idx] = (new_speed * 3 + prev) >> 2;
+                                    }
+                                }
+                                // Prędkość interpolacji = prędkość sektora WCHODZĄCEGO
+                                if (new_idx >= 0 && new_idx < 6 && g_sine_sector_speed[new_idx] != 0) {
+                                    g_sine_speed_q16 = g_sine_sector_speed[new_idx];
                                 } else {
-                                    g_sine_speed_q16 = (old_speed + new_speed) >> 1;
+                                    // Fallback: użyj właśnie zmierzonej
+                                    g_sine_speed_q16 = new_speed;
                                 }
                             }
 
@@ -3567,10 +3679,12 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                                 g_sine_angle_q16 = (uint32_t)expected;
                                 g_dbg_snap_count++;
                                 g_dbg_snap_window++;
+                                is_snap = true;
                             } else if (abs_err > SINE_SNAP_THRESHOLD) {
                                 g_sine_angle_q16 = (uint32_t)expected;
                                 g_dbg_snap_count++;
                                 g_dbg_snap_window++;
+                                is_snap = true;
                             } else {
                                 int32_t new_angle = current + (err >> SINE_PHASE_CORR_SHIFT);
                                 if (new_angle < 0) new_angle += (int32_t)SINE_TABLE_Q16_FULL;
@@ -3588,7 +3702,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                                 //   → ale err<0 dałby ujemną korektę → ODWRÓĆ znak!
                                 int32_t err_s = err >> 8;
                                 if (g_sine_dir < 0) err_s = -err_s;
-                                int32_t spd_corr = (err_s * (int32_t)g_sine_speed_q16) >> 14;
+                                int32_t spd_corr = (err_s * (int32_t)g_sine_speed_q16) >> 13;
                                 int32_t new_spd = (int32_t)g_sine_speed_q16 + spd_corr;
                                 if (new_spd < 0) new_spd = 0;
                                 g_sine_speed_q16 = (uint32_t)new_spd;
@@ -3601,6 +3715,73 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                         if (g_sine_startup_count < 255) {
                             g_sine_startup_count++;
                         }
+
+                        // ── Push debug event: Hall change w trybie SINUS/FOC ──
+                        if (g_debugCommutation) {
+                            uint8_t wr = g_dbg_evt_wr;
+                            uint8_t next = (wr + 1) & (DBG_EVT_RING_SIZE - 1);
+                            if (next != g_dbg_evt_rd) {
+                                volatile dbg_evt_t* ev = &g_dbg_evt_ring[wr];
+                                ev->ts_us = now_us;
+                                ev->hall_raw = hall;
+                                ev->hall_filt = g_hall_prev_isr;
+                                ev->mode = (uint8_t)g_mode_isr;
+                                ev->sector_old = old_idx;
+                                ev->sector_new = new_idx;
+                                ev->dir = g_sine_dir;
+                                ev->startup_cnt = g_sine_startup_count;
+                                ev->angle_q16 = g_sine_angle_q16;
+                                ev->speed_q16 = g_sine_speed_q16;
+                                ev->hall_period_us = dt_us;
+                                ev->duty = g_duty_isr;
+                                ev->da = g_dbg_last_da;
+                                ev->db = g_dbg_last_db;
+                                ev->dc = g_dbg_last_dc;
+                                ev->adc_a = g_phase_adc_raw_isr[0];
+                                ev->adc_b = g_phase_adc_raw_isr[1];
+                                ev->adc_c = g_phase_adc_raw_isr[2];
+                                ev->foc_vd = g_foc_vd_i;
+                                ev->foc_vq = g_foc_vq_i;
+                                ev->flags = (is_snap ? 2 : 0)
+                                          | (!seq_valid ? 4 : 0)
+                                          | (g_reverse_isr ? 8 : 0);
+                                g_dbg_evt_wr = next;
+                            } else {
+                                g_dbg_evt_overflow++;
+                            }
+                        }
+                    }
+                }
+                // ── Push debug event: Hall change w trybie BLOCK ──
+                else if (g_debugCommutation && g_mode_isr == DRIVE_MODE_BLOCK) {
+                    uint8_t wr = g_dbg_evt_wr;
+                    uint8_t next = (wr + 1) & (DBG_EVT_RING_SIZE - 1);
+                    if (next != g_dbg_evt_rd) {
+                        volatile dbg_evt_t* ev = &g_dbg_evt_ring[wr];
+                        ev->ts_us = now_us;
+                        ev->hall_raw = hall;
+                        ev->hall_filt = g_hall_prev_isr;
+                        ev->mode = (uint8_t)g_mode_isr;
+                        ev->sector_old = -1;
+                        ev->sector_new = -1;
+                        ev->dir = g_reverse_isr ? -1 : 1;
+                        ev->startup_cnt = 0;
+                        ev->angle_q16 = 0;
+                        ev->speed_q16 = 0;
+                        ev->hall_period_us = dt_us;
+                        ev->duty = g_duty_isr;
+                        ev->da = g_dbg_last_da;
+                        ev->db = g_dbg_last_db;
+                        ev->dc = g_dbg_last_dc;
+                        ev->adc_a = g_phase_adc_raw_isr[0];
+                        ev->adc_b = g_phase_adc_raw_isr[1];
+                        ev->adc_c = g_phase_adc_raw_isr[2];
+                        ev->foc_vd = 0;
+                        ev->foc_vq = 0;
+                        ev->flags = g_reverse_isr ? 8 : 0;
+                        g_dbg_evt_wr = next;
+                    } else {
+                        g_dbg_evt_overflow++;
                     }
                 }
             }
@@ -3713,14 +3894,43 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
     // Odwrócenie kierunku: remap Hall przed tabelą komutacji blokowej
     uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
 
-    switch (bh) {
-        case 1: phaseA_PWM(d); phaseB_Low(); phaseC_Off(); break;
-        case 3: phaseA_PWM(d); phaseB_Off(); phaseC_Low(); break;
-        case 2: phaseA_Off(); phaseB_PWM(d); phaseC_Low(); break;
-        case 6: phaseA_Low(); phaseB_PWM(d); phaseC_Off(); break;
-        case 4: phaseA_Low(); phaseB_Off(); phaseC_PWM(d); break;
-        case 5: phaseA_Off(); phaseB_Low(); phaseC_PWM(d); break;
-        default: allMosfetsOff(); break;
+    // Block crossfade: płynne przejście duty między starą a nową fazą PWM
+    if (g_block_cross_cnt > 0 && g_block_old_bh >= 1 && g_block_old_bh <= 6 && bh >= 1 && bh <= 6) {
+        uint8_t remaining = g_block_cross_cnt;
+        uint8_t elapsed = BLOCK_CROSS_TICKS - remaining;
+        g_block_cross_cnt--;
+
+        const uint8_t *os = g_block_phase_tbl[g_block_old_bh];
+        const uint8_t *ns = g_block_phase_tbl[bh];
+
+        // Faza A
+        uint8_t sa = ns[0]; uint16_t da = d;
+        if (os[0] == 2 && ns[0] == 0) { sa = 2; da = (uint16_t)((uint32_t)d * remaining / BLOCK_CROSS_TICKS); }
+        else if (os[0] == 0 && ns[0] == 2) { da = (uint16_t)((uint32_t)d * (elapsed + 1) / BLOCK_CROSS_TICKS); }
+        if (sa == 2) phaseA_PWM(da); else if (sa == 1) phaseA_Low(); else phaseA_Off();
+
+        // Faza B
+        uint8_t sb = ns[1]; uint16_t db = d;
+        if (os[1] == 2 && ns[1] == 0) { sb = 2; db = (uint16_t)((uint32_t)d * remaining / BLOCK_CROSS_TICKS); }
+        else if (os[1] == 0 && ns[1] == 2) { db = (uint16_t)((uint32_t)d * (elapsed + 1) / BLOCK_CROSS_TICKS); }
+        if (sb == 2) phaseB_PWM(db); else if (sb == 1) phaseB_Low(); else phaseB_Off();
+
+        // Faza C
+        uint8_t sc = ns[2]; uint16_t dc = d;
+        if (os[2] == 2 && ns[2] == 0) { sc = 2; dc = (uint16_t)((uint32_t)d * remaining / BLOCK_CROSS_TICKS); }
+        else if (os[2] == 0 && ns[2] == 2) { dc = (uint16_t)((uint32_t)d * (elapsed + 1) / BLOCK_CROSS_TICKS); }
+        if (sc == 2) phaseC_PWM(dc); else if (sc == 1) phaseC_Low(); else phaseC_Off();
+    } else {
+        // Normalny block (bez crossfade)
+        switch (bh) {
+            case 1: phaseA_PWM(d); phaseB_Low(); phaseC_Off(); break;
+            case 3: phaseA_PWM(d); phaseB_Off(); phaseC_Low(); break;
+            case 2: phaseA_Off(); phaseB_PWM(d); phaseC_Low(); break;
+            case 6: phaseA_Low(); phaseB_PWM(d); phaseC_Off(); break;
+            case 4: phaseA_Low(); phaseB_Off(); phaseC_PWM(d); break;
+            case 5: phaseA_Off(); phaseB_Low(); phaseC_PWM(d); break;
+            default: allMosfetsOff(); break;
+        }
     }
 }
 
@@ -3896,6 +4106,10 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
         if (dc < 0) dc = 0;
         if (dc > (int32_t)PWM_MAX_DUTY) dc = (int32_t)PWM_MAX_DUTY;
 
+        g_dbg_last_da = (int16_t)da;
+        g_dbg_last_db = (int16_t)db;
+        g_dbg_last_dc = (int16_t)dc;
+
         mcpwm_phase_complementary(0, (uint32_t)da);
         mcpwm_phase_complementary(1, (uint32_t)db);
         mcpwm_phase_complementary(2, (uint32_t)dc);
@@ -4019,6 +4233,10 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
         int32_t dc_duty = offset + vc;
         if (dc_duty < 0) dc_duty = 0;
         if (dc_duty > (int32_t)PWM_MAX_DUTY) dc_duty = (int32_t)PWM_MAX_DUTY;
+
+        g_dbg_last_da = (int16_t)da;
+        g_dbg_last_db = (int16_t)db;
+        g_dbg_last_dc = (int16_t)dc_duty;
 
         mcpwm_phase_complementary(0, (uint32_t)da);
         mcpwm_phase_complementary(1, (uint32_t)db);
@@ -4285,6 +4503,7 @@ void printHelp() {
     Serial.println("gdbg       Debug SINUS/BLOCK ON/OFF (co 200ms: hall idx, predkosc, duty)");
     Serial.println("idbg       Debug pradow fazowych ON/OFF (co 500ms: Ia,Ib,Ic, max, EMA, limit, factor)");
     Serial.println("hdbg       Debug Hall ON/OFF (co 200ms: raw/filtered hall, sector, speed, path, edges)");
+    Serial.println("cdbg       Debug Commutation ON/OFF (event-driven: Hall change + duty/angle/speed)");
     Serial.println();
     Serial.println("---------- Offset fazy sinusa (SINUS/FOC) ----------");
     Serial.println("so         Pokaz aktualny offset fazy [-48..+48], 1 wpis = 3.75 deg el.");
@@ -4744,6 +4963,15 @@ static String executeCommand(const String& cmd) {
         g_debugHall = !g_debugHall;
         g_lastDebugHallMs = millis();
         return g_debugHall ? "Debug Hall: ON (co 200ms)" : "Debug Hall: OFF";
+    }
+    if (cmd == "cdbg") {
+        g_debugCommutation = !g_debugCommutation;
+        if (g_debugCommutation) {
+            // Reset ring buffer
+            g_dbg_evt_rd = g_dbg_evt_wr;
+            g_dbg_evt_overflow = 0;
+        }
+        return g_debugCommutation ? "Debug Commutation: ON (event-driven)" : "Debug Commutation: OFF";
     }
     // ── FOC: strojenie i diagnostyka ──
     if (cmd == "fdbg") {
