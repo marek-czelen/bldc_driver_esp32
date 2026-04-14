@@ -122,10 +122,10 @@ void s866_init() {
     // Włącz konwerter poziomów TXB0102DCU
     digitalWrite(PIN_UART_EN, HIGH);
 
-    // Inicjalizuj Serial2 (GPIO4=TX2, GPIO16=RX2)
+    // Inicjalizuj Serial2 (RX=PIN_UART_RX/GPIO16, TX=PIN_UART_TX/GPIO17)
     Serial2.end();  // Upewnij się że wcześniej jest zamknięty
     delay(10);
-    Serial2.begin(S866_BAUD_RATE, SERIAL_8N1, 16, 4);  // RX=GPIO16, TX=GPIO4
+    Serial2.begin(S866_BAUD_RATE, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
 }
 
 void s866_deinit() {

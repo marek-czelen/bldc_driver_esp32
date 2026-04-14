@@ -63,11 +63,10 @@ Konfiguracja przez **Serial 115200 baud** oraz **WiFi AP** (responsywny interfej
 | Pomiar prądu      | INA180A2 × 3               | Gain = 50 V/V, shunt = 2 mΩ |
 | Shunty            | 2 mΩ (low-side)            | Jeden na każdą fazę |
 | Czujniki Halla    | 3 × czujnik cyfrowy        | Wbudowane w silnik |
-| Level shifter     | TXB0102DCU                 | 3.3V ↔ 5V, enable GPIO17 |
-| Wyświetlacz       | S866 (protokół 2)          | Serial2: GPIO4(TX)/GPIO16(RX), 9600 baud |
+| Level shifter     | TXB0102DCU                 | 3.3V ↔ 5V, enable GPIO5 |
+| Wyświetlacz       | S866 (protokół 2)          | Serial2: GPIO17(TX)/GPIO16(RX), 9600 baud |
 | Napięcie baterii  | Dzielnik 1 MΩ / 33 kΩ      | Mierzone na GPIO36 (VP) |
-| Przepustnica      | Potencjometr/czujnik 0–3.3 V | GPIO2, ADC zakres 400–2600 |
-| Temperatura silnika | Termistor / czujnik analogowy | GPIO15, ADC |
+| Przepustnica      | Potencjometr/czujnik 0–3.3 V | GPIO33, ADC zakres 400–2600 |
 
 ---
 
@@ -79,8 +78,8 @@ Wszystkie definicje pinów znajdują się w `include/pinout.h`.
 
 | Pin ESP32 | GPIO | Funkcja              | IR2103 |
 |-----------|------|----------------------|--------|
-| GPIO32    | 32   | Faza A — HIGH side   | HIN_A  |
-| GPIO33    | 33   | Faza A — LOW side    | LIN_A  |
+| GPIO12    | 12   | Faza A — HIGH side   | HIN_A  |
+| GPIO13    | 13   | Faza A — LOW side    | LIN_A  |
 | GPIO25    | 25   | Faza B — HIGH side   | HIN_B  |
 | GPIO26    | 26   | Faza B — LOW side    | LIN_B  |
 | GPIO27    | 27   | Faza C — HIGH side   | HIN_C  |
@@ -101,21 +100,17 @@ Wszystkie definicje pinów znajdują się w `include/pinout.h`.
 | 39   | Prąd fazy A           | ADC1_CH3  |
 | 34   | Prąd fazy B           | ADC1_CH6  |
 | 35   | Prąd fazy C           | ADC1_CH7  |
-| 2    | Przepustnica          | ADC2_CH2  |
-| 15   | Temperatura silnika   | ADC2_CH3  |
-| 12   | Temperatura FET       | ADC2_CH5  |
-
-> **Uwaga ADC2 — konflikt z WiFi:**  
-> Piny ADC2 (GPIO2, GPIO12, GPIO15) **nie mogą być czytane przez `analogRead()` gdy WiFi jest włączone** — sterownik ESP32 zgłasza `ESP_ERR_TIMEOUT: ADC2 is in use by Wi-Fi`. Dlatego podczas aktywnego WiFi (P17=1) odczyty tych pinów są pomijane, a silnik jest wyłączony (bez ADC2 i tak nie ma przepustnicy). Gdy podłączysz `PIN_FET_TEMP` (GPIO12), dodaj w `readAnalogInputs()` guard `if (!g_wifi_active)` przed `analogRead(PIN_FET_TEMP)` — szkielet komentarza jest już w kodzie.
+| 33   | Przepustnica          | ADC1_CH5  |
+| 32   | Temperatura FET       | ADC1_CH4  |
 
 > **Uwaga GPIO12 (MTDI):**  
-> GPIO12 jest pinem strap ESP32. Jeśli ma pull-up przy starcie, zmienia napięcie VDD_SDIO z 3.3 V na 1.8 V, co uniemożliwia programowanie flash. **Nie podłączać pull-up do GPIO12**; stosować pull-down lub pozostawić floating.
+> GPIO12 jest pinem strap ESP32 (teraz używany jako PIN_PWM_A_HIGH). Jeśli ma pull-up przy starcie, zmienia napięcie VDD_SDIO z 3.3 V na 1.8 V, co uniemożliwia programowanie flash. **Nie podłączać pull-up do GPIO12**; stosować pull-down lub pozostawić floating.
 
 ### Czujniki Halla
 
 | GPIO | Funkcja       | Tryb |
 |------|---------------|------|
-| 5    | Hall A        | INPUT_PULLUP |
+| 4    | Hall A        | INPUT_PULLUP |
 | 18   | Hall B        | INPUT_PULLUP |
 | 19   | Hall C        | INPUT_PULLUP |
 
@@ -130,13 +125,13 @@ Wszystkie definicje pinów znajdują się w `include/pinout.h`.
 
 | GPIO | Funkcja              |
 |------|----------------------|
-| 1    | UART0 TX (debug)     |
-| 3    | UART0 RX (debug)     |
-| 4    | UART2 TX (S866 wyświetlacz) |
-| 16   | UART2 RX (S866 wyświetlacz) |
-| 17   | UART Enable (TXB0102DCU) |
+| 16   | UART RX (S866 wyświetlacz) |
+| 17   | UART TX (S866 wyświetlacz) |
+| 5    | UART Enable (TXB0102DCU) |
 | 21   | Wejście prędkości (czujnik ext. przy P07≤1) |
 | 0    | EXT1 (boot pin!)     |
+| 2    | EXT2                 |
+| 15   | EXT3                 |
 
 ---
 
@@ -185,8 +180,7 @@ Zakres pomiarowy:
 
 ### Temperatura silnika
 
-Surowa wartość ADC (0–4095) bez przeliczenia na °C. Wymaga dopasowania krzywej do użytego czujnika (termistor NTC/PTC lub IC).  
-PIn GPIO15 ma pull-up 10 kΩ na PCB — przy braku czujnika daje stałą wartość ~4095.
+Surowa wartość ADC (0–4095) bez przeliczenia na °C. Wymaga dopasowania krzywej do użytego czujnika (termistor NTC/PTC lub IC).
 
 ---
 
@@ -549,8 +543,8 @@ MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_PWM;  // np. high-side PWM
 ## Wyświetlacz S866 — protokół 2
 
 Sterownik komunikuje się z wyświetlaczem S866 przez **Serial2** (UART2):
-- **TX:** GPIO4, **RX:** GPIO16, **9600 baud**, 8N1
-- Level shifter **TXB0102DCU** (3.3V ↔ 5V), włączany przez GPIO17 (UART_EN)
+- **TX:** GPIO17, **RX:** GPIO16, **9600 baud**, 8N1
+- Level shifter **TXB0102DCU** (3.3V ↔ 5V), włączany przez GPIO5 (UART_EN)
 - Wyświetlacz jest **zawsze aktywny** (nie wymaga komendy do uruchomienia)
 
 ### Ramka RX (wyświetlacz → sterownik): 20 bajtów
@@ -729,7 +723,7 @@ Jeśli warunki nie są spełnione → coast (allMosfetsOff).
 
 ### Sprzęt
 
-- **Pin:** GPIO2 (ADC2_CH2)
+- **Pin:** GPIO33 (ADC1_CH5)
 - **Martwa strefa:** wartości ADC < 400 → duty = 0
 - **Zakres roboczy:** 400–2600 ADC
 
@@ -738,7 +732,7 @@ Jeśli warunki nie są spełnione → coast (allMosfetsOff).
 
 ### Filtr szumów ADC przepustnicy (burst + outlier rejection + EMA)
 
-GPIO2 (ADC2) jest podatny na szpilki EMI od PWM silnika. Pojedyncza szpilka
+GPIO33 (ADC1_CH5) jest podatny na szpilki EMI od PWM silnika. Pojedyncza szpilka
 poniżej progu dead-zone dawałaby `duty=0` i stall silnika. Zastosowano
 3-stopniowy pipeline filtracji:
 
@@ -795,9 +789,8 @@ thr_ema += α × (burst_avg − thr_ema)
 | `thr_outlier_thresh` | 150 | `cfg:thrdelta:N` | Max odchylenie od mediany (10–2000) |
 | `kThrottleFilterAlpha` | 0.15 | — | Stała EMA (w kodzie) |
 
-> **Uwaga ADC2 — konflikt z WiFi:**  
-> Piny ADC2 (GPIO2, GPIO12, GPIO15) **nie mogą być czytane przez `analogRead()` gdy WiFi jest włączone**.
-> Podczas aktywnego WiFi (P17=1) odczyty tych pinów są pomijane, a silnik jest wyłączony.
+> **Uwaga:** Przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają teraz z **ADC1** — nie ma konfliktu z WiFi.  
+> Odczyty ADC przepustnicy i temperatury FET działają poprawnie niezależnie od stanu WiFi.
 
 ### Mapowanie proporcjonalne (wspólny algorytm BLOCK / SINUS / FOC)
 
@@ -1286,17 +1279,11 @@ Przejście P17: 1→0 jest jedynym momentem kiedy kolejka trybu (`B`, `S`, `F`) 
 
 > **Ograniczenie `/api/cmd`:** komendy startujące silnik (`B`, `S`, `F`, `e`, `m2`, `m3`) są odrzucane z HTTP 403 gdy WiFi aktywne. Użyj `/api/queue` — komenda wykona się po P17→0.
 
-### Konflikt ADC2 / WiFi
+### ADC a WiFi
 
-ESP32 posiada dwa przetworniki ADC. ADC2 jest współdzielony z kontrolerem WiFi — nie można go używać jednocześnie (błąd `ESP_ERR_TIMEOUT`).
+W nowej wersji PCB przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają z **ADC1**, który **nie koliduje z WiFi**. Nie ma już potrzeby blokowania odczytów ADC podczas aktywnego WiFi.
 
-| GPIO | Funkcja | ADC | Zachowanie podczas WiFi |
-|------|---------|-----|--------------------------|
-| 2 | Przepustnica | ADC2_CH2 | Pominięty — `throttle_raw = 0` |
-| 15 | Temp. silnika | ADC2_CH3 | Pominięty — ostatnia znana wartość |
-| 12 | Temp. FET *(niepodłączony)* | ADC2_CH5 | Guard w kodzie przygotowany |
-
-> **Gdy podłączysz czujnik FET (GPIO12):** W `readAnalogInputs()` w pliku `main.cpp` jest szkielet komentarza z gotową instrukcją jak dodać guard `if (!g_wifi_active)` przed `analogRead(PIN_FET_TEMP)`. Pamiętaj też o zakazie pull-up (pin STRAP).
+Jedyne piny ADC2 nie są używane do pomiarów analogowych — konflikt ADC2/WiFi nie dotyczy tej konfiguracji.
 
 ---
 
@@ -1755,11 +1742,6 @@ ale z ramą dq.
 - Offset nie skalibrowany (zbyt mało czasu z wyłączonym silnikiem)
 - Błąd w kalibracji dzielnika `kVbatRTop/kVbatRBottom` dla VBAT
 - Sprawdź napięcie na wyjściu INA180A2 multimetrem
-
-### Problem: GPIO15 (PIN_MOTOR_TEMP) — wartość ADC = 4095
-- GPIO15 ma pull-up 10 kΩ na PCB
-- Przy braku podłączonego czujnika daje max wartość ADC
-- **GPIO15 z pull-up = bezpieczny strap pin dla ESP32** (nie zmienia VDD_SDIO)
 
 ---
 

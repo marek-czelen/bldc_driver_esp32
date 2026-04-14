@@ -1432,11 +1432,11 @@ void setup() {
 
     Serial.printf("[OK] Rampa rozpędzania: %d ms (0→100%%)\n", g_bldc_state.ramp_time_ms);
 
-    // Inicjalizacja wyświetlacza S866 na Serial2 (GPIO4/GPIO16)
+    // Inicjalizacja wyświetlacza S866 na Serial2 (GPIO16/GPIO17)
     memset(&g_display, 0, sizeof(g_display));
     g_display.last_valid_ms = millis();
     s866_init();
-    Serial.println("[OK] Wyświetlacz S866 uruchomiony (Serial2: GPIO4/GPIO16, 9600 baud)");
+    Serial.println("[OK] Wyświetlacz S866 uruchomiony (Serial2: GPIO16/GPIO17, 9600 baud)");
 
     // Automatyczne włączenie trybu jazdy z konfiguracji NVS
     {
@@ -2638,9 +2638,8 @@ void loop() {
  * Piny PWM (mostki) są ustawiane w bezpieczny stan (wszystkie tranzystory OFF)
  * PRZED przełączeniem trybu na OUTPUT — zapobiega to impulsowi przy starcie.
  *
- * @warning GPIO12 (PIN_FET_TEMP) jest pinem STRAP ESP32.
+ * @warning GPIO12 (PIN_PWM_A_HIGH) jest pinem STRAP ESP32.
  * Pull-up na GPIO12 during boot przestawia VDD_SDIO na 1.8V → brak uploadu do flash.
- * Na PCB GPIO12 nie powinien mieć pull-up; tu nie konfigurujemy go jako OUTPUT.
  *
  * @warning GPIO0 (PIN_EXT_1) jest pinem BOOT. LOW przy resecie = tryb programowania.
  * Używać ostrożnie.
@@ -2674,9 +2673,9 @@ void initGPIO() {
     pinMode(PIN_PHASE_B_CURRENT, INPUT);
     pinMode(PIN_PHASE_C_CURRENT, INPUT);
 
-    // --- Czujniki temperatury ---
-    pinMode(PIN_MOTOR_TEMP, INPUT);
-    // PIN_FET_TEMP (GPIO12)
+    // --- Czujnik temperatury FET (GPIO32/ADC1_CH4) ---
+    // PIN_FET_TEMP — nie wymaga pinMode, input-only nie dotyczy, ale ustawiamy
+    pinMode(PIN_FET_TEMP, INPUT);
 
     // --- Przepustnica ---
     pinMode(PIN_THROTTLE, INPUT);
@@ -2935,12 +2934,11 @@ void readAnalogInputs() {
     }
 
     // Przepustnica: bufor kołowy N próbek (1 na iterację loop) + mediana
-    // ADC2/GPIO2 jest podatny na szpilki EMI od PWM silnika.
+    // GPIO33/ADC1_CH5 — podatny na szpilki EMI od PWM silnika.
     // Zamiast burst (N próbek w ~100µs) — 1 próbka na loop() (~0.5ms).
     // Próbki rozłożone w czasie: szpilka EMI trwająca <N×0.5ms
     // zanieczyszcza tylko część bufora, mediana ją odrzuca.
-    // Pomijamy odczyt gdy WiFi aktywne — ADC2 jest zajęty przez WiFi.
-    if (!g_wifi_active) {
+    {
         static uint16_t thr_ring[16] = {0};
         static uint8_t  thr_ring_idx = 0;
         static bool     thr_ring_init = false;
@@ -2992,19 +2990,9 @@ void readAnalogInputs() {
             }
         }
         g_bldc_state.throttle_raw = (count > 0) ? (uint16_t)(sum / count) : median;
-    } else {
-        g_bldc_state.throttle_raw = 0;  // WiFi ON: silnik wyłączony, przepustnica zignorowana
     }
 
-    // Odczyt temperatury silnika (ADC2/GPIO15) — pomijamy gdy WiFi aktywne
-    uint16_t motorTempRaw = g_wifi_active ? (uint16_t)g_bldc_state.motor_temperature
-                                          : analogRead(PIN_MOTOR_TEMP);
-
-    // Odczyt temperatury FET (ADC2_CH5/GPIO12) — PIN_FET_TEMP
-    // UWAGA: GPIO12 jest pinem STRAP i ADC2 — gdy podłączysz czujnik FET:
-    //   1. Nie stosuj pull-up (STRAP: VDD_SDIO 1.8V → brak uploadu flash)
-    //   2. Dodaj tu guard: analogRead(PIN_FET_TEMP) tylko gdy !g_wifi_active
-    //      (ADC2 zajęty przez WiFi → ESP_ERR_TIMEOUT gdy g_wifi_active)
+    // Odczyt temperatury FET (ADC1_CH4/GPIO32) — PIN_FET_TEMP
     // Aktualnie PIN_FET_TEMP NIE jest czytany (czujnik niepodłączony).
 
     // Surowe wartości ADC
@@ -3047,7 +3035,6 @@ void readAnalogInputs() {
     g_bldc_state.phase_current[0] = ia;
     g_bldc_state.phase_current[1] = ib;
     g_bldc_state.phase_current[2] = ic;
-    g_bldc_state.motor_temperature = motorTempRaw;                   // Surowa wartość
 }
 
 // ============================================================================
@@ -3145,7 +3132,7 @@ void printDiagnostics() {
         if (thrPct > 100) thrPct = 100;
     }
 
-    Serial.printf("%s%s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d T:%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
+    Serial.printf("%s%s D:%d/%d%% V:%.1f Ia:%.2f Ib:%.2f Ic:%.2f H:%d%d%d Thr:%d%%(%d) RPM:%lu WT:%u P:%.1fW",
         modeNames[g_bldc_state.mode],
         g_reverse_isr ? "<" : ">",
         dutyPct, targetPct,
@@ -3156,7 +3143,6 @@ void printDiagnostics() {
         (g_bldc_state.hall_state >> 2) & 1,
         (g_bldc_state.hall_state >> 1) & 1,
         g_bldc_state.hall_state & 1,
-        (int)g_bldc_state.motor_temperature,
         thrPct,
         g_bldc_state.throttle_raw,
         (unsigned long)g_bldc_state.rpm,

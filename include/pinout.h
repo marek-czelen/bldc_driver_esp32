@@ -44,10 +44,10 @@
 // Aby wyłączyć low-side MOSFET: ustaw pin PWM_x_LOW = HIGH (LIN jest odwrócony!)
 
 /** @brief Faza A - sterowanie high-side MOSFET (IR2103 HIN) */
-#define PIN_PWM_A_HIGH          32  // GPIO32
+#define PIN_PWM_A_HIGH          12  // GPIO12
 
 /** @brief Faza A - sterowanie low-side MOSFET (IR2103 LIN - odwrócony!) */
-#define PIN_PWM_A_LOW           33  // GPIO33
+#define PIN_PWM_A_LOW           13  // GPIO13
 
 /** @brief Faza B - sterowanie high-side MOSFET (IR2103 HIN) */
 #define PIN_PWM_B_HIGH          25  // GPIO25
@@ -77,24 +77,15 @@
 // Czujniki temperatury (ADC)
 // ============================================================================
 
-/**
- * @brief Czujnik temperatury tranzystorów FET (ADC2_CH5).
- * @warning GPIO12 (MTDI) jest pinem STRAP ESP32!
- * Pull-up na GPIO12 podczas boot-u przestawia VDD_SDIO na 1.8V zamiast 3.3V,
- * co uniemożliwia programowanie flas. Na PCB NIE stosować pull-up na GPIO12.
- * Stosować pull-down lub pozostawić floating.
- */
-#define PIN_FET_TEMP            12  // GPIO12 (STRAP pin - nie stosuj pull-up!)
-
-/** @brief Czujnik temperatury silnika */
-#define PIN_MOTOR_TEMP          15  // GPIO15
+/** @brief Czujnik temperatury tranzystorów FET (ADC1_CH4) */
+#define PIN_FET_TEMP            32  // GPIO32 - ADC1_CH4
 
 // ============================================================================
 // Wejścia sterujące
 // ============================================================================
 
-/** @brief Wejście przepustnicy / gazu (ADC2_CH2) */
-#define PIN_THROTTLE            2   // GPIO2
+/** @brief Wejście przepustnicy / gazu (ADC1_CH5) */
+#define PIN_THROTTLE            33  // GPIO33 - ADC1_CH5
 
 /** @brief Wejście czujnika PAS (Pedal Assist Sensor) */
 #define PIN_PAS                 22  // GPIO22
@@ -107,7 +98,7 @@
 // ============================================================================
 
 /** @brief Czujnik Halla A */
-#define PIN_HALL_SENSOR_A       5   // GPIO5
+#define PIN_HALL_SENSOR_A       4   // GPIO4
 
 /** @brief Czujnik Halla B */
 #define PIN_HALL_SENSOR_B       18  // GPIO18
@@ -127,13 +118,13 @@
 // ============================================================================
 
 /** @brief UART RX (3.3V) */
-#define PIN_UART_RX             3   // GPIO3 (RX0)
+#define PIN_UART_RX             16  // GPIO16
 
 /** @brief UART TX (3.3V) */
-#define PIN_UART_TX             1   // GPIO1 (TX0)
+#define PIN_UART_TX             17  // GPIO17
 
 /** @brief UART Enable */
-#define PIN_UART_EN             17  // GPIO17
+#define PIN_UART_EN             5   // GPIO5
 
 // ============================================================================
 // Wyprowadzenia rozszerzeń
@@ -143,10 +134,10 @@
 #define PIN_EXT_1               0   // GPIO0 (UWAGA: boot pin)
 
 /** @brief Rozszerzenie 2 */
-#define PIN_EXT_2               4   // GPIO4
+#define PIN_EXT_2               2   // GPIO2
 
 /** @brief Rozszerzenie 3 */
-#define PIN_EXT_3               16  // GPIO16
+#define PIN_EXT_3               15  // GPIO15
 
 // ============================================================================
 // Konfiguracja PWM (MCPWM — center-aligned complementary)
