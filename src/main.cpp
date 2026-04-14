@@ -3549,13 +3549,17 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         g_phase_adc_raw_isr[0] = a;
         g_phase_adc_raw_isr[1] = b;
         g_phase_adc_raw_isr[2] = c;
-        // Akumuluj do uśredniania w loop()
-        portENTER_CRITICAL_ISR(&g_adc_mux);
-        g_phase_adc_sum_isr[0] += a;
-        g_phase_adc_sum_isr[1] += b;
-        g_phase_adc_sum_isr[2] += c;
-        g_phase_adc_cnt_isr++;
-        portEXIT_CRITICAL_ISR(&g_adc_mux);
+        // Akumuluj do uśredniania w loop() — odrzucaj szpilki ADC (saturacja)
+        // Próbki > 3800 (~30A) to artefakty przełączania MOSFET, nie prawdziwy prąd.
+        // Pomijamy je zamiast dodawać do sumy.
+        if (a < 3800 && b < 3800 && c < 3800) {
+            portENTER_CRITICAL_ISR(&g_adc_mux);
+            g_phase_adc_sum_isr[0] += a;
+            g_phase_adc_sum_isr[1] += b;
+            g_phase_adc_sum_isr[2] += c;
+            g_phase_adc_cnt_isr++;
+            portEXIT_CRITICAL_ISR(&g_adc_mux);
+        }
         g_adc_ready_isr = true;
     }
 
@@ -3954,6 +3958,10 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         if (os[2] == 2 && ns[2] == 0) { sc = 2; dc = (uint16_t)((uint32_t)d * remaining / BLOCK_CROSS_TICKS); }
         else if (os[2] == 0 && ns[2] == 2) { dc = (uint16_t)((uint32_t)d * (elapsed + 1) / BLOCK_CROSS_TICKS); }
         if (sc == 2) phaseC_PWM(dc); else if (sc == 1) phaseC_Low(); else phaseC_Off();
+        // Debug: aktualizuj dA/dB/dC dla cdbg (crossfade)
+        g_dbg_last_da = (sa == 2) ? da : 0;
+        g_dbg_last_db = (sb == 2) ? db : 0;
+        g_dbg_last_dc = (sc == 2) ? dc : 0;
     } else {
         // Normalny block (bez crossfade)
         switch (bh) {
@@ -3964,6 +3972,16 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             case 4: phaseA_Low(); phaseB_Off(); phaseC_PWM(d); break;
             case 5: phaseA_Off(); phaseB_Low(); phaseC_PWM(d); break;
             default: allMosfetsOff(); break;
+        }
+        // Debug: aktualizuj dA/dB/dC dla cdbg
+        switch (bh) {
+            case 1: g_dbg_last_da = d; g_dbg_last_db = 0; g_dbg_last_dc = 0; break;
+            case 3: g_dbg_last_da = d; g_dbg_last_db = 0; g_dbg_last_dc = 0; break;
+            case 2: g_dbg_last_da = 0; g_dbg_last_db = d; g_dbg_last_dc = 0; break;
+            case 6: g_dbg_last_da = 0; g_dbg_last_db = d; g_dbg_last_dc = 0; break;
+            case 4: g_dbg_last_da = 0; g_dbg_last_db = 0; g_dbg_last_dc = d; break;
+            case 5: g_dbg_last_da = 0; g_dbg_last_db = 0; g_dbg_last_dc = d; break;
+            default: g_dbg_last_da = g_dbg_last_db = g_dbg_last_dc = 0; break;
         }
     }
 }
