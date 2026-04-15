@@ -78,17 +78,18 @@ bldc_state_t g_bldc_state;
 
 // MCPWM ISR handle (zastępuje hw_timer — komutacja w przerwaniu TEZ center-aligned)
 static intr_handle_t g_mcpwm_isr_handle = NULL;
-/// Flaga: ISR MCPWM przeczytał ADC prądu w dolinie PWM (center)
+/// Flaga: ISR MCPWM przeczytał pierwszy odczyt ADC prądu
 volatile bool g_adc_ready_isr = false;
-/// Akumulator surowych odczytów ADC prądu z ISR (uśrednianie wielu cykli PWM)
-volatile uint32_t g_phase_adc_sum_isr[3] = {0, 0, 0};
-volatile uint16_t g_phase_adc_cnt_isr = 0;
-/// Ostatni surowy odczyt ADC (do diagnostyki idbg)
+/// Ciągła EMA prądu per kanał w ISR (fixed-point Q8: wartość × 256)
+/// Aktualizowana co tick ISR (20kHz), spike > ADC_SPIKE_THRESHOLD → pominięty.
+/// SHIFT=4 → alpha=1/16, tau=16/20000=0.8ms. Odczyt w loop(): ema>>8.
+volatile uint32_t g_phase_adc_ema_q8[3] = {0, 0, 0};
+/// Ostatni surowy odczyt ADC (do diagnostyki idbg/cdbg)
 volatile uint16_t g_phase_adc_raw_isr[3] = {0, 0, 0};
-/// Ostatni dobry odczyt ADC per kanał (do zastąpienia outlierów)
-volatile uint16_t g_phase_adc_last_good[3] = {0, 0, 0};
-/// Spinlock synchronizacji ISR ↔ loop dla akumulatora ADC prądu
-static portMUX_TYPE g_adc_mux = portMUX_INITIALIZER_UNLOCKED;
+/// Próg odrzucania szpilek ADC (~30A przy INA180+2mΩ shunt)
+#define ADC_SPIKE_THRESHOLD  3800
+/// Stała EMA w ISR: shift=4 → alpha=1/16, tau≈0.8ms @ 20kHz
+#define ADC_EMA_SHIFT        4
 /// Flaga: ISR może czytać ADC1 (false=loop() czyta ADC1, ISR pomija)
 volatile bool g_adc_isr_active = false;
 /// Licznik timeoutów ADC w ISR (diagnostyka)
@@ -130,6 +131,11 @@ volatile int8_t   g_sine_last_hall_idx = -1;   ///< Ostatni indeks Halla w sekwe
 volatile int8_t   g_sine_dir = 1;              ///< Kierunek z przejść Halla: +1 forward, -1 reverse
 volatile uint32_t g_sine_last_hall_ms = 0;     ///< HAL tick ostatniego przejścia Halla (stall detection)
 volatile int8_t   g_sine_hall_phase_offset = 0; ///< Runtime-tunable Hall phase offset (-48..+48 entries, 1 entry = 3.75°)
+
+/// Startup state machine for SINUS/FOC: 0=IDLE, 1=ALIGN, 2=RUN
+volatile uint8_t  g_startup_state = 0;
+volatile uint32_t g_startup_align_start_us = 0; ///< Timestamp rozpoczęcia alignmentu [us]
+volatile uint8_t  g_startup_align_hall = 0;     ///< Hall zapisany na początku alignmentu
 
 // FOC state — regulatory PI i wektory napięciowe
 struct foc_pi_t {
@@ -435,6 +441,8 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
 #define SINE_PHASE_B_OFFSET     64              // 96*2/3 = 240°
 #define SINE_PHASE_C_OFFSET     32              // 96/3 = 120°
 #define SINE_STARTUP_COMMUT     18              // przejść Halla w BLOCK przed przejściem na SINUS/FOC (3 obroty el.)
+#define STARTUP_ALIGN_MS        150             // czas wyrównania rotora w BLOCK [ms]
+#define STARTUP_ALIGN_DUTY_PCT  100             // duty wyrównania [% PWM_MAX_DUTY]
 #define SINE_BLOCK_SPEED_THRESHOLD  10000       // Q16 speed poniżej tego → BLOCK zamiast SINUS/FOC (stall/oscylacja)
 #define SINE_STALL_FREEZE_MS    200             // ms bez Halla → zamrożenie kąta
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prędkość startowa ≈ 1 obr.elekt./s (52428800/166666)
@@ -3017,28 +3025,13 @@ void readAnalogInputs() {
     // ISR onCommutationTimer czyta ADC prądu w dolinie center-aligned PWM
     // (counter=0, wszystkie low-side ON) → odczyt stabilny, bez szpilek.
     // Gdy ISR nie dostarczył danych (np. przed uruchomieniem timera),
-    // fallback na analogRead() z medianą (stare zachowanie).
+    // Odczyt ciągłej EMA prądu z ISR (fixed-point Q8 → wartość realna).
+    // Atomowy 32-bit read na ESP32 — bez spinlocka.
     uint16_t phaseA_raw, phaseB_raw, phaseC_raw;
     if (g_adc_ready_isr) {
-        // Pobierz uśrednione odczyty z akumulatora ISR (wiele cykli PWM)
-        portENTER_CRITICAL(&g_adc_mux);
-        uint32_t sa = g_phase_adc_sum_isr[0];
-        uint32_t sb = g_phase_adc_sum_isr[1];
-        uint32_t sc = g_phase_adc_sum_isr[2];
-        uint16_t cnt = g_phase_adc_cnt_isr;
-        g_phase_adc_sum_isr[0] = 0;
-        g_phase_adc_sum_isr[1] = 0;
-        g_phase_adc_sum_isr[2] = 0;
-        g_phase_adc_cnt_isr = 0;
-        g_adc_ready_isr = false;
-        portEXIT_CRITICAL(&g_adc_mux);
-        if (cnt > 0) {
-            phaseA_raw = (uint16_t)(sa / cnt);
-            phaseB_raw = (uint16_t)(sb / cnt);
-            phaseC_raw = (uint16_t)(sc / cnt);
-        } else {
-            phaseA_raw = phaseB_raw = phaseC_raw = 0;
-        }
+        phaseA_raw = (uint16_t)(g_phase_adc_ema_q8[0] >> 8);
+        phaseB_raw = (uint16_t)(g_phase_adc_ema_q8[1] >> 8);
+        phaseC_raw = (uint16_t)(g_phase_adc_ema_q8[2] >> 8);
     } else {
         // Fallback: bezpośredni odczyt (przed init ISR lub ISR nieaktywny)
         g_adc_isr_active = false;
@@ -3547,20 +3540,16 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         uint16_t a = adc1_read_isr(ADC1_CHANNEL_3);  // Phase A (GPIO39)
         uint16_t b = adc1_read_isr(ADC1_CHANNEL_6);  // Phase B (GPIO34)
         uint16_t c = adc1_read_isr(ADC1_CHANNEL_7);  // Phase C (GPIO35)
-        // Zachowaj ostatni raw do diagnostyki (idbg)
+        // Zachowaj ostatni raw do diagnostyki (idbg/cdbg)
         g_phase_adc_raw_isr[0] = a;
         g_phase_adc_raw_isr[1] = b;
         g_phase_adc_raw_isr[2] = c;
-        // Akumuluj do uśredniania w loop() — odrzucaj szpilki ADC per kanał.
-        // Próbki > 3800 (~30A) to artefakty przełączania MOSFET, nie prawdziwy prąd.
-        // Każdy kanał filtrowany niezależnie — spike na fazie A nie odrzuca fazy B/C.
-        portENTER_CRITICAL_ISR(&g_adc_mux);
-        if (a < 3800) { g_phase_adc_sum_isr[0] += a; } else { g_phase_adc_sum_isr[0] += g_phase_adc_last_good[0]; }
-        if (b < 3800) { g_phase_adc_sum_isr[1] += b; g_phase_adc_last_good[1] = b; } else { g_phase_adc_sum_isr[1] += g_phase_adc_last_good[1]; }
-        if (c < 3800) { g_phase_adc_sum_isr[2] += c; g_phase_adc_last_good[2] = c; } else { g_phase_adc_sum_isr[2] += g_phase_adc_last_good[2]; }
-        if (a < 3800) { g_phase_adc_last_good[0] = a; }
-        g_phase_adc_cnt_isr++;
-        portEXIT_CRITICAL_ISR(&g_adc_mux);
+        // Ciągła EMA per kanał w fixed-point Q8 (wartość × 256).
+        // Spike > ADC_SPIKE_THRESHOLD → pominięty (EMA trzyma poprzednią wartość).
+        // ema += ((sample<<8) - ema) >> SHIFT  — bez mnożenia, ~3 cykle ARM.
+        if (a < ADC_SPIKE_THRESHOLD) { g_phase_adc_ema_q8[0] += (((uint32_t)a << 8) - g_phase_adc_ema_q8[0]) >> ADC_EMA_SHIFT; }
+        if (b < ADC_SPIKE_THRESHOLD) { g_phase_adc_ema_q8[1] += (((uint32_t)b << 8) - g_phase_adc_ema_q8[1]) >> ADC_EMA_SHIFT; }
+        if (c < ADC_SPIKE_THRESHOLD) { g_phase_adc_ema_q8[2] += (((uint32_t)c << 8) - g_phase_adc_ema_q8[2]) >> ADC_EMA_SHIFT; }
         g_adc_ready_isr = true;
     }
 
@@ -3602,7 +3591,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
 
             uint32_t min_hall_period_us = HALL_MIN_PERIOD_US;
             if ((g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) &&
-                g_sine_speed_q16 < SINE_BLOCK_SPEED_THRESHOLD) {
+                g_startup_state < 2) {
                 min_hall_period_us = HALL_MIN_PERIOD_STARTUP_US;
             }
 
@@ -3643,7 +3632,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                                 // naprzemienne ±1 sektor. Blokujemy takie "cofanie" na starcie.
                                 uint16_t duty_lock_th = (uint16_t)(PWM_MAX_DUTY * SINE_DIR_LOCK_DUTY_PCT / 100);
                                 bool startup_lock =
-                                    (g_sine_speed_q16 < SINE_BLOCK_SPEED_THRESHOLD) &&
+                                    (g_startup_state < 2) &&
                                     (g_duty_isr <= duty_lock_th);
                                 if (startup_lock) {
                                     g_dbg_hall_seq_reject++;
@@ -3873,10 +3862,9 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                 g_dbg_sine_fallback_count++;
                 g_dbg_last_fallback_ms = now_ms;
             }
-            // Stall → powrót do BLOCK startup (reaktywna komutacja z Halli)
-            // Bez tego: prędkość=0 + startup_count>=6 → sinusCommutateISR z crawl
-            // → pole leci dookoła → silnik się "miota".
+            // Stall → powrót do alignment startup
             g_sine_startup_count = 0;
+            g_startup_state = 0;  // IDLE → przy następnym d>0 zrobi alignment
             g_sine_last_hall_ms = now_ms;
         }
     }
@@ -3898,21 +3886,61 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
     switch (g_mode_isr) {
         case DRIVE_MODE_SINUS:
         case DRIVE_MODE_FOC:
-            // ── Max Torque Startup: snap kąt do optymalnej pozycji Hall ──
-            // Gdy prędkość < threshold: rotor stoi lub oscyluje.
-            // Snap kąt do hall_sector_center + skalibrowany offset (sat) →
-            // pole statorowe prostopadłe do rotora (max Iq, max moment).
-            // SINUS/FOC SVPWM generuje gładkie sinusoidalne prądy pod tym kątem.
-            // Nie używamy BLOCK — SINUS daje precyzyjniejszy wektor momentu.
-            if (g_sine_speed_q16 < SINE_BLOCK_SPEED_THRESHOLD) {
-                int8_t sec = hallToSector(hall);
-                if (sec >= 0) {
-                    int32_t entry = (int32_t)sec * SINE_SECTOR_ENTRIES + SINE_SECTOR_CENTER + g_sine_hall_phase_offset;
-                    if (entry < 0) entry += SINE_TABLE_SIZE;
-                    if (entry >= SINE_TABLE_SIZE) entry -= SINE_TABLE_SIZE;
-                    g_sine_angle_q16 = (uint32_t)entry << 16;
+        {
+            // ── Startup state machine: IDLE → ALIGN → RUN ──
+            // 1. ALIGN: jeden krok BLOCK z małym duty → rotor ustala pozycję
+            // 2. RUN: normalna praca SINUS/FOC z monitorowaniem Halli
+            uint32_t now_us = (uint32_t)esp_timer_get_time();
+
+            // Reset do IDLE gdy duty=0 (manetka puszczona)
+            if (d == 0) {
+                if (g_startup_state != 0) {
+                    g_startup_state = 0;
+                    resetSineTracking(hall);
                 }
             }
+
+            // IDLE → ALIGN: rozpocznij wyrównanie
+            if (g_startup_state == 0 && d > 0) {
+                g_startup_state = 1;  // ALIGN
+                g_startup_align_start_us = now_us;
+                g_startup_align_hall = hall;
+                resetSineTracking(hall);
+            }
+
+            // ALIGN: wymuszony jeden krok BLOCK z kontrolowanym duty
+            if (g_startup_state == 1) {
+                uint32_t elapsed_us = now_us - g_startup_align_start_us;
+                uint16_t align_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * STARTUP_ALIGN_DUTY_PCT / 100);
+                // Duty narastające liniowo w pierwszej połowie alignmentu
+                uint32_t half_ms = STARTUP_ALIGN_MS / 2;
+                uint32_t elapsed_ms = elapsed_us / 1000;
+                if (elapsed_ms < half_ms) {
+                    align_duty = (uint16_t)((uint32_t)align_duty * elapsed_ms / half_ms);
+                    if (align_duty < 1) align_duty = 1;
+                }
+                // Użyj BLOCK komutacji z bieżącym Hallem
+                uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+                if (bh >= 1 && bh <= 6) {
+                    const uint8_t *ps = g_block_phase_tbl[bh];
+                    for (int ph = 0; ph < 3; ph++) {
+                        if (ps[ph] == 2)      mcpwm_phase_pwm(ph, align_duty);
+                        else if (ps[ph] == 1) mcpwm_phase_gnd(ph);
+                        else                  mcpwm_phase_off(ph);
+                    }
+                }
+                g_dbg_commut_path = 4;  // ALIGN
+                // Przejście do RUN po upływie czasu ALIGN
+                if (elapsed_us >= (uint32_t)STARTUP_ALIGN_MS * 1000) {
+                    g_startup_state = 2;  // RUN
+                    resetSineTracking(hall);
+                }
+                return;
+            }
+
+            // RUN: normalna praca SINUS/FOC
+            // Kąt zarządzany przez PLL (korekta na przejściach Halla).
+            // Nie robimy per-tick snap — alignment zapewnia poprawną pozycję startową.
             if (g_mode_isr == DRIVE_MODE_SINUS) {
                 g_dbg_commut_path = 2;  // SINUS
                 sinusCommutateISR(hall, d);
@@ -3921,6 +3949,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                 focCommutateISR(hall, d);
             }
             return;
+        }
         case DRIVE_MODE_BLOCK:
             g_dbg_commut_path = 1;  // BLOCK
             break;  // kontynuuj do komutacji blokowej poniżej
@@ -4063,16 +4092,19 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     }
 
     // ── 1. Stall freeze: brak przejścia Halla > 200ms → nie avansuj kąta ──
-    // Gdy speed==0 → nie avansuj (dispatch już użył BLOCK, tu nie powinniśmy trafić).
+    // Zamrażamy kąt tylko na timeout Halla (rotor stanął), NIE na próg prędkości.
+    // Alignment zapewnia poprawną pozycję startową, PLL koryguje na przejściach Halla.
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t since_hall = now_ms - g_sine_last_hall_ms;
     uint32_t real_speed = g_sine_speed_q16;
-    bool stalled = (real_speed < SINE_BLOCK_SPEED_THRESHOLD) || (since_hall > SINE_STALL_FREEZE_MS);
+    bool stalled = (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle ──
     // Kierunek avansowania kąta: z detekcji Halli (g_sine_dir), nie config.
     if (!stalled) {
         uint32_t spd = real_speed;
+        // Przy speed==0 (tuż po alignment) użyj minimalnej prędkości crawl
+        if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
         bool dir_reverse = (g_sine_dir < 0);
         if (dir_reverse) {
             if (g_sine_angle_q16 >= spd) {
@@ -4203,11 +4235,12 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t since_hall = now_ms - g_sine_last_hall_ms;
     uint32_t real_speed = g_sine_speed_q16;
-    bool stalled = (real_speed < SINE_BLOCK_SPEED_THRESHOLD) || (since_hall > SINE_STALL_FREEZE_MS);
+    bool stalled = (since_hall > SINE_STALL_FREEZE_MS);
 
     // ── 2. Advance angle (identycznie jak SINUS) ──
     if (!stalled) {
         uint32_t spd = real_speed;
+        if (spd == 0) spd = SINE_CRAWL_SPEED_Q16;
         bool dir_reverse = (g_sine_dir < 0);
         if (dir_reverse) {
             if (g_sine_angle_q16 >= spd) {
