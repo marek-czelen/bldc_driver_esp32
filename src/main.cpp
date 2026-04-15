@@ -85,6 +85,8 @@ volatile uint32_t g_phase_adc_sum_isr[3] = {0, 0, 0};
 volatile uint16_t g_phase_adc_cnt_isr = 0;
 /// Ostatni surowy odczyt ADC (do diagnostyki idbg)
 volatile uint16_t g_phase_adc_raw_isr[3] = {0, 0, 0};
+/// Ostatni dobry odczyt ADC per kanał (do zastąpienia outlierów)
+volatile uint16_t g_phase_adc_last_good[3] = {0, 0, 0};
 /// Spinlock synchronizacji ISR ↔ loop dla akumulatora ADC prądu
 static portMUX_TYPE g_adc_mux = portMUX_INITIALIZER_UNLOCKED;
 /// Flaga: ISR może czytać ADC1 (false=loop() czyta ADC1, ISR pomija)
@@ -3549,17 +3551,16 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         g_phase_adc_raw_isr[0] = a;
         g_phase_adc_raw_isr[1] = b;
         g_phase_adc_raw_isr[2] = c;
-        // Akumuluj do uśredniania w loop() — odrzucaj szpilki ADC (saturacja)
+        // Akumuluj do uśredniania w loop() — odrzucaj szpilki ADC per kanał.
         // Próbki > 3800 (~30A) to artefakty przełączania MOSFET, nie prawdziwy prąd.
-        // Pomijamy je zamiast dodawać do sumy.
-        if (a < 3800 && b < 3800 && c < 3800) {
-            portENTER_CRITICAL_ISR(&g_adc_mux);
-            g_phase_adc_sum_isr[0] += a;
-            g_phase_adc_sum_isr[1] += b;
-            g_phase_adc_sum_isr[2] += c;
-            g_phase_adc_cnt_isr++;
-            portEXIT_CRITICAL_ISR(&g_adc_mux);
-        }
+        // Każdy kanał filtrowany niezależnie — spike na fazie A nie odrzuca fazy B/C.
+        portENTER_CRITICAL_ISR(&g_adc_mux);
+        if (a < 3800) { g_phase_adc_sum_isr[0] += a; } else { g_phase_adc_sum_isr[0] += g_phase_adc_last_good[0]; }
+        if (b < 3800) { g_phase_adc_sum_isr[1] += b; g_phase_adc_last_good[1] = b; } else { g_phase_adc_sum_isr[1] += g_phase_adc_last_good[1]; }
+        if (c < 3800) { g_phase_adc_sum_isr[2] += c; g_phase_adc_last_good[2] = c; } else { g_phase_adc_sum_isr[2] += g_phase_adc_last_good[2]; }
+        if (a < 3800) { g_phase_adc_last_good[0] = a; }
+        g_phase_adc_cnt_isr++;
+        portEXIT_CRITICAL_ISR(&g_adc_mux);
         g_adc_ready_isr = true;
     }
 
