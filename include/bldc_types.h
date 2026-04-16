@@ -20,7 +20,8 @@ typedef enum {
     DRIVE_MODE_DISABLED = 0,    ///< Silnik wyłączony - wszystkie MOSFETy OFF
     DRIVE_MODE_BLOCK,           ///< Komutacja blokowa (trapezoidalna / 6-step)
     DRIVE_MODE_SINUS,           ///< Sterowanie sinusoidalne
-    DRIVE_MODE_FOC              ///< Field Oriented Control
+    DRIVE_MODE_FOC,             ///< Field Oriented Control
+    DRIVE_MODE_BLOCK12          ///< Komutacja blokowa 12-step (pół-krok między Hallami)
 } drive_mode_t;
 
 /**
