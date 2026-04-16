@@ -159,10 +159,13 @@ static float g_foc_vq_dbg = 0.0f;        ///< Kopia Vq do debugowania (float, no
 static float g_foc_ia_signed = 0.0f;     ///< Prąd fazy A [A] (surowy, przed klipowaniem)
 static float g_foc_ib_signed = 0.0f;     ///< Prąd fazy B [A]
 static float g_foc_ic_signed = 0.0f;     ///< Prąd fazy C [A]
-// EMA-filtrowane prądy dla FOC (wygładzenie sporadycznych odczytów ADC)
+// EMA-filtrowane prądy dla FOC (zachowane do diagnostyki/debugowania)
 static float g_foc_ia_ema = 0.0f;        ///< EMA Ia [A]
 static float g_foc_ib_ema = 0.0f;        ///< EMA Ib [A]
 static float g_foc_ic_ema = 0.0f;        ///< EMA Ic [A]
+// EMA-filtrowane Id/Iq (po transformacie Parka — sygnały DC)
+static float g_foc_id_ema = 0.0f;        ///< EMA Id [A] (po Park, bez phase lag)
+static float g_foc_iq_ema = 0.0f;        ///< EMA Iq [A] (po Park, bez phase lag)
 static bool g_foc_debug = false;          ///< Debug FOC (komenda fdbg)
 static bool g_foc_voltage_mode = false;   ///< Tryb napięciowy: Vq = duty wprost, bez PI
 static unsigned long g_foc_last_debug_ms = 0;
@@ -526,6 +529,7 @@ static void resetSineTracking(uint8_t hall_state) {
 #define FOC_INV_SQRT3       0.57735026919f  ///< 1/√3
 #define FOC_SQRT3           1.73205080757f  ///< √3
 #define FOC_CURRENT_EMA_ALPHA  0.05f ///< EMA α dla prądów FOC (~2kHz → τ≈10ms)
+#define FOC_DQ_EMA_ALPHA       0.15f ///< EMA α dla Id/Iq po Park (τ≈3ms @ 2kHz, DC signal)
                                      //   Uśrednia sporadyczne odczyty ADC (analogRead
                                      //   nie jest zsynchr. z PWM, INA180A2 widzi prąd
                                      //   tylko gdy low-side ON → ~50% odczytów = 0)
@@ -2121,21 +2125,47 @@ void loop() {
             g_foc_pi_q.limit = pi_limit;
 
             // 3. Rekonstrukcja prądów ze znakiem (INA180A2 jest jednokierunkowy)
-            // Użyj EMA-filtrowanych prądów (wygładzone z niesynchr. ADC).
-            // Czujnik klipuje prąd ujemny do ~0V. Kirchhoff: Ia+Ib+Ic=0,
-            // więc faza z najmniejszym odczytem = -(suma pozostałych dwóch).
-            // ADC mierzy fizyczne fazy. Brak zamiany B↔C – Park działa
-            // bezpośrednio na pomiarach fizycznych w obu kierunkach.
-            float ia = g_foc_ia_ema;
-            float ib = g_foc_ib_ema;
-            float ic = g_foc_ic_ema;
+            // INA180 mierzy tylko prąd w jednym kierunku. Prąd w drugą stronę → 0V.
+            // Zamiast zgadywać min() (niestabilne na szumie), używamy kąta elektrycznego
+            // do deterministycznego wyboru fazy z prądem ujemnym (Kirchhoff: Ia+Ib+Ic=0).
+            //
+            // Fazy: A=sin(θ), B=sin(θ+240°), C=sin(θ+120°)
+            // Tabela 96 wpisów = 360° elektr, 16 wpisów = 60° = 1 sektor
+            // Sektor z kąta: entry = angle>>16, sector = entry/16
+            //
+            // Faza z prądem ujemnym per sektor (wynika z sinusów 3-fazowych):
+            //   Sektor 0 (0-60°):    B ujemne (sin(240°..300°) < 0)
+            //   Sektor 1 (60-120°):  B ujemne (sin(300°..360°) ≤ 0)
+            //   Sektor 2 (120-180°): A ujemne (sin(120°..180°) → crossing)
+            //   Sektor 3 (180-240°): A ujemne (sin(180°..240°) < 0)
+            //   Sektor 4 (240-300°): C ujemne (sin(360°..420°→60°) → crossing)
+            //   Sektor 5 (300-360°): C ujemne (sin(60°..120°→420°) depends)
+            //
+            // Uproszczenie: faza z najniższym napięciem SVPWM = ujemny prąd.
+            // Kąt jest znany → deterministyczny wybór bez porównywania szumnych ADC.
+            float ia = g_foc_ia_signed;
+            float ib = g_foc_ib_signed;
+            float ic = g_foc_ic_signed;
 
-            if (ia <= ib && ia <= ic) {
-                ia = -(ib + ic);
-            } else if (ib <= ia && ib <= ic) {
-                ib = -(ia + ic);
-            } else {
-                ic = -(ia + ib);
+            {
+                // Oblicz napięcia sinusoidalne z aktualnego kąta (identycznie jak SVPWM)
+                uint32_t a_angle = g_sine_angle_q16;
+                uint32_t b_angle = a_angle + ((uint32_t)SINE_PHASE_B_OFFSET << 16);
+                uint32_t c_angle = a_angle + ((uint32_t)SINE_PHASE_C_OFFSET << 16);
+                if (b_angle >= SINE_TABLE_Q16_FULL) b_angle -= SINE_TABLE_Q16_FULL;
+                if (c_angle >= SINE_TABLE_Q16_FULL) c_angle -= SINE_TABLE_Q16_FULL;
+                int32_t sa = sine_interp_q16(a_angle);
+                int32_t sb = sine_interp_q16(b_angle);
+                int32_t sc = sine_interp_q16(c_angle);
+
+                // Faza z najniższym sinusem → ma prąd ujemny → rekonstruuj z Kirchhoffa
+                if (sa <= sb && sa <= sc) {
+                    ia = -(ib + ic);
+                } else if (sb <= sa && sb <= sc) {
+                    ib = -(ia + ic);
+                } else {
+                    ic = -(ia + ib);
+                }
             }
 
             // 4. Clarke: Ia,Ib,Ic → Iα,Iβ
@@ -2156,6 +2186,13 @@ void loop() {
 
             float id =  i_alpha * cos_f + i_beta * sin_f;
             float iq =  i_alpha * sin_f - i_beta * cos_f;
+
+            // EMA filtr na Id/Iq (sygnały DC po Park — bez phase lag!)
+            g_foc_id_ema += FOC_DQ_EMA_ALPHA * (id - g_foc_id_ema);
+            g_foc_iq_ema += FOC_DQ_EMA_ALPHA * (iq - g_foc_iq_ema);
+            id = g_foc_id_ema;
+            iq = g_foc_iq_ema;
+
             g_foc_id_meas = id;
             g_foc_iq_meas = iq;
 
@@ -2300,7 +2337,7 @@ void loop() {
             g_foc_vq_dbg = vq;
             }  // koniec else (tryb PI)
         } else {
-            // Duty = 0 → reset PI integratorów
+            // Duty = 0 → reset PI integratorów i EMA
             g_foc_pi_d.integral = 0.0f;
             g_foc_pi_q.integral = 0.0f;
             g_foc_vd_i = 0;
@@ -2308,6 +2345,8 @@ void loop() {
             g_foc_vd_dbg = 0.0f;
             g_foc_vq_dbg = 0.0f;
             g_foc_iq_target = 0.0f;
+            g_foc_id_ema = 0.0f;
+            g_foc_iq_ema = 0.0f;
         }
     }
 
@@ -4968,6 +5007,8 @@ static String executeCommand(const String& cmd) {
         g_foc_ia_ema = 0.0f;
         g_foc_ib_ema = 0.0f;
         g_foc_ic_ema = 0.0f;
+        g_foc_id_ema = 0.0f;
+        g_foc_iq_ema = 0.0f;
         resetSineTracking(g_bldc_state.hall_state);
         return "FOC ON";
     }

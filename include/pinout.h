@@ -170,6 +170,7 @@
 /** @brief Okres timera MCPWM (half-period for UP_DOWN = resolution / frequency / 2) */
 #define MCPWM_TIMER_PERIOD      (MCPWM_TIMER_RESOLUTION / PWM_FREQUENCY / 2)
 
+
 /** @brief Maksymalna wartość duty (compare value = half period) */
 #define PWM_MAX_DUTY            MCPWM_TIMER_PERIOD
 
