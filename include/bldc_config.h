@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  16
+#define CONFIG_VERSION  18
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -70,9 +70,16 @@ typedef struct __attribute__((packed)) {
     uint8_t         speed_pulses_per_rev; ///< Impulsy SPEED na obrót koła. 1–20, domyślnie 1. Kalibracja: spdcal
     uint16_t        pwm_freq_hz;          ///< Częstotliwość PWM [Hz]. 8000–32000, domyślnie 20000. Komenda: pwmfreq:N
     uint8_t         duty_min_pct;         ///< Min duty [%]. Poniżej → 0. 0–50, domyślnie 10. Komenda: dutymin:N
+    uint8_t         startup_boost_pct;    ///< Boost duty na starcie [%]. 0–200, domyślnie 50. Komenda: cfg:sboost:N
+    uint16_t        startup_boost_rpm;    ///< RPM przy którym boost zanika. 10–500, domyślnie 80. Komenda: cfg:sboostrpm:N
+    uint16_t        fb_wheel_size_x10;    ///< Fallback P06: rozmiar koła ×10 [cale]. Domyślnie 260 (26"). Komenda: dp:p06:N
+    uint8_t         fb_speed_magnets;     ///< Fallback P07: magnesy/pole pairs czujnika prędkości. Domyślnie 1. Komenda: dp:p07:N
+    uint8_t         fb_speed_limit;       ///< Fallback P08: limit prędkości [km/h]. 0=brak. Domyślnie 25. Komenda: dp:p08:N
+    uint8_t         fb_drive_mode;        ///< Fallback P10: 0=PAS+gaz, 1=gaz, 2=PAS. Domyślnie 0. Komenda: dp:p10:N
+    uint8_t         fb_pas_magnets;       ///< Fallback P13: magnesy PAS. 1–100, domyślnie 12. Komenda: dp:p13:N
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[11];      ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[2];       ///< Padding do stałego rozmiaru (64 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)

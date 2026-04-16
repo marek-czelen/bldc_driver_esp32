@@ -110,7 +110,7 @@
 // Wejście czujnika prędkości
 // ============================================================================
 
-/** @brief Wejście czujnika prędkości (aktywne przy P07<=1, silnik przekładniowy) */
+/** @brief Wejście czujnika prędkości (aktywne przy P07<10, P07=impulsy/obrót koła) */
 #define PIN_SPEED               21  // GPIO21
 
 // ============================================================================

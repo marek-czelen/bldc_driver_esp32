@@ -157,8 +157,13 @@ void s866_service(s866_display_t* ctx) {
             if (ctx->rx_buf[S866_RX_FRAME_LEN - 1] == expected) {
                 // ✓ Poprawna ramka — parsuj i odpowiedz
                 s866_parse_rx_frame(ctx);
-                ctx->connected = true;
                 ctx->last_valid_ms = now;
+                if (ctx->first_valid_ms == 0) {
+                    ctx->first_valid_ms = now;
+                }
+                if (!ctx->connected && (now - ctx->first_valid_ms >= S866_CONNECT_CONFIRM_MS)) {
+                    ctx->connected = true;
+                }
 
                 // Wyślij odpowiedź (TX params muszą być zaktualizowane wcześniej w loop)
                 s866_send_response(ctx);
@@ -181,5 +186,9 @@ void s866_service(s866_display_t* ctx) {
     // --- Timeout połączenia: brak poprawnych ramek → rozłączony ---
     if (ctx->connected && (now - ctx->last_valid_ms > S866_TIMEOUT_MS)) {
         ctx->connected = false;
+        ctx->first_valid_ms = 0;
+    }
+    if (!ctx->connected && ctx->first_valid_ms > 0 && (now - ctx->last_valid_ms > S866_TIMEOUT_MS)) {
+        ctx->first_valid_ms = 0;
     }
 }

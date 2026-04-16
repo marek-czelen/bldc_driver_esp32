@@ -69,6 +69,7 @@
 #define S866_TX_FRAME_LEN   14      ///< Ramka do wyświetlacza
 #define S866_BAUD_RATE      9600    ///< Prędkość UART wyświetlacza
 #define S866_TIMEOUT_MS     2000    ///< Timeout rozłączenia [ms]
+#define S866_CONNECT_CONFIRM_MS  1000  ///< Ciągła komunikacja wymagana do potwierdzenia połączenia [ms]
 #define S866_INTERBYTE_TIMEOUT_MS  50  ///< Timeout między bajtami w ramce [ms]
 
 // ============================================================================
@@ -145,8 +146,9 @@ typedef struct {
     s866_rx_params_t rx;                          ///< Sparsowane parametry RX
     s866_tx_params_t tx;                          ///< Parametry do wysłania TX
     s866_config_t    config;                      ///< Kopia parametrów P01-P20
-    bool             connected;                   ///< Wyświetlacz podłączony?
+    bool             connected;                   ///< Wyświetlacz podłączony (potwierdzone)?
     unsigned long    last_valid_ms;               ///< Czas ostatniej poprawnej ramki
+    unsigned long    first_valid_ms;              ///< Czas pierwszej ramki w bieżącej serii (0=brak)
     unsigned long    last_byte_ms;                ///< Czas ostatniego odebranego bajtu
 } s866_display_t;
 

@@ -860,11 +860,12 @@ static const unsigned long SPDCAL_MEASURE_S = 15;  ///< Czas pomiaru [s]
 // WyĹ›wietlacz S866 (zawsze aktywny na Serial2)
 static s866_display_t g_display;
 static inline uint8_t getEffectiveAssistRaw() {
-    if (g_web_assist_override >= 0) {
-        return (uint8_t)g_web_assist_override;
-    }
+    // Display ZAWSZE ma priorytet gdy online
     if (g_display.connected) {
         return g_display.rx.assist_level;
+    }
+    if (g_web_assist_override >= 0) {
+        return (uint8_t)g_web_assist_override;
     }
     if (config_get().display_required) {
         return 0;
@@ -2445,6 +2446,20 @@ void loop() {
     g_hall_isr = g_bldc_state.hall_state;
     {
         uint16_t raw_duty = g_bldc_state.duty_cycle;
+
+        // Startup boost: zwieksz duty przy niskich RPM (wszystkie tryby)
+        uint8_t bp = config_get().startup_boost_pct;
+        uint16_t br = config_get().startup_boost_rpm;
+        if (bp > 0 && br > 0 && raw_duty > 0) {
+            uint32_t rpm = g_bldc_state.rpm;
+            if (rpm < br) {
+                uint32_t boost_duty = (uint32_t)raw_duty * bp * (br - rpm) / (100U * br);
+                uint32_t total = (uint32_t)raw_duty + boost_duty;
+                if (total > PWM_MAX_DUTY) total = PWM_MAX_DUTY;
+                raw_duty = (uint16_t)total;
+            }
+        }
+
         uint16_t min_duty = ((uint16_t)config_get().duty_min_pct * PWM_MAX_DUTY) / 100;
         if (raw_duty > 0 && raw_duty < min_duty) raw_duty = 0;
         g_duty_isr = raw_duty;
@@ -2605,14 +2620,23 @@ void loop() {
         if (g_bldc_state.phase_current[2] > maxI) maxI = g_bldc_state.phase_current[2];
         g_display.tx.current_x10 = (uint16_t)(maxI * 10.0f);
 
+        // Fallback: gdy display offline i standalone mode, uzyj NVS parametrow
+        if (!g_display.connected && !config_get().display_required) {
+            const controller_config_t& fbcfg = config_get();
+            g_display.config.p06_wheel_size_x10 = fbcfg.fb_wheel_size_x10;
+            g_display.config.p07_speed_magnets   = fbcfg.fb_speed_magnets;
+            g_display.config.p08_speed_limit     = fbcfg.fb_speed_limit;
+            g_display.config.p10_drive_mode      = fbcfg.fb_drive_mode;
+            g_display.config.p13_pas_magnets     = fbcfg.fb_pas_magnets;
+        }
         // Wheeltime [ms] â€” ĹşrĂłdĹ‚o zaleĹĽy od P07:
-        //   P07 > 1  â†’ silnik direct-drive, P07 = liczba impulsĂłw Halla na obrĂłt koĹ‚a
-        //              (= 6 transitions/erev Ă— pole_pairs, np. 6Ă—15=90)
-        //              wheeltime = hall_period_us Ă— P07 / 1000
-        //              NIE mnoĹĽymy dodatkowo Ă—6, bo P07 juĹĽ to zawiera!
-        //   P07 == 1 â†’ silnik przekĹ‚adniowy, uĹĽyj zewnÄ™trznego czujnika SPEED
-        //              wheeltime = speed_period_us / 1000 (1 impuls na obrĂłt)
-        //   P07 == 0 â†’ brak konfiguracji, uĹĽyj Halli z domyĹ›lnym P07=1 (SPEED)
+        //   P07 >= 10 â†’ silnik direct-drive (hub), P07 = przejĹ›cia Halla na obrĂłt koĹ‚a
+        //                (= 6 transitions/erev Ă— pole_pairs, np. 6Ă—15=90)
+        //                wheeltime = hall_period_us Ă— P07 / 1000
+        //   P07 < 10  â†’ czujnik zewnÄ™trzny SPEED na pinie GPIO21
+        //                P07 = ile impulsĂłw SPEED na jeden obrĂłt koĹ‚a (1..9)
+        //                wheeltime = speed_period_us Ă— P07 / 1000
+        //   P07 == 0  â†’ traktuj jak P07=1 (1 impuls SPEED na obrĂłt)
         uint8_t p07 = g_display.config.p07_speed_magnets;
         uint32_t wt_us = 0;
 
@@ -2621,8 +2645,8 @@ void loop() {
             p07 = DEFAULT_P07_STANDALONE;
         }
 
-        if (p07 <= 1) {
-            // P07==1: czujnik zewnÄ™trzny SPEED (1 magnes na koĹ‚o)
+        if (p07 < 10) {
+            // P07 < 10: czujnik zewnÄ™trzny SPEED (P07 = impulsĂłw na obrĂłt koĹ‚a)
             uint32_t sp = g_speed_period_us;  // volatile â†’ local copy
             uint32_t last = g_speed_last_pulse_us;
             uint32_t now_us = (uint32_t)esp_timer_get_time();
@@ -2683,12 +2707,14 @@ void loop() {
                 g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
                 g_speed_last_accepted_us = 0;
             }
-            // Przelicz: period_jednego_impulsu Ă— impulsy_na_obrĂłt = czas_obrotu_koĹ‚a
-            if (wt_us > 0 && g_speed_pulses_per_rev > 1) {
-                wt_us *= g_speed_pulses_per_rev;
+            // P07 = ile impulsĂłw SPEED na obrĂłt koĹ‚a
+            // wheeltime = period_miÄ™dzy_impulsami Ă— P07
+            uint8_t spd_ppr = (p07 > 0) ? p07 : 1;
+            if (wt_us > 0 && spd_ppr > 1) {
+                wt_us *= (uint32_t)spd_ppr;
             }
         } else {
-            // P07 > 1: direct-drive hub, P07 = hall transitions per wheel revolution
+            // P07 >= 10: direct-drive hub, P07 = przejĹ›cia Halla na obrĂłt koĹ‚a
             // P07 = 6 Ă— pole_pairs (np. 90 = 6Ă—15 par biegunĂłw)
             uint32_t hp = g_hall_period_us;  // volatile â†’ local copy
             uint32_t last = g_hall_last_change_us;
@@ -2717,6 +2743,7 @@ void loop() {
 
         // ObsĹ‚uga protokoĹ‚u wyswietlacza
         s866_service(&g_display);
+
     }
 
     // ObsĹ‚uga komend USB Serial (zawsze aktywna)
@@ -3974,12 +4001,10 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         return;
     }
 
-    // SINUS/FOC safety fallback: PRZED guardem d==0, ĹĽeby prÄ™dkoĹ›Ä‡
-    // byĹ‚a zerowana nawet gdy duty=0 (motor coastuje po puszczeniu manetki).
-    // Bez tego: spd zostaje zamroĹĽone na starej wartoĹ›ci â†’ przy ponownym
-    // duty kÄ…t startuje z bĹ‚Ä™dnÄ… prÄ™dkoĹ›ciÄ… â†’ snap â†’ szarpniÄ™cie.
+    // Safety fallback: stall detection + startup state reset
+    // Zeruj predkosc sinusoidalna jesli brak impulsow Halla (motor stal)
     if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
-        uint32_t now_ms = (uint32_t)esp_timer_get_time() / 1000;  // identycznie jak w Hall ISR
+        uint32_t now_ms = (uint32_t)esp_timer_get_time() / 1000;
         uint32_t hp_us = g_hall_period_us;
         uint32_t dyn_ms = SINE_STALL_FALLBACK_MS;
         if (hp_us > 0 && hp_us < 500000) {
@@ -3992,100 +4017,95 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                 g_dbg_sine_fallback_count++;
                 g_dbg_last_fallback_ms = now_ms;
             }
-            // Stall â†’ powrĂłt do alignment startup
             g_sine_startup_count = 0;
-            g_startup_state = 0;  // IDLE â†’ przy nastÄ™pnym d>0 zrobi alignment
+            g_startup_state = 0;
             g_sine_last_hall_ms = now_ms;
         }
     }
 
     uint16_t d = g_duty_isr;
 
-    // â”€â”€ Explicit freewheel: duty == 0 â†’ wolnobieg â”€â”€
-    // BLOCK: natychmiast allMosfetsOff (bo d=0 + LS ON = hamowanie EM).
-    // SINUS/FOC: kontynuuj do sinusCommutateISR/focCommutateISR â€”
-    // angle advance musi dziaĹ‚aÄ‡ nawet przy d=0, inaczej po ponownym
-    // wĹ‚Ä…czeniu duty kÄ…t jest stary â†’ duĹĽy err â†’ snap â†’ szarpniÄ™cie.
-    // sinusCommutateISR/focCommutateISR same wyĹ‚Ä…czÄ… MOSFETy (amplitude < MIN).
+    // — Startup alignment state machine (wszystkie tryby) —
+    // IDLE(0) -> ALIGN(1) -> RUN(2)
+    // ALIGN: wymusza jeden krok BLOCK z narastajacym duty (150ms)
+    // aby rotor ustalil pozycje przed normalna komutacja.
+    {
+        uint32_t now_us = (uint32_t)esp_timer_get_time();
+
+        // Reset do IDLE gdy duty=0 (manetka puszczona)
+        if (d == 0 && g_startup_state != 0) {
+            g_startup_state = 0;
+            if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
+                resetSineTracking(hall);
+            }
+        }
+
+        // IDLE -> ALIGN: rozpocznij wyrownanie
+        if (g_startup_state == 0 && d > 0) {
+            g_startup_state = 1;  // ALIGN
+            g_startup_align_start_us = now_us;
+            g_startup_align_hall = hall;
+            if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
+                resetSineTracking(hall);
+            }
+        }
+
+        // ALIGN: wymuszony jeden krok BLOCK z kontrolowanym duty
+        if (g_startup_state == 1) {
+            uint32_t elapsed_us = now_us - g_startup_align_start_us;
+            uint16_t align_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * STARTUP_ALIGN_DUTY_PCT / 100);
+            // Duty narastajace liniowo w pierwszej polowie alignmentu
+            uint32_t half_ms = STARTUP_ALIGN_MS / 2;
+            uint32_t elapsed_ms = elapsed_us / 1000;
+            if (elapsed_ms < half_ms) {
+                align_duty = (uint16_t)((uint32_t)align_duty * elapsed_ms / half_ms);
+                if (align_duty < 1) align_duty = 1;
+            }
+            // Uzyj BLOCK komutacji z biezacym Hallem
+            uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+            if (bh >= 1 && bh <= 6) {
+                const uint8_t *ps = g_block_phase_tbl[bh];
+                for (int ph = 0; ph < 3; ph++) {
+                    if (ps[ph] == 2)      mcpwm_phase_pwm(ph, align_duty);
+                    else if (ps[ph] == 1) mcpwm_phase_gnd(ph);
+                    else                  mcpwm_phase_off(ph);
+                }
+            }
+            g_dbg_commut_path = 4;  // ALIGN
+            // Przejscie do RUN po uplywie czasu ALIGN
+            if (elapsed_us >= (uint32_t)STARTUP_ALIGN_MS * 1000) {
+                g_startup_state = 2;  // RUN
+                if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
+                    resetSineTracking(hall);
+                }
+            }
+            return;
+        }
+    }
+
+    // — Freewheel: duty == 0 —
+    // BLOCK/BLOCK12: allMosfetsOff (bo d=0 + LS ON = hamowanie EM).
+    // SINUS/FOC: kontynuuj do ISR — angle advance musi dzialac nawet przy d=0.
     if (d == 0 && g_mode_isr != DRIVE_MODE_SINUS && g_mode_isr != DRIVE_MODE_FOC) {
         allMosfetsOff();
         return;
     }
 
-    // Dispatch trybu sterowania
+    // — Dispatch trybu sterowania (state == RUN) —
     switch (g_mode_isr) {
         case DRIVE_MODE_SINUS:
-        case DRIVE_MODE_FOC:
-        {
-            // â”€â”€ Startup state machine: IDLE â†’ ALIGN â†’ RUN â”€â”€
-            // 1. ALIGN: jeden krok BLOCK z maĹ‚ym duty â†’ rotor ustala pozycjÄ™
-            // 2. RUN: normalna praca SINUS/FOC z monitorowaniem Halli
-            uint32_t now_us = (uint32_t)esp_timer_get_time();
-
-            // Reset do IDLE gdy duty=0 (manetka puszczona)
-            if (d == 0) {
-                if (g_startup_state != 0) {
-                    g_startup_state = 0;
-                    resetSineTracking(hall);
-                }
-            }
-
-            // IDLE â†’ ALIGN: rozpocznij wyrĂłwnanie
-            if (g_startup_state == 0 && d > 0) {
-                g_startup_state = 1;  // ALIGN
-                g_startup_align_start_us = now_us;
-                g_startup_align_hall = hall;
-                resetSineTracking(hall);
-            }
-
-            // ALIGN: wymuszony jeden krok BLOCK z kontrolowanym duty
-            if (g_startup_state == 1) {
-                uint32_t elapsed_us = now_us - g_startup_align_start_us;
-                uint16_t align_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * STARTUP_ALIGN_DUTY_PCT / 100);
-                // Duty narastajÄ…ce liniowo w pierwszej poĹ‚owie alignmentu
-                uint32_t half_ms = STARTUP_ALIGN_MS / 2;
-                uint32_t elapsed_ms = elapsed_us / 1000;
-                if (elapsed_ms < half_ms) {
-                    align_duty = (uint16_t)((uint32_t)align_duty * elapsed_ms / half_ms);
-                    if (align_duty < 1) align_duty = 1;
-                }
-                // UĹĽyj BLOCK komutacji z bieĹĽÄ…cym Hallem
-                uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
-                if (bh >= 1 && bh <= 6) {
-                    const uint8_t *ps = g_block_phase_tbl[bh];
-                    for (int ph = 0; ph < 3; ph++) {
-                        if (ps[ph] == 2)      mcpwm_phase_pwm(ph, align_duty);
-                        else if (ps[ph] == 1) mcpwm_phase_gnd(ph);
-                        else                  mcpwm_phase_off(ph);
-                    }
-                }
-                g_dbg_commut_path = 4;  // ALIGN
-                // PrzejĹ›cie do RUN po upĹ‚ywie czasu ALIGN
-                if (elapsed_us >= (uint32_t)STARTUP_ALIGN_MS * 1000) {
-                    g_startup_state = 2;  // RUN
-                    resetSineTracking(hall);
-                }
-                return;
-            }
-
-            // RUN: normalna praca SINUS/FOC
-            // KÄ…t zarzÄ…dzany przez PLL (korekta na przejĹ›ciach Halla).
-            // Nie robimy per-tick snap â€” alignment zapewnia poprawnÄ… pozycjÄ™ startowÄ….
-            if (g_mode_isr == DRIVE_MODE_SINUS) {
-                g_dbg_commut_path = 2;  // SINUS
-                sinusCommutateISR(hall, d);
-            } else {
-                g_dbg_commut_path = 3;  // FOC
-                focCommutateISR(hall, d);
-            }
+            g_dbg_commut_path = 2;  // SINUS
+            sinusCommutateISR(hall, d);
             return;
-        }
+        case DRIVE_MODE_FOC:
+            g_dbg_commut_path = 3;  // FOC
+            focCommutateISR(hall, d);
+            return;
         case DRIVE_MODE_BLOCK12:
         {
             g_dbg_commut_path = 5;  // BLOCK12
             uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
             uint8_t mid_bh = bh;
-
             if (g_hall_last_change_us > 0 && g_hall_period_us >= (2 * HALL_MIN_PERIOD_US)) {
                 uint32_t now_us = (uint32_t)esp_timer_get_time();
                 uint32_t dt_us = now_us - g_hall_last_change_us;
@@ -4094,15 +4114,13 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
                     mid_bh = blockHallNextCw(bh);
                 }
             }
-
             applyBlockState(mid_bh, d);
             return;
         }
         case DRIVE_MODE_BLOCK:
             g_dbg_commut_path = 1;  // BLOCK
-            break;  // kontynuuj do komutacji blokowej poniĹĽej
+            break;
         default:
-            // Tryb DISABLED â†’ bezpieczny stan
             allMosfetsOff();
             return;
     }
@@ -5926,7 +5944,77 @@ static String executeCommand(const String& cmd) {
             }
             return "Zakres 0-50 %";
         }
+        if (cmd.startsWith("cfg:sboost:")) {
+            int val = cmd.substring(11).toInt();
+            if (val >= 0 && val <= 200) {
+                cfg.startup_boost_pct = (uint8_t)val;
+                config_save();
+                return "Startup boost: " + String(val) + "%";
+            }
+            return "Zakres 0-200 %";
+        }
+        if (cmd.startsWith("cfg:sboostrpm:")) {
+            int val = cmd.substring(14).toInt();
+            if (val >= 10 && val <= 500) {
+                cfg.startup_boost_rpm = (uint16_t)val;
+                config_save();
+                return "Startup boost RPM: " + String(val);
+            }
+            return "Zakres 10-500 RPM";
+        }
         return "Nieznany parametr cfg";
+    }
+
+    // Display fallback parameters (dp:pXX:val)
+    if (cmd.startsWith("dp:")) {
+        controller_config_t& cfg = config_get();
+        if (cmd.startsWith("dp:p06:")) {
+            int val = cmd.substring(7).toInt();
+            if (val >= 100 && val <= 400) {
+                cfg.fb_wheel_size_x10 = (uint16_t)val;
+                config_save();
+                return "FB P06 wheel: " + String((float)val/10.0f, 1) + "\"";
+            }
+            return "Zakres 100-400 (x10 cali, np 260=26\")";
+        }
+        if (cmd.startsWith("dp:p07:")) {
+            int val = cmd.substring(7).toInt();
+            if (val >= 1 && val <= 100) {
+                cfg.fb_speed_magnets = (uint8_t)val;
+                config_save();
+                return "FB P07 speed magnets: " + String(val);
+            }
+            return "Zakres 1-100";
+        }
+        if (cmd.startsWith("dp:p08:")) {
+            int val = cmd.substring(7).toInt();
+            if (val >= 0 && val <= 72) {
+                cfg.fb_speed_limit = (uint8_t)val;
+                config_save();
+                return "FB P08 speed limit: " + String(val) + " km/h (0=brak)";
+            }
+            return "Zakres 0-72 km/h";
+        }
+        if (cmd.startsWith("dp:p10:")) {
+            int val = cmd.substring(7).toInt();
+            if (val >= 0 && val <= 2) {
+                cfg.fb_drive_mode = (uint8_t)val;
+                config_save();
+                String modes[] = {"PAS+gaz", "gaz", "PAS"};
+                return "FB P10 drive mode: " + modes[val];
+            }
+            return "Zakres 0-2 (0=PAS+gaz,1=gaz,2=PAS)";
+        }
+        if (cmd.startsWith("dp:p13:")) {
+            int val = cmd.substring(7).toInt();
+            if (val >= 1 && val <= 100) {
+                cfg.fb_pas_magnets = (uint8_t)val;
+                config_save();
+                return "FB P13 PAS magnets: " + String(val);
+            }
+            return "Zakres 1-100";
+        }
+        return "Nieznany param dp (dp:p06/p07/p08/p10/p13)";
     }
 
     // Numeryczna wartoĹ›Ä‡ duty w %
@@ -6026,174 +6114,460 @@ static const char BLDC_WIFI_SSID[] = "BLDC_Config";
 static const char BLDC_WIFI_PASS[] = "bldc1234";
 
 // Strona HTML w pamieci flash (PROGMEM)
-static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BLDC Control</title><style>
-:root{--bg:#efe7d8;--panel:#fff9ee;--panel2:#f5ebd8;--border:#d1c1a4;--text:#2e2b24;--muted:#746f62;--ink:#17140f;--green:#2f8b4d;--red:#b43636;--orange:#b86a1f;--blue:#2f5fa8;--accent:#1f6c5d}
-*{box-sizing:border-box;margin:0;padding:0}html{font-size:14px}body{background:radial-gradient(circle at 12% 0%,#fbf6ed 0,#f3e9d7 44%,#e9dcc4 100%);color:var(--text);font-family:"Trebuchet MS",Verdana,sans-serif;line-height:1.5;min-height:100vh}
-header{padding:14px 18px;background:linear-gradient(120deg,#20463d,#2f5f53);border-bottom:2px solid #c88c58;display:flex;align-items:center;gap:12px}
-header h1{font-size:1rem;font-weight:700;color:#fff6e9;letter-spacing:.02em}header .sub{font-size:.75rem;color:#e6dcca;margin-left:auto}
-.wrap{display:grid;grid-template-columns:360px 1fr;gap:1px;background:var(--border);min-height:calc(100vh - 50px)}
-@media(max-width:860px){.wrap{grid-template-columns:1fr}}
-.col{background:var(--bg);padding:14px;overflow-y:auto}
-.hero{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:12px}
-.stat{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;box-shadow:0 3px 14px rgba(67,52,31,.06)}.stat .k{font-size:.64rem;color:var(--muted);text-transform:uppercase;letter-spacing:.09em;margin-bottom:1px}
-.stat .v{font-size:1.5rem;font-weight:700;color:var(--ink);line-height:1.15}.stat .s{font-size:.7rem;color:var(--muted);margin-top:2px}.stat.wide{grid-column:span 2}
-.sec{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;overflow:hidden;box-shadow:0 3px 14px rgba(67,52,31,.06)}
-.sec-h{padding:8px 13px;background:linear-gradient(180deg,#f2e6d0,#e8d8bc);border-bottom:1px solid var(--border);font-size:.75rem;font-weight:700;color:#4e3b20;text-transform:uppercase;letter-spacing:.06em}
-.sec-b{padding:11px 13px}
-.bbar{display:flex;gap:5px;flex-wrap:wrap}
-.btn{padding:6px 13px;border:1px solid #bca98a;border-radius:8px;background:#f7eddc;color:#2f2a22;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .08s}
-.btn:hover,.btn:active{filter:brightness(1.06);transform:translateY(-1px)}
-.btn-g{background:#dff1df;border-color:#84ba8f;color:#1f6d3b}
-.btn-r{background:#f6dcdc;border-color:#d09a9a;color:#8f2525}
-.btn-o{background:#f8e6d2;border-color:#d9af82;color:#9a5818}
-.btn-b{background:#dfe8f8;border-color:#9fb4dc;color:#234f92}
-.abar{display:flex;gap:4px;flex-wrap:wrap;align-items:center}.abar .lbl{font-size:.74rem;color:var(--muted);margin-right:2px}
-.abar .btn{min-width:40px;text-align:center}.abar .btn.sel{background:#0e4429;border-color:var(--green);color:var(--green);font-weight:700}
-.status-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;font-size:.78rem}
-.status-grid span{display:flex;align-items:center;gap:5px}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0}
-.dot.g{background:var(--green)}.dot.r{background:var(--red)}.dot.o{background:var(--orange)}
-.diag{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}
-.dc{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 9px}
-.dc .dk{font-size:.64rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-.dc .dv{font-size:.95rem;font-weight:700;color:var(--ink);margin-top:1px}
-.chart-wrap{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px;margin-bottom:10px;box-shadow:0 3px 14px rgba(67,52,31,.06)}
-.chart-wrap canvas{display:block;width:100%;height:160px;border-radius:4px}
-.cfg-row{display:grid;grid-template-columns:1fr 96px 62px;gap:5px;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)}
-.cfg-row:last-child{border-bottom:0}.cfg-row label{font-size:.8rem;color:var(--text)}
-.cfg-row input,.cfg-row select{padding:5px 7px;background:#fffdf8;color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:.8rem;width:100%}
-.cfg-row .btn{padding:4px 9px;font-size:.75rem;width:100%;text-align:center}
-.cmdl{display:flex;gap:5px;margin-top:10px}
-.cmdl input{flex:1;padding:7px 10px;background:#fffdf8;color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:.82rem}
-#notif{padding:8px 14px;background:linear-gradient(180deg,#f8edd8,#eedfc4);border-top:1px solid var(--border);font-size:.75rem;color:#6d624f;min-height:30px}
+static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"><title>BLDC Control</title><style>
+:root{--bg:#0a0a12;--panel:#141428;--panel2:#1a1a36;--border:#252548;--text:#ccc;--muted:#777;--ink:#fff;--green:#00e676;--red:#ff5252;--orange:#ffab40;--blue:#448aff;--cyan:#00bcd4;--purple:#b388ff}
+*{box-sizing:border-box;margin:0;padding:0}html{font-size:15px}body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.4;min-height:100vh;overflow-x:hidden}
+.screen{display:none;min-height:100vh}.screen.active{display:block}
+.tab-bar{position:fixed;bottom:0;left:0;right:0;display:flex;background:#08081a;border-top:1px solid var(--border);z-index:100;padding:0 0 env(safe-area-inset-bottom)}
+.tab-bar button{flex:1;padding:10px 0 8px;background:none;border:none;color:var(--muted);font-size:.65rem;font-weight:600;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;transition:color .2s}
+.tab-bar button.active{color:var(--cyan)}
+.tab-bar button svg{width:22px;height:22px}
+
+#ride{background:radial-gradient(ellipse at 50% 20%,#0f1530 0%,#080818 60%,#050510 100%);padding-bottom:60px}
+.ride-top{display:flex;justify-content:space-between;align-items:center;padding:14px 16px 0}
+.ride-top .st{display:flex;gap:6px;align-items:center;font-size:.7rem;color:var(--muted)}
+.ride-top .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.ride-top .dot.g{background:var(--green);box-shadow:0 0 6px var(--green)}.ride-top .dot.r{background:var(--red);box-shadow:0 0 6px var(--red)}
+
+.speedo{text-align:center;padding:20px 0 4px;position:relative}
+.speedo .ring{width:210px;height:210px;margin:0 auto;position:relative}
+.speedo .ring svg{width:100%;height:100%}
+.speedo .ring .val{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.speedo .ring .num{font-size:3.8rem;font-weight:200;color:#fff;line-height:1;font-variant-numeric:tabular-nums;letter-spacing:-2px}
+.speedo .ring .unit{font-size:.7rem;color:var(--muted);margin-top:-2px;display:block}
+
+.dual-gauge{display:flex;gap:8px;margin:8px 12px;justify-content:center}
+.mini-gauge{flex:1;max-width:180px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:10px 8px 8px;text-align:center;position:relative}
+.mini-gauge svg{width:120px;height:70px;display:block;margin:0 auto}
+.mini-gauge .mg-val{font-size:1.5rem;font-weight:600;color:#fff;margin-top:-4px;font-variant-numeric:tabular-nums}
+.mini-gauge .mg-unit{font-size:.55rem;color:var(--muted);display:block}
+.mini-gauge .mg-lbl{font-size:.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:2px}
+
+.batt-box{flex:1;max-width:180px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:10px 12px 8px;text-align:center}
+.batt-box .mg-lbl{font-size:.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px}
+.batt-shell{width:64px;height:28px;border:2px solid var(--muted);border-radius:5px;margin:0 auto;position:relative;display:flex;align-items:center;padding:2px}
+.batt-shell::after{content:'';position:absolute;right:-5px;top:50%;transform:translateY(-50%);width:4px;height:12px;background:var(--muted);border-radius:0 2px 2px 0}
+.batt-fill{height:100%;border-radius:2px;transition:width .4s,background .4s;min-width:2px}
+.batt-pct{font-size:1.3rem;font-weight:700;color:#fff;margin-top:4px;font-variant-numeric:tabular-nums}
+.batt-volt{font-size:.65rem;color:var(--muted);margin-top:1px}
+
+.stat-row{display:flex;gap:1px;background:var(--border);margin:8px 12px;border-radius:10px;overflow:hidden}
+.stat-row .sc{flex:1;background:var(--panel);padding:8px 6px;text-align:center}
+.stat-row .sc .k{font-size:.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.stat-row .sc .v{font-size:1rem;font-weight:600;color:#fff;margin-top:1px;font-variant-numeric:tabular-nums}
+.stat-row .sc .s{font-size:.55rem;color:var(--muted)}
+
+.assist-ring{margin:10px auto;width:200px;position:relative;text-align:center}
+.assist-ring .lbl{font-size:.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:3px}
+.assist-ring .src{font-size:.5rem;color:var(--cyan);margin-top:1px}
+.assist-ring .row{display:flex;align-items:center;justify-content:center;gap:18px}
+.abtn{width:48px;height:48px;border-radius:50%;border:2px solid var(--border);background:linear-gradient(135deg,var(--panel),var(--panel2));color:#fff;font-size:1.4rem;font-weight:300;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .12s;-webkit-tap-highlight-color:transparent;box-shadow:0 2px 10px rgba(0,0,0,.4)}
+.abtn:active{transform:scale(.9);background:var(--cyan);border-color:var(--cyan)}
+.abtn.dis{opacity:.3;pointer-events:none}
+.alvl{font-size:2.6rem;font-weight:200;color:#fff;min-width:46px;font-variant-numeric:tabular-nums}
+
+.mbar{display:flex;gap:4px;margin:10px 12px 0;flex-wrap:wrap}
+.mbar button{flex:1;min-width:52px;padding:8px 4px;border-radius:10px;border:1px solid var(--border);background:var(--panel);color:var(--muted);font-size:.65rem;font-weight:700;cursor:pointer;transition:all .12s;text-transform:uppercase}
+.mbar button.active{background:linear-gradient(135deg,#0d3a3a,#0a2a40);border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 10px rgba(0,188,212,.2)}
+
+.ride-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);margin:8px 12px;border-radius:10px;overflow:hidden}
+.ride-grid .gc{background:var(--panel);padding:7px 10px}
+.ride-grid .gc .k{font-size:.5rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.ride-grid .gc .v{font-size:.8rem;font-weight:600;color:var(--text);margin-top:1px}
+
+#diag{background:var(--bg);padding:12px;padding-bottom:70px}
+.dhdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.dhdr h2{font-size:.85rem;color:var(--cyan);font-weight:600}
+.dhdr .btn-sm{padding:5px 12px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);font-size:.7rem;cursor:pointer}
+.dgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:8px}
+.dc{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:9px}
+.dc .dk{font-size:.55rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.dc .dv{font-size:.9rem;font-weight:700;color:var(--ink);margin-top:2px;font-variant-numeric:tabular-nums}
+.dchart{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:9px;margin-bottom:8px}
+.dchart canvas{display:block;width:100%;height:130px;border-radius:6px}
+.dchart .leg{font-size:.58rem;color:var(--muted);margin-bottom:3px}
+.dchart .leg span{margin-right:8px}
+.dsec{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:7px;overflow:hidden}
+.dsec-h{padding:7px 11px;background:var(--panel2);border-bottom:1px solid var(--border);font-size:.65rem;font-weight:700;color:var(--cyan);text-transform:uppercase;letter-spacing:.05em;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+.dsec-h::after{content:'';display:inline-block;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--muted);transition:transform .2s}
+.dsec-h.open::after{transform:rotate(180deg)}
+.dsec-b{padding:9px 11px;display:none}.dsec-b.open{display:block}
+.cr{display:grid;grid-template-columns:1fr 86px 48px;gap:4px;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.cr:last-child{border-bottom:0}
+.cr label{font-size:.68rem;color:var(--text)}
+.cr .desc{font-size:.52rem;color:var(--muted);display:block;margin-top:-1px}
+.cr input,.cr select{padding:4px 5px;background:#0a0a18;color:var(--text);border:1px solid var(--border);border-radius:5px;font-size:.7rem;width:100%}
+.cr .bs{padding:3px 6px;font-size:.62rem;border-radius:5px;border:1px solid var(--border);background:var(--panel2);color:var(--cyan);cursor:pointer;width:100%;text-align:center;font-weight:700}
+.cr .bs:active{background:var(--cyan);color:#fff}
+.dpg{display:grid;grid-template-columns:auto 1fr;gap:1px 8px;font-size:.7rem}
+.dpg .pk{color:var(--muted)}.dpg .pv{color:var(--text);font-weight:600}
+.bbar{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px}
+.bbar .bd{padding:5px 10px;border-radius:7px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:.7rem;font-weight:600;cursor:pointer}
+.bbar .bd:active{background:var(--cyan);color:#fff}
+.bbar .br{border-color:var(--red);color:var(--red)}.bbar .bg{border-color:var(--green);color:var(--green)}
+.cmdl{display:flex;gap:4px;margin-top:7px}
+.cmdl input{flex:1;padding:6px 9px;background:#0a0a18;color:var(--text);border:1px solid var(--border);border-radius:7px;font-size:.72rem}
+.cmdl .bd{padding:6px 12px}
+#notif{position:fixed;bottom:54px;left:8px;right:8px;padding:5px 10px;background:rgba(0,0,0,.9);border:1px solid var(--border);border-radius:8px;font-size:.65rem;color:var(--muted);text-align:center;z-index:99;pointer-events:none;opacity:0;transition:opacity .3s}
+#notif.show{opacity:1}
+@media(min-width:900px){#ride .ri{max-width:440px;margin:0 auto}#diag{columns:2;column-gap:8px}.dsec{break-inside:avoid}}
 </style></head><body>
-<header>
-<svg viewBox="0 0 20 20" width="20" height="20" fill="none"><rect width="20" height="20" rx="4" fill="#238636"/><path d="M5 11h4V6h2v5h4l-5 4-5-4z" fill="#fff"/></svg>
-<h1>BLDC ESP32 Controller</h1>
-<div class="sub">BLDC_Config&nbsp;/&nbsp;bldc1234&nbsp;&bull;&nbsp;192.168.4.1</div>
-</header>
-<div class="wrap">
-<div class="col">
-<div class="hero">
-<div class="stat wide"><div class="k">Predkosc</div><div class="v" id="rt_speed">0.0 <span style="font-size:.85rem">km/h</span></div><div class="s">RPM: <span id="rt_rpm">0</span></div></div>
-<div class="stat"><div class="k">Tryb</div><div class="v" style="font-size:1rem" id="rt_mode">-</div><div class="s" id="rt_fault" style="color:var(--green)">OK</div></div>
-<div class="stat wide"><div class="k">Moc</div><div class="v" id="rt_power">0 <span style="font-size:.85rem">W</span></div><div class="s">Duty: <span id="rt_duty">0%</span></div></div>
-<div class="stat"><div class="k">Bateria</div><div class="v" id="rt_batt">0.0 <span style="font-size:.85rem">V</span></div><div class="s">Thr: <span id="rt_thr">0</span></div></div>
-<div class="stat"><div class="k">Assist</div><div class="v" style="font-size:1rem" id="rt_assist">AUTO</div><div class="s">PAS: <span id="rt_pas">-</span></div></div>
-<div class="stat"><div class="k">Hall&nbsp;/&nbsp;Temp</div><div class="v" style="font-size:1rem" id="rt_hall">-</div><div class="s"><span id="rt_temp">-</span></div></div>
+
+<div id="ride" class="screen active"><div class="ri">
+<div class="ride-top">
+<div class="st"><span class="dot" id="rd_conn"></span><span id="rd_mode">-</span></div>
+<div class="st"><span id="rd_fault" style="color:var(--green)">OK</span></div>
 </div>
-<div class="sec"><div class="sec-h">Sterowanie</div><div class="sec-b">
-<div class="bbar" style="margin-bottom:7px"><button class="btn btn-r" onclick="sc('d')">&#9209; OFF</button>
-<button class="btn" onclick="sc('B')">BLOCK</button>
-<button class="btn btn-o" onclick="sc('B12')">BLOCK12</button>
-<button class="btn btn-b" onclick="sc('S')">SINUS</button>
-<button class="btn btn-b" onclick="sc('F')">FOC</button></div>
-<div class="bbar"><button class="btn" onclick="sc('sat')">SAT tune</button>
-<button class="btn" onclick="sc('fpitune')">FOC tune</button>
-<button class="btn" onclick="sc('fvolt')">fvolt</button>
-<button class="btn btn-o" onclick="sc('b12dbg')">B12 debug</button></div>
+
+<div class="speedo"><div class="ring">
+<svg viewBox="0 0 200 200">
+<defs><linearGradient id="sg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#00bcd4" stop-opacity=".12"/><stop offset="100%" stop-color="#b388ff" stop-opacity=".06"/></linearGradient></defs>
+<circle cx="100" cy="100" r="90" fill="none" stroke="url(#sg)" stroke-width="1"/>
+<circle cx="100" cy="100" r="88" fill="none" stroke="#1a1a3a" stroke-width="6" stroke-dasharray="4 4" stroke-linecap="round"/>
+<circle id="spd_arc" cx="100" cy="100" r="88" fill="none" stroke="var(--cyan)" stroke-width="6" stroke-dasharray="0 553" stroke-linecap="round" transform="rotate(-90 100 100)" style="transition:stroke-dasharray .4s"/>
+</svg>
+<div class="val"><div class="num" id="rs_speed">0.0</div><div class="unit">km/h</div></div>
 </div></div>
-<div class="sec"><div class="sec-h">Wspomaganie</div><div class="sec-b">
-<div class="abar"><span class="lbl">Level:</span>
-<button id="ab_auto" class="btn" onclick="sa('auto')">AUTO</button>
-<button id="ab_0" class="btn" onclick="sa(0)">0</button>
-<button id="ab_3" class="btn" onclick="sa(3)">3</button>
-<button id="ab_6" class="btn" onclick="sa(6)">6</button>
-<button id="ab_9" class="btn" onclick="sa(9)">9</button>
-<button id="ab_12" class="btn" onclick="sa(12)">12</button>
-<button id="ab_15" class="btn" onclick="sa(15)">15</button>
-</div></div></div>
-<div class="sec"><div class="sec-h">Status systemu</div><div class="sec-b">
-<div class="status-grid">
-<span><span id="dot_disp" class="dot"></span>Display: <strong id="rt_display">-</strong></span>
-<span><span id="dot_brake" class="dot"></span>Brake: <strong id="rt_brake">-</strong></span>
-<span><span id="dot_regen" class="dot"></span>Regen: <strong id="rt_regen">0 W</strong></span>
-<span><span id="dot_pas" class="dot"></span>Offset: <strong id="rt_offset">0</strong></span>
+
+<div class="dual-gauge">
+<div class="mini-gauge">
+<div class="mg-lbl">Moc</div>
+<svg viewBox="0 0 120 70">
+<path d="M10,60 A50,50 0 0,1 110,60" fill="none" stroke="#1a1a3a" stroke-width="7" stroke-linecap="round"/>
+<path id="pwr_arc" d="M10,60 A50,50 0 0,1 110,60" fill="none" stroke="var(--green)" stroke-width="7" stroke-linecap="round" stroke-dasharray="0 157" style="transition:stroke-dasharray .4s,stroke .3s"/>
+</svg>
+<div class="mg-val" id="rs_power">0</div>
+<span class="mg-unit">W</span>
+</div>
+<div class="batt-box">
+<div class="mg-lbl">Bateria</div>
+<div class="batt-shell"><div class="batt-fill" id="batt_fill" style="width:0%;background:var(--green)"></div></div>
+<div class="batt-pct" id="batt_pct">-%</div>
+<div class="batt-volt" id="batt_volt">0.0 V</div>
+</div>
+</div>
+
+<div class="stat-row">
+<div class="sc"><div class="k">RPM</div><div class="v" id="rs_rpm">0</div></div>
+<div class="sc"><div class="k">Duty</div><div class="v" id="rs_duty">0%</div></div>
+<div class="sc"><div class="k">Regen</div><div class="v" id="rs_regen">0</div><div class="s">W</div></div>
+</div>
+
+<div class="assist-ring">
+<div class="lbl">Wspomaganie</div>
+<div class="row">
+<button class="abtn" id="abtn_m" onclick="aInc(-1)">&#8722;</button>
+<div class="alvl" id="rs_alvl">0</div>
+<button class="abtn" id="abtn_p" onclick="aInc(1)">+</button>
+</div>
+<div class="src" id="assist_src"></div>
+</div>
+
+<div class="mbar" id="mbar">
+<button onclick="sm('d')">OFF</button>
+<button onclick="sm('B')">BLOCK</button>
+<button onclick="sm('B12')">BLK12</button>
+<button onclick="sm('S')">SINUS</button>
+<button onclick="sm('F')">FOC</button>
+</div>
+
+<div class="ride-grid">
+<div class="gc"><div class="k">PAS</div><div class="v" id="rs_pas">0 rpm</div></div>
+<div class="gc"><div class="k">Throttle</div><div class="v" id="rs_thr">0</div></div>
+<div class="gc"><div class="k">Temp FET</div><div class="v" id="rs_temp">- C</div></div>
+<div class="gc"><div class="k">Max I</div><div class="v" id="rs_maxi">0.0 A</div></div>
 </div>
 </div></div>
-</div>
-<div class="col">
-<div class="diag">
+
+<div id="diag" class="screen">
+<div class="dhdr"><h2>Diagnostyka &amp; Konfiguracja</h2><button class="btn-sm" onclick="lA()">&#8635; Odswiez</button></div>
+
+<div class="dgrid">
 <div class="dc"><div class="dk">I faza A</div><div class="dv" id="diag_ia">0.000 A</div></div>
 <div class="dc"><div class="dk">I faza B</div><div class="dv" id="diag_ib">0.000 A</div></div>
 <div class="dc"><div class="dk">I faza C</div><div class="dv" id="diag_ic">0.000 A</div></div>
-<div class="dc"><div class="dk">I limit factor</div><div class="dv" id="diag_ilim">1.000</div></div>
-<div class="dc"><div class="dk">FOC Id / Iq</div><div class="dv" id="diag_idiq">- / -</div></div>
-<div class="dc"><div class="dk">FOC Vd / Vq</div><div class="dv" id="diag_vdvq">- / -</div></div>
+<div class="dc"><div class="dk">I limit</div><div class="dv" id="diag_ilim">1.000</div></div>
+<div class="dc"><div class="dk">FOC Id/Iq</div><div class="dv" id="diag_idiq">-/-</div></div>
+<div class="dc"><div class="dk">FOC Vd/Vq</div><div class="dv" id="diag_vdvq">-/-</div></div>
 </div>
-<div class="chart-wrap">
-<div style="font-size:.7rem;color:var(--muted);margin-bottom:5px">Prady fazowe realtime &mdash; <span style="color:#3fb950">&#9632; A &nbsp;</span><span style="color:#79c0ff">&#9632; B &nbsp;</span><span style="color:#d29922">&#9632; C</span></div>
-<canvas id="currents" width="800" height="160"></canvas>
+
+<div class="dchart">
+<div class="leg"><span style="color:var(--green)">&#9632; A</span><span style="color:var(--blue)">&#9632; B</span><span style="color:var(--orange)">&#9632; C</span></div>
+<canvas id="currents" width="800" height="130"></canvas>
 </div>
-<div class="sec"><div class="sec-h">Konfiguracja &mdash; Silnik</div><div class="sec-b">
-<div class="cfg-row"><label>Tryb boot</label><select id="cfg_mode"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option><option value="4">BLOCK12</option></select><button class="btn" onclick="av('cfg:mode:','cfg_mode')">Ustaw</button></div>
-<div class="cfg-row"><label>Rampa [ms]</label><input id="cfg_ramp" type="number" min="0" max="10000" step="100"><button class="btn" onclick="av('cfg:ramp:','cfg_ramp')">Ustaw</button></div>
-<div class="cfg-row"><label>Regen</label><select id="cfg_regen"><option value="0">OFF</option><option value="1">ON</option></select><button class="btn" onclick="av('cfg:regen:','cfg_regen')">Ustaw</button></div>
-<div class="cfg-row"><label>Max step duty [%]</label><input id="cfg_step" type="number" min="0" max="100"><button class="btn" onclick="av('cfg:step:','cfg_step')">Ustaw</button></div>
-<div class="cfg-row"><label>Kierunek</label><select id="cfg_rev"><option value="0">CW</option><option value="1">CCW</option></select><button class="btn" onclick="av('cfg:rev:','cfg_rev')">Ustaw</button></div>
-<div class="cfg-row"><label>Offset Hall</label><select id="cfg_so"></select><button class="btn" onclick="av('so:','cfg_so')">Ustaw</button></div>
-<div class="cfg-row"><label>Duty min [%]</label><input id="cfg_dutymin" type="number" min="0" max="50"><button class="btn" onclick="av('cfg:dutymin:','cfg_dutymin')">Ustaw</button></div>
+
+<div class="dsec"><div class="dsec-h" onclick="tgl(this)">Sterowanie</div><div class="dsec-b">
+<div class="bbar">
+<button class="bd br" onclick="sc('d')">&#9209; OFF</button>
+<button class="bd" onclick="sc('B')">BLOCK</button>
+<button class="bd" onclick="sc('B12')">BLOCK12</button>
+<button class="bd" onclick="sc('S')">SINUS</button>
+<button class="bd" onclick="sc('F')">FOC</button>
+</div>
+<div class="bbar" style="margin-top:4px">
+<button class="bd" onclick="sc('sat')">SAT tune</button>
+<button class="bd" onclick="sc('fpitune')">FOC tune</button>
+<button class="bd" onclick="sc('fvolt')">fvolt</button>
+<button class="bd" onclick="sc('b12dbg')">B12 dbg</button>
+</div>
+<div style="margin-top:6px;font-size:.6rem;color:var(--muted)">Wspomaganie</div>
+<div class="bbar">
+<button class="bd" id="ab_auto" onclick="sa('auto')">AUTO</button>
+<button class="bd" id="ab_0" onclick="sa(0)">0</button>
+<button class="bd" id="ab_3" onclick="sa(3)">3</button>
+<button class="bd" id="ab_6" onclick="sa(6)">6</button>
+<button class="bd" id="ab_9" onclick="sa(9)">9</button>
+<button class="bd" id="ab_12" onclick="sa(12)">12</button>
+<button class="bd" id="ab_15" onclick="sa(15)">15</button>
+</div>
 </div></div>
-<div class="sec"><div class="sec-h">Konfiguracja &mdash; System</div><div class="sec-b">
-<div class="cfg-row"><label>Limit pradu [A]</label><input id="cfg_ilim" type="number" min="0" max="50"><button class="btn" onclick="av('cfg:ilim:','cfg_ilim')">Ustaw</button></div>
-<div class="cfg-row"><label>Display wymagany</label><select id="cfg_disp"><option value="1">TAK</option><option value="0">NIE</option></select><button class="btn" onclick="av('cfg:dispreq:','cfg_disp')">Ustaw</button></div>
-<div class="cfg-row"><label>Throttle samples</label><input id="cfg_thrn" type="number" min="2" max="16"><button class="btn" onclick="av('cfg:thrsamp:','cfg_thrn')">Ustaw</button></div>
-<div class="cfg-row"><label>Throttle outlier</label><input id="cfg_thrd" type="number" min="10" max="2000" step="10"><button class="btn" onclick="av('cfg:thrdelta:','cfg_thrd')">Ustaw</button></div>
-<div class="cfg-row"><label>Speed pulses/rev</label><input id="cfg_spdppr" type="number" min="1" max="20"><button class="btn" onclick="av('spdppr:','cfg_spdppr')">Ustaw</button></div>
-<div class="cfg-row"><label>PWM freq [Hz]</label><input id="cfg_pwm" type="number" min="8000" max="32000" step="1000"><button class="btn" onclick="av('pwmfreq:','cfg_pwm')">Ustaw</button></div>
+
+<div class="dsec"><div class="dsec-h" onclick="tgl(this)">Display S866 <span id="dp_badge" style="font-size:.55rem;color:var(--muted);font-weight:400"></span></div><div class="dsec-b">
+<div style="margin-bottom:5px;font-size:.7rem"><span class="dot" id="dp_dot" style="width:6px;height:6px;border-radius:50%;display:inline-block"></span> <strong id="dp_status">-</strong></div>
+<div id="dp_live" class="dpg">
+<span class="pk">P06 Kolo</span><span class="pv" id="dp_p06">-</span>
+<span class="pk">P07 Magnesy speed</span><span class="pv" id="dp_p07">-</span>
+<span class="pk">P08 Limit predkosci</span><span class="pv" id="dp_p08">-</span>
+<span class="pk">P09 Tryb startu</span><span class="pv" id="dp_p09">-</span>
+<span class="pk">P10 Tryb jazdy</span><span class="pv" id="dp_p10">-</span>
+<span class="pk">P11 Czulosc PAS</span><span class="pv" id="dp_p11">-</span>
+<span class="pk">P12 Start PAS</span><span class="pv" id="dp_p12">-</span>
+<span class="pk">P13 Magnesy PAS</span><span class="pv" id="dp_p13">-</span>
+<span class="pk">P14 Limit pradu</span><span class="pv" id="dp_p14">- A</span>
+<span class="pk">P15 Nap. odciecia</span><span class="pv" id="dp_p15">- V</span>
+<span class="pk">P17 Tempomat</span><span class="pv" id="dp_p17">-</span>
+</div>
+<div id="dp_fb" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px">
+<div style="font-size:.6rem;color:var(--cyan);margin-bottom:4px">FALLBACK (bez wyswietlacza)</div>
+<div class="cr"><label>P06 Kolo [x10 cali]<span class="desc">Srednica kola do obliczania predkosci (260=26")</span></label><input id="fb_p06" type="number" min="100" max="400"><button class="bs" onclick="av('dp:p06:','fb_p06')">OK</button></div>
+<div class="cr"><label>P07 Magnesy speed<span class="desc">&lt;10: impulsy SPEED/obr kola, &ge;10: Hall (6*pary_bieg)</span></label><input id="fb_p07" type="number" min="1" max="100"><button class="bs" onclick="av('dp:p07:','fb_p07')">OK</button></div>
+<div class="cr"><label>P08 Limit predkosci<span class="desc">Max predkosc [km/h], 0=brak limitu</span></label><input id="fb_p08" type="number" min="0" max="72"><button class="bs" onclick="av('dp:p08:','fb_p08')">OK</button></div>
+<div class="cr"><label>P10 Tryb jazdy<span class="desc">0=PAS+gaz, 1=tylko gaz, 2=tylko PAS</span></label><select id="fb_p10"><option value="0">0: PAS+gaz</option><option value="1">1: Gaz</option><option value="2">2: PAS</option></select><button class="bs" onclick="av('dp:p10:','fb_p10')">OK</button></div>
+<div class="cr"><label>P13 Magnesy PAS<span class="desc">Liczba magnetow czujnika pedal-assist</span></label><input id="fb_p13" type="number" min="1" max="100"><button class="bs" onclick="av('dp:p13:','fb_p13')">OK</button></div>
+</div>
 </div></div>
-<div class="sec"><div class="sec-h">Konfiguracja &mdash; PAS</div><div class="sec-b">
-<div class="cfg-row"><label>Start delay [ms]</label><input id="cfg_pas_s" type="number" min="0" max="10000" step="100"><button class="btn" onclick="av('passtart:','cfg_pas_s')">Ustaw</button></div>
-<div class="cfg-row"><label>Stop delay [ms]</label><input id="cfg_pas_t" type="number" min="100" max="10000" step="100"><button class="btn" onclick="av('passtop:','cfg_pas_t')">Ustaw</button></div>
-<div class="cfg-row"><label>Ramp [ms]</label><input id="cfg_pas_r" type="number" min="0" max="10000" step="100"><button class="btn" onclick="av('pasramp:','cfg_pas_r')">Ustaw</button></div>
-<div class="cfg-row"><label>Invert</label><select id="cfg_pas_d"><option value="0">Normal</option><option value="1">Invert</option></select><button class="btn" onclick="pd()">Przelacz</button></div>
-<div class="cfg-row"><label>Debounce [us]</label><input id="cfg_pas_db" type="number" min="500" max="10000" step="100"><button class="btn" onclick="av('pasdbnc:','cfg_pas_db')">Ustaw</button></div>
-<div class="cfg-row"><label>Half-period [ms]</label><input id="cfg_pas_hp" type="number" min="1" max="200"><button class="btn" onclick="av('pashalf:','cfg_pas_hp')">Ustaw</button></div>
-<div class="cfg-row"><label>Asymmetry [%]</label><input id="cfg_pas_as" type="number" min="1" max="50"><button class="btn" onclick="av('pasasym:','cfg_pas_as')">Ustaw</button></div>
-<div class="cfg-row"><label>Slew rate</label><input id="cfg_pas_sl" type="number" min="1" max="100"><button class="btn" onclick="av('passlew:','cfg_pas_sl')">Ustaw</button></div>
-<div class="cfg-row"><label>Holdoff [ms]</label><input id="cfg_pas_fh" type="number" min="50" max="2000" step="50"><button class="btn" onclick="av('pashold:','cfg_pas_fh')">Ustaw</button></div>
+
+<div class="dsec"><div class="dsec-h" onclick="tgl(this)">Silnik</div><div class="dsec-b">
+<div class="cr"><label>Tryb boot<span class="desc">Tryb sterowania po wlaczeniu zasilania</span></label><select id="cfg_mode"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option><option value="4">BLOCK12</option></select><button class="bs" onclick="av('cfg:mode:','cfg_mode')">OK</button></div>
+<div class="cr"><label>Rampa [ms]<span class="desc">Czas przyspieszania 0-100% (plynny start)</span></label><input id="cfg_ramp" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('cfg:ramp:','cfg_ramp')">OK</button></div>
+<div class="cr"><label>Regen<span class="desc">Hamowanie regeneracyjne (odzyskiwanie energii)</span></label><select id="cfg_regen"><option value="0">OFF</option><option value="1">ON</option></select><button class="bs" onclick="av('cfg:regen:','cfg_regen')">OK</button></div>
+<div class="cr"><label>Max step [%]<span class="desc">Max zmiana duty/cykl (plynnosc rampy)</span></label><input id="cfg_step" type="number" min="0" max="100"><button class="bs" onclick="av('cfg:step:','cfg_step')">OK</button></div>
+<div class="cr"><label>Kierunek<span class="desc">Kierunek obrotow silnika</span></label><select id="cfg_rev"><option value="0">CW</option><option value="1">CCW</option></select><button class="bs" onclick="av('cfg:rev:','cfg_rev')">OK</button></div>
+<div class="cr"><label>Offset Hall<span class="desc">Przesuniecie fazowe Hall-sinus (kalibracja SAT)</span></label><select id="cfg_so"></select><button class="bs" onclick="av('so:','cfg_so')">OK</button></div>
+<div class="cr"><label>Duty min [%]<span class="desc">Ponizej tej wartosci duty=0 (strefa martwa)</span></label><input id="cfg_dutymin" type="number" min="0" max="50"><button class="bs" onclick="av('cfg:dutymin:','cfg_dutymin')">OK</button></div>
+<div class="cr"><label>Boost startu [%]<span class="desc">Dodatkowa moc przy ruszaniu (0=wyl)</span></label><input id="cfg_sboost" type="number" min="0" max="200"><button class="bs" onclick="av('cfg:sboost:','cfg_sboost')">OK</button></div>
+<div class="cr"><label>Boost RPM fade<span class="desc">RPM przy ktorym boost zanika do zera</span></label><input id="cfg_sboostrpm" type="number" min="10" max="500"><button class="bs" onclick="av('cfg:sboostrpm:','cfg_sboostrpm')">OK</button></div>
 </div></div>
-<div class="sec"><div class="sec-h">Konfiguracja &mdash; FOC</div><div class="sec-b">
-<div class="cfg-row"><label>Kp q+d</label><input id="cfg_fkpq" type="number" min="0" max="100" step="0.01"><button class="btn" onclick="av('fkp:','cfg_fkpq')">Ustaw</button></div>
-<div class="cfg-row"><label>Ki q+d</label><input id="cfg_fkiq" type="number" min="0" max="1000" step="0.1"><button class="btn" onclick="av('fki:','cfg_fkiq')">Ustaw</button></div>
-<div class="cfg-row"><label>Kp d</label><input id="cfg_fkpd" type="number" min="0" max="100" step="0.01"><button class="btn" onclick="av('fkpd:','cfg_fkpd')">Ustaw</button></div>
-<div class="cfg-row"><label>Ki d</label><input id="cfg_fkid" type="number" min="0" max="1000" step="0.1"><button class="btn" onclick="av('fkid:','cfg_fkid')">Ustaw</button></div>
+
+<div class="dsec"><div class="dsec-h" onclick="tgl(this)">System</div><div class="dsec-b">
+<div class="cr"><label>Limit pradu [A]<span class="desc">Max prad fazowy. 0=brak limitu. P14 z display nadpisuje</span></label><input id="cfg_ilim" type="number" min="0" max="50"><button class="bs" onclick="av('cfg:ilim:','cfg_ilim')">OK</button></div>
+<div class="cr"><label>Display wymagany<span class="desc">NIE = silnik dziala bez wyswietlacza (standalone)</span></label><select id="cfg_disp"><option value="1">TAK</option><option value="0">NIE</option></select><button class="bs" onclick="av('cfg:dispreq:','cfg_disp')">OK</button></div>
+<div class="cr"><label>Thr samples<span class="desc">Probki ADC gazu w burst (filtr szumow)</span></label><input id="cfg_thrn" type="number" min="2" max="16"><button class="bs" onclick="av('cfg:thrsamp:','cfg_thrn')">OK</button></div>
+<div class="cr"><label>Thr outlier<span class="desc">Max odchylenie od mediany ADC do odrzucenia</span></label><input id="cfg_thrd" type="number" min="10" max="2000" step="10"><button class="bs" onclick="av('cfg:thrdelta:','cfg_thrd')">OK</button></div>
+<div class="cr"><label>Speed ppr<span class="desc">Impulsy czujnika SPEED na obrot kola</span></label><input id="cfg_spdppr" type="number" min="1" max="20"><button class="bs" onclick="av('spdppr:','cfg_spdppr')">OK</button></div>
+<div class="cr"><label>PWM freq [Hz]<span class="desc">Czestotliwosc PWM MOSFETow (8-32 kHz)</span></label><input id="cfg_pwm" type="number" min="8000" max="32000" step="1000"><button class="bs" onclick="av('pwmfreq:','cfg_pwm')">OK</button></div>
 </div></div>
-<div class="sec"><div class="sec-h">EEPROM / NVS</div><div class="sec-b">
-<div class="bbar"><button class="btn btn-g" onclick="sc('cfg:save')">&#128190; Zapisz EEPROM</button>
-<button class="btn" onclick="sc('cfg:reload')">&#128194; Wczytaj</button>
-<button class="btn btn-r" onclick="if(confirm('Reset do domyslnych?'))sc('cfg:defaults')">Domyslne</button>
-<button class="btn" onclick="lA()">&#8635; Odswiez</button>
-</div></div></div>
+
+<div class="dsec"><div class="dsec-h" onclick="tgl(this)">PAS (Pedal Assist)</div><div class="dsec-b">
+<div class="cr"><label>Start delay [ms]<span class="desc">Czas ciaglego pedalowania do aktywacji PAS</span></label><input id="cfg_pas_s" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('passtart:','cfg_pas_s')">OK</button></div>
+<div class="cr"><label>Stop delay [ms]<span class="desc">Timeout: brak impulsow = wylacz wspomaganie</span></label><input id="cfg_pas_t" type="number" min="100" max="10000" step="100"><button class="bs" onclick="av('passtop:','cfg_pas_t')">OK</button></div>
+<div class="cr"><label>Ramp [ms]<span class="desc">Czas soft-start narastania mocy PAS 0-100%</span></label><input id="cfg_pas_r" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('pasramp:','cfg_pas_r')">OK</button></div>
+<div class="cr"><label>Invert<span class="desc">Odwroc konwencje kierunku czujnika PAS</span></label><select id="cfg_pas_d"><option value="0">Normal</option><option value="1">Invert</option></select><button class="bs" onclick="pd()">OK</button></div>
+<div class="cr"><label>Debounce [us]<span class="desc">Filtr EMI: ignoruj impulsy szybsze niz X us</span></label><input id="cfg_pas_db" type="number" min="500" max="10000" step="100"><button class="bs" onclick="av('pasdbnc:','cfg_pas_db')">OK</button></div>
+<div class="cr"><label>Half-period [ms]<span class="desc">Min polokres PAS (debounce krawedzi)</span></label><input id="cfg_pas_hp" type="number" min="1" max="200"><button class="bs" onclick="av('pashalf:','cfg_pas_hp')">OK</button></div>
+<div class="cr"><label>Asymmetry [%]<span class="desc">Prog asymetrii do detekcji kierunku pedalowania</span></label><input id="cfg_pas_as" type="number" min="1" max="50"><button class="bs" onclick="av('pasasym:','cfg_pas_as')">OK</button></div>
+<div class="cr"><label>Slew rate<span class="desc">Max zmiana duty PAS na krok (plynnosc)</span></label><input id="cfg_pas_sl" type="number" min="1" max="100"><button class="bs" onclick="av('passlew:','cfg_pas_sl')">OK</button></div>
+<div class="cr"><label>Holdoff [ms]<span class="desc">Blokada cofania PAS po zmianie kierunku</span></label><input id="cfg_pas_fh" type="number" min="50" max="2000" step="50"><button class="bs" onclick="av('pashold:','cfg_pas_fh')">OK</button></div>
+</div></div>
+
+<div class="dsec"><div class="dsec-h" onclick="tgl(this)">FOC (Field Oriented Control)</div><div class="dsec-b">
+<div class="cr"><label>Kp q+d<span class="desc">Wzmocnienie proporcjonalne regulatora PI pradu</span></label><input id="cfg_fkpq" type="number" min="0" max="100" step="0.01"><button class="bs" onclick="av('fkp:','cfg_fkpq')">OK</button></div>
+<div class="cr"><label>Ki q+d<span class="desc">Wzmocnienie calkujace regulatora PI pradu</span></label><input id="cfg_fkiq" type="number" min="0" max="1000" step="0.1"><button class="bs" onclick="av('fki:','cfg_fkiq')">OK</button></div>
+<div class="cr"><label>Kp d<span class="desc">Kp osi d (odmagnesowujaca, chcemy Id=0)</span></label><input id="cfg_fkpd" type="number" min="0" max="100" step="0.01"><button class="bs" onclick="av('fkpd:','cfg_fkpd')">OK</button></div>
+<div class="cr"><label>Ki d<span class="desc">Ki osi d</span></label><input id="cfg_fkid" type="number" min="0" max="1000" step="0.1"><button class="bs" onclick="av('fkid:','cfg_fkid')">OK</button></div>
+</div></div>
+
+<div class="dsec"><div class="dsec-h" onclick="tgl(this)">EEPROM / NVS</div><div class="dsec-b">
+<div class="bbar">
+<button class="bd bg" onclick="sc('cfg:save')">&#128190; Zapisz</button>
+<button class="bd" onclick="sc('cfg:reload')">&#128194; Wczytaj</button>
+<button class="bd br" onclick="if(confirm('Reset do domyslnych?'))sc('cfg:defaults')">Domyslne</button>
+</div>
+</div></div>
+
 <div class="cmdl">
-<input id="direct_cmd" type="text" placeholder="Komenda: cfg, b12dbg, foc, so:4, pasdbg, ilim:15 ...">
-<button class="btn btn-g" onclick="sd()">&#9654; Wyslij</button>
+<input id="direct_cmd" type="text" placeholder="Komenda...">
+<button class="bd bg" onclick="sd()">&#9654;</button>
 </div>
 </div>
+
+<div id="notif"></div>
+
+<div class="tab-bar">
+<button id="tab_ride" class="active" onclick="showTab('ride')">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+Jazda</button>
+<button id="tab_diag" onclick="showTab('diag')">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20V10M6 20V4M18 20v-6"/></svg>
+Diagnostyka</button>
 </div>
-<div id="notif">Ladowanie...</div>
+
 <script>
-const ge=id=>document.getElementById(id);let C={},T={};const hA=[],hB=[],hC=[],HM=180;
-(()=>{const s=ge('cfg_so');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'deg)';s.appendChild(o);}})();
-function note(m,bad){const n=ge('notif');n.textContent=m;n.style.color=bad?'#b43636':'#6d624f';}
+const ge=id=>document.getElementById(id);
+let C={},T={};
+const hA=[],hB=[],hC=[],HM=180;
+let curTab='ride',notifTimer=0;
+const MODES=['d','B','B12','S','F'];
+const MODE_MAP={0:'d',1:'B',4:'B12',2:'S',3:'F'};
+
+function showTab(t){curTab=t;document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));ge(t).classList.add('active');document.querySelectorAll('.tab-bar button').forEach(b=>b.classList.remove('active'));ge('tab_'+t).classList.add('active');}
+function tgl(el){el.classList.toggle('open');el.nextElementSibling.classList.toggle('open');}
+function note(m,bad){const n=ge('notif');n.textContent=m;n.style.color=bad?'var(--red)':'var(--muted)';n.classList.add('show');clearTimeout(notifTimer);notifTimer=setTimeout(()=>n.classList.remove('show'),2500);}
+
 async function pc(cmd){const body=new URLSearchParams({cmd:String(cmd)}).toString();const r=await fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body});return r.text();}
-async function sc(cmd){try{const t=await pc(cmd);note((t||'OK')+' \u2190 '+cmd,false);await lA();}catch(e){note('Blad: '+e,true);}}
+async function sc(cmd){try{const t=await pc(cmd);note((t||'OK')+' < '+cmd,false);await lA();}catch(e){note('Err: '+e,true);}}
 function av(pfx,id){return sc(pfx+ge(id).value);}
 function sa(lvl){return sc(lvl==='auto'?'assist:auto':'assist:'+lvl);}
-function pd(){const nv=String(C.pas_dir_invert||0)!==ge('cfg_pas_d').value;if(nv)sc('pasdir');else note('PAS dir bez zmian',false);}
+function pd(){sc('pasdir');}
 function sd(){const i=ge('direct_cmd');const c=i.value.trim();if(!c)return;sc(c).then(()=>i.value='');}
 function fmt(v,d=1){return Number(v||0).toFixed(d);}
-function tx(id,val){ge(id).textContent=val;}
-function ua(){document.querySelectorAll('.abar .btn').forEach(b=>b.classList.remove('sel'));const k='assist_override'in T&&T.assist_override>=0?String(T.assist_override):'auto';const eq=ge('ab_'+k);if(eq)eq.classList.add('sel');}
-function drawChart(){const cv=ge('currents'),ctx=cv.getContext('2d'),w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);ctx.fillStyle='#fbf6ea';ctx.fillRect(0,0,w,h);const mx=Math.max(0.1,...hA.map(Math.abs),...hB.map(Math.abs),...hC.map(Math.abs));const sc2=(h-16)/(mx*2),z=h/2;ctx.strokeStyle='#dfcfb2';ctx.lineWidth=1;[.5,1].forEach(f=>{[z-mx*f*sc2,z+mx*f*sc2].forEach(y=>{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();});});ctx.strokeStyle='#cdbb9c';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,z);ctx.lineTo(w,z);ctx.stroke();[[hA,'#2f8b4d'],[hB,'#2f5fa8'],[hC,'#b86a1f']].forEach(([arr,col])=>{if(arr.length<2)return;ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=1.8;arr.forEach((v,i)=>{const x=i*(w-1)/Math.max(1,HM-1),y=z-v*sc2;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});ctx.stroke();});ctx.fillStyle='#7b6d56';ctx.font='10px Trebuchet MS';ctx.fillText(mx.toFixed(1)+'A peak',4,12);}
-function push(a,b,c){hA.push(a);hB.push(b);hC.push(c);if(hA.length>HM){hA.shift();hB.shift();hC.shift();}drawChart();}
-function rT(){const t=T;tx('rt_mode',t.mode_name||'-');tx('rt_speed',fmt(t.speed_kmh,1));tx('rt_rpm',Math.round(t.rpm||0));tx('rt_power',fmt(t.power_w,1)+' W');tx('rt_duty',(t.duty_pct||0)+'% ('+(t.duty_raw||0)+')');tx('rt_batt',fmt(t.battery_v,2)+' V');tx('rt_thr',t.throttle_raw||0);tx('rt_assist',(t.assist_override>=0?'MAN':'AUTO')+' '+(t.assist_raw||0));tx('rt_pas',(t.pas_rpm||0)+' rpm');tx('rt_hall',t.hall||'-');tx('rt_temp',fmt(t.fet_temp,1)+' C');tx('rt_display',t.display_connected?'ONLINE':'OFFLINE');tx('rt_brake',t.brake?'AKTYWNY':'off');tx('rt_regen',fmt(t.regen_w,1)+' W');tx('rt_offset',String(t.sine_offset||0));tx('diag_ia',fmt(t.phase_a,3)+' A');tx('diag_ib',fmt(t.phase_b,3)+' A');tx('diag_ic',fmt(t.phase_c,3)+' A');tx('diag_ilim',fmt(t.ilim_factor,3));tx('diag_idiq',fmt(t.foc_id,2)+' / '+fmt(t.foc_iq,2));tx('diag_vdvq',fmt(t.foc_vd,2)+' / '+fmt(t.foc_vq,2));const fe=ge('rt_fault');fe.textContent=t.fault?'FAULT':'OK';fe.style.color=t.fault?'#f85149':'#3fb950';ge('dot_disp').className='dot '+(t.display_connected?'g':'r');ge('dot_brake').className='dot '+(t.brake?'o':'');ge('dot_pas').className='dot '+(t.pas_active?'g':'');ge('dot_regen').className='dot '+(t.regen_w>0?'g':'');push(+(t.phase_a||0),+(t.phase_b||0),+(t.phase_c||0));ua();}
-function fC(){ge('cfg_mode').value=C.drive_mode??1;ge('cfg_ramp').value=C.ramp_time_ms??1200;ge('cfg_regen').value=C.regen_enabled??0;ge('cfg_step').value=C.duty_max_step_pct??5;ge('cfg_rev').value=C.motor_reverse??0;ge('cfg_so').value=C.sine_hall_offset??0;ge('cfg_dutymin').value=C.duty_min_pct??0;ge('cfg_ilim').value=C.current_limit_a??0;ge('cfg_disp').value=C.display_required??1;ge('cfg_thrn').value=C.thr_samples??8;ge('cfg_thrd').value=C.thr_outlier_thresh??150;ge('cfg_spdppr').value=C.speed_pulses_per_rev??1;ge('cfg_pwm').value=C.pwm_freq_hz??20000;ge('cfg_pas_s').value=C.pas_start_delay_ms??2000;ge('cfg_pas_t').value=C.pas_stop_delay_ms??1000;ge('cfg_pas_r').value=C.pas_ramp_ms??1500;ge('cfg_pas_d').value=C.pas_dir_invert??0;ge('cfg_pas_db').value=C.pas_debounce_us??3000;ge('cfg_pas_hp').value=C.pas_min_halfperiod_ms??5;ge('cfg_pas_as').value=C.pas_dir_asymmetry_pct??5;ge('cfg_pas_sl').value=C.pas_slew_rate??30;ge('cfg_pas_fh').value=C.pas_fwd_holdoff_ms??300;ge('cfg_fkpq').value=Number(C.foc_kp_q??0).toFixed(3);ge('cfg_fkiq').value=Number(C.foc_ki_q??0).toFixed(3);ge('cfg_fkpd').value=Number(C.foc_kp_d??0).toFixed(3);ge('cfg_fkid').value=Number(C.foc_ki_d??0).toFixed(3);}
+function tx(id,val){const e=ge(id);if(e)e.textContent=val;}
+function sm(cmd){sc(cmd);}
+
+function aInc(dir){
+if(T.display_connected){note('Display kontroluje wspomaganie');return;}
+let cur=T.assist_raw||0;
+cur+=dir;if(cur<0)cur=0;if(cur>15)cur=15;
+sc('assist:'+cur);
+}
+
+function battPct(v){
+var lvc=T.dp_p15||39;if(lvc<20)lvc=39;
+var full=lvc*1.4;
+var pct=Math.round((v-lvc)/(full-lvc)*100);
+return Math.max(0,Math.min(100,pct));
+}
+
+function updArc(){
+const spd=T.speed_kmh||0;const lim=T.dp_p08||50;
+const pct=Math.min(spd/(lim||50),1);
+const full=553;
+ge('spd_arc').setAttribute('stroke-dasharray',Math.round(full*pct)+' '+full);
+ge('spd_arc').setAttribute('stroke',pct>.85?'var(--red)':pct>.6?'var(--orange)':'var(--cyan)');
+}
+
+function updPwr(){
+const pw=Math.abs(T.power_w||0);
+const mx=750;
+const pct=Math.min(pw/mx,1);
+const full=157;
+const arc=ge('pwr_arc');
+arc.setAttribute('stroke-dasharray',Math.round(full*pct)+' '+full);
+arc.setAttribute('stroke',pct>.8?'var(--red)':pct>.5?'var(--orange)':'var(--green)');
+}
+
+function updBatt(){
+const v=T.battery_v||0;
+const pct=battPct(v);
+const fill=ge('batt_fill');
+fill.style.width=pct+'%';
+fill.style.background=pct>50?'var(--green)':pct>20?'var(--orange)':'var(--red)';
+tx('batt_pct',pct+'%');
+tx('batt_volt',fmt(v,1)+' V');
+}
+
+function rRide(){
+const t=T;
+tx('rs_speed',fmt(t.speed_kmh,1));
+tx('rs_power',Math.round(t.power_w||0));
+tx('rs_rpm',Math.round(t.rpm||0));
+tx('rs_duty',(t.duty_pct||0)+'%');
+
+const al=t.assist_raw||0;
+tx('rs_alvl',al);
+const dc=t.display_connected;
+ge('abtn_m').classList.toggle('dis',!!dc);
+ge('abtn_p').classList.toggle('dis',!!dc);
+tx('assist_src',dc?'Display S866':'GUI / Standalone');
+
+tx('rs_pas',(t.pas_rpm||0)+' rpm');
+tx('rs_thr',t.throttle_raw||0);
+tx('rs_temp',fmt(t.fet_temp,1)+' C');
+tx('rs_maxi',fmt(t.max_i,1)+' A');
+ge('rd_conn').className='ride-top dot '+(dc?'g':'r');
+tx('rd_mode',t.mode_name||'-');
+const fe=ge('rd_fault');fe.textContent=t.fault?'FAULT':'OK';fe.style.color=t.fault?'var(--red)':'var(--green)';
+const mc=MODE_MAP[t.mode]||'d';
+ge('mbar').querySelectorAll('button').forEach((b,i)=>{b.classList.toggle('active',MODES[i]===mc);});
+updArc();updPwr();updBatt();
+}
+
+function rDiag(){
+const t=T;
+tx('diag_ia',fmt(t.phase_a,3)+' A');
+tx('diag_ib',fmt(t.phase_b,3)+' A');
+tx('diag_ic',fmt(t.phase_c,3)+' A');
+tx('diag_ilim',fmt(t.ilim_factor,3));
+tx('diag_idiq',fmt(t.foc_id,2)+'/'+fmt(t.foc_iq,2));
+tx('diag_vdvq',fmt(t.foc_vd,2)+'/'+fmt(t.foc_vq,2));
+push(+(t.phase_a||0),+(t.phase_b||0),+(t.phase_c||0));
+const conn=t.dp_conn;
+ge('dp_dot').className='dot '+(conn?'g':'r');
+tx('dp_status',conn?'ONLINE':'OFFLINE');
+tx('dp_badge',conn?'[LIVE]':'[FALLBACK]');
+ge('dp_badge').style.color=conn?'var(--green)':'var(--orange)';
+if(conn){
+tx('dp_p06',fmt(t.dp_p06,1)+'"');tx('dp_p07',t.dp_p07);tx('dp_p08',(t.dp_p08||0)+' km/h');
+tx('dp_p09',t.dp_p09?'pedal':'zero');tx('dp_p10',['PAS+gaz','gaz','PAS'][t.dp_p10||0]||t.dp_p10);
+tx('dp_p11',t.dp_p11);tx('dp_p12',t.dp_p12);tx('dp_p13',t.dp_p13);
+tx('dp_p14',(t.dp_p14||0)+' A');tx('dp_p15',fmt(t.dp_p15,1)+' V');
+tx('dp_p17',t.dp_p17?'ON':'OFF');
+}
+ge('dp_live').style.display=conn?'':'none';
+ge('dp_fb').style.display=conn?'none':'';
+document.querySelectorAll('#diag .bbar .bd').forEach(b=>{
+const txt=b.textContent.trim();
+const ov=T.assist_override;
+if(['AUTO','0','3','6','9','12','15'].includes(txt)){
+const isAuto=txt==='AUTO';
+const isSel=isAuto?(ov<0):(ov==parseInt(txt));
+b.style.borderColor=isSel?'var(--cyan)':'';b.style.color=isSel?'var(--cyan)':'';
+}
+});
+}
+
+function rT(){rRide();rDiag();}
+
+function fC(){
+const ae=document.activeElement;
+const fs=(id,val)=>{const el=ge(id);if(el&&el!==ae)el.value=val;};
+fs('cfg_mode',C.drive_mode??1);fs('cfg_ramp',C.ramp_time_ms??1200);fs('cfg_regen',C.regen_enabled??0);
+fs('cfg_step',C.duty_max_step_pct??5);fs('cfg_rev',C.motor_reverse??0);fs('cfg_so',C.sine_hall_offset??0);
+fs('cfg_dutymin',C.duty_min_pct??0);fs('cfg_sboost',C.startup_boost_pct??50);fs('cfg_sboostrpm',C.startup_boost_rpm??80);
+fs('cfg_ilim',C.current_limit_a??0);fs('cfg_disp',C.display_required??1);
+fs('cfg_thrn',C.thr_samples??8);fs('cfg_thrd',C.thr_outlier_thresh??150);
+fs('cfg_spdppr',C.speed_pulses_per_rev??1);fs('cfg_pwm',C.pwm_freq_hz??20000);
+fs('cfg_pas_s',C.pas_start_delay_ms??2000);fs('cfg_pas_t',C.pas_stop_delay_ms??1000);
+fs('cfg_pas_r',C.pas_ramp_ms??1500);fs('cfg_pas_d',C.pas_dir_invert??0);
+fs('cfg_pas_db',C.pas_debounce_us??3000);fs('cfg_pas_hp',C.pas_min_halfperiod_ms??5);
+fs('cfg_pas_as',C.pas_dir_asymmetry_pct??5);fs('cfg_pas_sl',C.pas_slew_rate??30);
+fs('cfg_pas_fh',C.pas_fwd_holdoff_ms??300);
+fs('cfg_fkpq',Number(C.foc_kp_q??0).toFixed(3));fs('cfg_fkiq',Number(C.foc_ki_q??0).toFixed(3));
+fs('cfg_fkpd',Number(C.foc_kp_d??0).toFixed(3));fs('cfg_fkid',Number(C.foc_ki_d??0).toFixed(3));
+fs('fb_p06',C.fb_p06??260);fs('fb_p07',C.fb_p07??1);fs('fb_p08',C.fb_p08??25);
+fs('fb_p10',C.fb_p10??0);fs('fb_p13',C.fb_p13??12);
+}
+
+(()=>{const s=ge('cfg_so');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'deg)';s.appendChild(o);}})();
+
+function drawChart(){const cv=ge('currents');if(!cv)return;const ctx=cv.getContext('2d'),w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);ctx.fillStyle='#0a0a16';ctx.fillRect(0,0,w,h);const mx=Math.max(0.1,...hA.map(Math.abs),...hB.map(Math.abs),...hC.map(Math.abs));const s=(h-12)/(mx*2),z=h/2;ctx.strokeStyle='#151528';ctx.lineWidth=1;[.5,1].forEach(f=>{[z-mx*f*s,z+mx*f*s].forEach(y=>{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();});});ctx.strokeStyle='#1e1e38';ctx.beginPath();ctx.moveTo(0,z);ctx.lineTo(w,z);ctx.stroke();[[hA,'#00e676'],[hB,'#448aff'],[hC,'#ffab40']].forEach(([arr,col])=>{if(arr.length<2)return;ctx.beginPath();ctx.strokeStyle=col;ctx.lineWidth=1.4;arr.forEach((v,i)=>{const x=i*(w-1)/Math.max(1,HM-1),y=z-v*s;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});ctx.stroke();});ctx.fillStyle='#555';ctx.font='9px sans-serif';ctx.fillText(mx.toFixed(1)+'A',3,10);}
+function push(a,b,c){hA.push(a);hB.push(b);hC.push(c);if(hA.length>HM){hA.shift();hB.shift();hC.shift();}if(curTab==='diag')drawChart();}
+
 async function lC(){const r=await fetch('/api/config');C=await r.json();fC();}
 async function lT(){const r=await fetch('/api/telemetry');T=await r.json();rT();}
-async function lA(){try{await Promise.all([lC(),lT()]);note('OK '+new Date().toLocaleTimeString(),false);}catch(e){note('Blad: '+e,true);}}
+async function lA(){try{await Promise.all([lC(),lT()]);}catch(e){note('Err: '+e,true);}}
 setInterval(()=>lT().catch(e=>note('T:'+e,true)),500);
-setInterval(()=>lC().catch(e=>note('C:'+e,true)),5000);
+setInterval(()=>lC().catch(e=>note('C:'+e,true)),10000);
 lA();
 </script></body></html>)bldc_html";
 
@@ -6224,6 +6598,8 @@ static void webHandleApiConfig() {
         "\"current_limit_a\":%d,"
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"speed_pulses_per_rev\":%d,\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
+        "\"startup_boost_pct\":%u,\"startup_boost_rpm\":%u,"
+        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,"
         "\"assist_override\":%d,\"queued_cmd\":\"%s\"}",
         (int)cfg.drive_mode, (int)cfg.ramp_time_ms, (int)cfg.regen_enabled,
         (int)cfg.pas_dir_invert, (int)cfg.pas_start_delay_ms,
@@ -6242,6 +6618,13 @@ static void webHandleApiConfig() {
         (int)cfg.speed_pulses_per_rev,
         (unsigned)cfg.pwm_freq_hz,
         (unsigned)cfg.duty_min_pct,
+        (unsigned)cfg.startup_boost_pct,
+        (unsigned)cfg.startup_boost_rpm,
+        (unsigned)cfg.fb_wheel_size_x10,
+        (unsigned)cfg.fb_speed_magnets,
+        (unsigned)cfg.fb_speed_limit,
+        (unsigned)cfg.fb_drive_mode,
+        (unsigned)cfg.fb_pas_magnets,
         (int)g_web_assist_override,
         g_web_queued_cmd.c_str()
     );
@@ -6250,7 +6633,7 @@ static void webHandleApiConfig() {
 
 static void webHandleApiTelemetry() {
     if (!g_web_server) return;
-    char buf[1536];
+    char buf[2048];
     uint8_t assist_raw = getEffectiveAssistRaw();
     float phase_a = g_display_current[0];
     float phase_b = g_display_current[1];
@@ -6265,7 +6648,11 @@ static void webHandleApiTelemetry() {
         "\"pas_rpm\":%u,\"pas_active\":%s,\"throttle_raw\":%u,\"hall\":%u,"
         "\"phase_a\":%.3f,\"phase_b\":%.3f,\"phase_c\":%.3f,\"max_i\":%.3f,"
         "\"fet_temp\":%.2f,\"ilim_factor\":%.3f,\"foc_vd\":%.2f,\"foc_vq\":%.2f,"
-        "\"foc_id\":%.2f,\"foc_iq\":%.2f,\"fvolt\":%s,\"sine_offset\":%d}",
+        "\"foc_id\":%.2f,\"foc_iq\":%.2f,\"fvolt\":%s,\"sine_offset\":%d,"
+        "\"dp_conn\":%s,\"dp_p06\":%.1f,\"dp_p07\":%u,\"dp_p08\":%u,"
+        "\"dp_p09\":%u,\"dp_p10\":%u,\"dp_p11\":%u,\"dp_p12\":%u,"
+        "\"dp_p13\":%u,\"dp_p14\":%u,\"dp_p15\":%.1f,"
+        "\"dp_p17\":%u}",
         (int)g_bldc_state.mode, driveModeName(g_bldc_state.mode), g_bldc_state.wheel_speed_kmh,
         (unsigned long)g_bldc_state.rpm, g_bldc_state.battery_voltage, power, g_bldc_state.regen_power_watts,
         (unsigned int)((uint32_t)g_bldc_state.duty_cycle * 100u / PWM_MAX_DUTY), (unsigned int)g_bldc_state.duty_cycle,
@@ -6274,7 +6661,19 @@ static void webHandleApiTelemetry() {
         (unsigned)g_bldc_state.pas_cadence_rpm, g_bldc_state.pas_active ? "true" : "false", (unsigned)g_bldc_state.throttle_raw,
         (unsigned)g_bldc_state.hall_state, phase_a, phase_b, phase_c, max_i, g_bldc_state.fet_temperature,
         g_current_limit_factor, g_foc_vd_dbg, g_foc_vq_dbg, g_foc_id_meas, g_foc_iq_meas,
-        g_foc_voltage_mode ? "true" : "false", (int)g_sine_hall_phase_offset
+        g_foc_voltage_mode ? "true" : "false", (int)g_sine_hall_phase_offset,
+        g_display.connected ? "true" : "false",
+        (float)g_display.config.p06_wheel_size_x10 / 10.0f,
+        (unsigned)g_display.config.p07_speed_magnets,
+        (unsigned)g_display.config.p08_speed_limit,
+        (unsigned)g_display.config.p09_start_mode,
+        (unsigned)g_display.config.p10_drive_mode,
+        (unsigned)g_display.config.p11_pas_sensitivity,
+        (unsigned)g_display.config.p12_pas_start_strength,
+        (unsigned)g_display.config.p13_pas_magnets,
+        (unsigned)g_display.config.p14_current_limit_a,
+        (float)g_display.config.p15_undervoltage_x10 / 10.0f,
+        (unsigned)g_display.config.p17_cruise_control
     );
     g_web_server->send(200, "application/json", buf);
 }

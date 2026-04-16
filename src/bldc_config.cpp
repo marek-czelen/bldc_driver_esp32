@@ -59,6 +59,13 @@ static void config_apply_defaults() {
     g_config.speed_pulses_per_rev  = 1;                               // Impulsy SPEED na obrót: 1 (kalibracja: spdcal)
     g_config.pwm_freq_hz           = 20000;                           // Częstotliwość PWM: 20 kHz (domyślna)
     g_config.duty_min_pct          = 10;                              // Min duty: 10% (poniżej → 0)
+    g_config.startup_boost_pct     = 50;                              // Boost na starcie: +50% duty przy 0 RPM
+    g_config.startup_boost_rpm     = 80;                              // Boost zanika liniowo do 0 przy 80 RPM
+    g_config.fb_wheel_size_x10    = 260;                              // Fallback P06: 26" koło
+    g_config.fb_speed_magnets     = 1;                                // Fallback P07: 1 (zewn. czujnik SPEED)
+    g_config.fb_speed_limit       = 25;                               // Fallback P08: 25 km/h
+    g_config.fb_drive_mode        = 0;                                // Fallback P10: PAS+gaz
+    g_config.fb_pas_magnets       = 12;                               // Fallback P13: 12 magnesów PAS
 }
 
 void config_init() {
