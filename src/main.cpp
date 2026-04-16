@@ -308,6 +308,7 @@ static float g_current_limit_factor = 1.0f;   ///< MnoĹĽnik duty z limitera pr
 static bool  g_overcurrent_fault = false;      ///< Hard cutoff: prÄ…d > 150% limitu â†’ blokada
 static unsigned long g_overcurrent_fault_ms = 0; ///< Czas wejĹ›cia w fault [ms]
 static float g_ilim_current_ema = 0.0f;        ///< EMA-filtrowany max prÄ…d fazowy dla limitera [A]
+static float g_display_current[3] = {0,0,0};  ///< Prady fazowe do wyswietlania (ze znakiem, Kirchhoff)
 static uint8_t g_ilim_hard_count = 0;          ///< Licznik kolejnych prĂłbek powyĹĽej hard cutoff
 #define OVERCURRENT_HARD_MULT  1.5f            ///< MnoĹĽnik: hard cutoff przy 150% limitu
 #define OVERCURRENT_FAULT_MS   500             ///< Czas blokady po hard cutoff [ms]
@@ -481,6 +482,7 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
                                                 // err<0 = kÄ…t za szybki â†’ zmniejsz prÄ™dkoĹ›Ä‡
 #define SINE_SPEED_FILTER_SHIFT 1               // filtr prÄ™dkoĹ›ci (unused, rate-limiter zamiast EMA)
 #define SINE_SPEED_MAX_CHANGE_PCT 30            // max zmiana prÄ™dkoĹ›ci na Hall edge [%]
+#define SINE_ADVANCE_TICKS      2               ///< Advance timing: kompensacja opoznienia PWM+L/R [ticki ISR]
 
 // Block crossfade: pĹ‚ynne przejĹ›cie PWM miÄ™dzy fazami przy komutacji
 // Stara faza PWM wygasza duty do 0, nowa faza PWM rozjaĹ›nia od 0 do d
@@ -3240,13 +3242,37 @@ void readAnalogInputs() {
         g_foc_ic_ema += FOC_CURRENT_EMA_ALPHA * (ic - g_foc_ic_ema);
     }
 
-    if (ia < 0.0f) ia = 0.0f;
-    if (ib < 0.0f) ib = 0.0f;
-    if (ic < 0.0f) ic = 0.0f;
+    // SINUS/FOC: rekonstrukcja Kirchhoffa (Ia+Ib+Ic=0)
+    // INA180A2 jest jednokierunkowy — faza z pradem ujemnym czyta ~0V.
+    // Identyfikujemy ja jako minimum z 3 ADC i rekonstruujemy ze znaku.
+    if (g_bldc_state.mode == DRIVE_MODE_SINUS || g_bldc_state.mode == DRIVE_MODE_FOC) {
+        if (ia <= ib && ia <= ic) {
+            ia = -(ib + ic);
+        } else if (ib <= ia && ib <= ic) {
+            ib = -(ia + ic);
+        } else {
+            ic = -(ia + ib);
+        }
+    }
 
-    g_bldc_state.phase_current[0] = ia;
-    g_bldc_state.phase_current[1] = ib;
-    g_bldc_state.phase_current[2] = ic;
+    // Clamp do >= 0 dla limitera pradowego i mocy
+    float ia_pos = (ia > 0.0f) ? ia : 0.0f;
+    float ib_pos = (ib > 0.0f) ? ib : 0.0f;
+    float ic_pos = (ic > 0.0f) ? ic : 0.0f;
+
+    // Prady do wyswietlania (ze znakiem, po rekonstrukcji Kirchhoffa)
+    g_display_current[0] = ia;
+    g_display_current[1] = ib;
+    g_display_current[2] = ic;
+
+    g_bldc_state.phase_current[0] = ia_pos;
+    g_bldc_state.phase_current[1] = ib_pos;
+    g_bldc_state.phase_current[2] = ic_pos;
+
+    // Wartosci ze znakiem do GUI (rekonstruowane Kirchhoffem)
+    g_foc_ia_signed = ia;
+    g_foc_ib_signed = ib;
+    g_foc_ic_signed = ic;
 }
 
 // ============================================================================
@@ -4200,6 +4226,12 @@ static void IRAM_ATTR sinusCommutateISR(uint8_t hall, uint16_t amplitude) {
     //   Phase B = sin(Î¸ + 240Â°)    â€” offset 64 wpisĂłw
     //   Phase C = sin(Î¸ + 120Â°)    â€” offset 32 wpisĂłw
     uint32_t angle = g_sine_angle_q16;
+    // Advance timing: kompensacja opoznienia PWM + L/R silnika
+    if (!stalled && real_speed > 0) {
+        uint32_t advance = (uint32_t)SINE_ADVANCE_TICKS * real_speed;
+        angle += advance;
+        if (angle >= SINE_TABLE_Q16_FULL) angle -= SINE_TABLE_Q16_FULL;
+    }
 
     uint32_t angle_a = angle;  // A = reference
     uint32_t angle_b = angle + ((uint32_t)SINE_PHASE_B_OFFSET << 16);
@@ -4348,7 +4380,13 @@ static void IRAM_ATTR focCommutateISR(uint8_t hall, uint16_t amplitude) {
     //
     // VÎ± = (VdÂ·cos + VqÂ·sin) >> 10
     // VÎ˛ = (VdÂ·sin - VqÂ·cos) >> 10
+    // Advance timing (identycznie jak SINUS)
     uint32_t angle = g_sine_angle_q16;
+    if (!stalled && real_speed > 0) {
+        uint32_t advance = (uint32_t)SINE_ADVANCE_TICKS * real_speed;
+        angle += advance;
+        if (angle >= SINE_TABLE_Q16_FULL) angle -= SINE_TABLE_Q16_FULL;
+    }
     // FOC: surowy Î¸ (bez offsetu 180Â°!) â€” musi byÄ‡ spĂłjny z forward Park w loop().
     int32_t sin_val = sine_interp_q16(angle);  // -1024..+1024
     uint32_t cos_angle = angle + (24UL << 16); // +90Â° (24/96 entries = 90Â°)
@@ -6214,10 +6252,10 @@ static void webHandleApiTelemetry() {
     if (!g_web_server) return;
     char buf[1536];
     uint8_t assist_raw = getEffectiveAssistRaw();
-    float phase_a = g_bldc_state.phase_current[0];
-    float phase_b = g_bldc_state.phase_current[1];
-    float phase_c = g_bldc_state.phase_current[2];
-    float max_i = fmaxf(phase_a, fmaxf(phase_b, phase_c));
+    float phase_a = g_display_current[0];
+    float phase_b = g_display_current[1];
+    float phase_c = g_display_current[2];
+    float max_i = fmaxf(fabsf(phase_a), fmaxf(fabsf(phase_b), fabsf(phase_c)));
     float power = g_bldc_state.regen_active ? g_bldc_state.regen_power_watts : g_bldc_state.power_watts;
     snprintf(buf, sizeof(buf),
         "{\"mode\":%d,\"mode_name\":\"%s\",\"speed_kmh\":%.2f,\"rpm\":%lu,"
