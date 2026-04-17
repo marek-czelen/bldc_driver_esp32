@@ -976,84 +976,73 @@ static float getAssistSpeedLimit() {
     if (spd > max_spd) spd = max_spd;
     return spd;
 }
-static float g_speed_limit_factor = 1.0f;           ///< EMA-filtrowany wspĂłĹ‚czynnik mocy 0..1
-#define SPEED_LIMIT_ALPHA_DOWN    0.03f              ///< EMA Î± spadek (over-speed â†’ szybka redukcja duty)
-#define SPEED_LIMIT_ALPHA_UP      0.02f              ///< EMA Î± wzrost (under-speed â†’ narastanie duty)
-#define SPEED_LIMIT_FADE_BAND_KMH 3.0f              ///< Strefa liniowego fade przed limitem [km/h]
+static float g_speed_limit_factor = 1.0f;           ///< EMA-filtrowany wspolczynnik mocy 0..1
+// P08 speed limit: plynna rampa z histereza
+// Fade band: 5 km/h przed limitem (moc maleje 100%->10%, nie do zera!)
+// Histereza: +2 km/h ponad limit nadal 10% mocy (pozwala na lekkie przekroczenie)
+// Twardy clamp dopiero +5 km/h ponad limit
+// Wolna rampa EMA: alpha_down=0.015, alpha_up=0.008 -> lagodne przejscia
+#define SPEED_LIMIT_ALPHA_DOWN    0.015f             ///< EMA alpha spadek (wolna redukcja - plynnosc!)
+#define SPEED_LIMIT_ALPHA_UP      0.008f             ///< EMA alpha wzrost (jeszcze wolniejsze narastanie)
+#define SPEED_LIMIT_FADE_BAND_KMH 5.0f              ///< Strefa fade przed limitem [km/h]
+#define SPEED_LIMIT_MIN_FACTOR    0.10f              ///< Minimalna moc w strefie fade (10%, nie zero!)
+#define SPEED_LIMIT_HYSTERESIS    2.0f               ///< Pozwala przekroczyc limit o tyle [km/h] z min moca
+#define SPEED_LIMIT_HARD_CUT      5.0f               ///< Twardy clamp: ponad limit+5 -> 0%
 
 static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
     if (duty_in == 0) {
-        // Przy zerowym duty nie modyfikuj filtra â€” silnik nie jedzie
         return 0;
     }
     // STARTING->RUN: przejscie gdy predkosc >= assist_min_speed_kmh
     if (g_startup_state == 2 && speed_kmh >= (float)config_get().assist_min_speed_kmh) {
         g_startup_state = 3;  // RUN
-        g_run_enter_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);  // zapisz timestamp
+        g_run_enter_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
     }
 
-    // Grace period: przez run_grace_s sekund po wejsciu w RUN nie limituj assist
-    bool in_grace = false;
-    if (g_startup_state == 3 && config_get().run_grace_s > 0) {
-        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        uint32_t grace_ms = (uint32_t)config_get().run_grace_s * 1000U;
-        if ((now_ms - g_run_enter_ms) < grace_ms) {
-            in_grace = true;
-        }
-    }
-
-    // Efektywny limit predkosci: mniejszy z P08 i assist_speed
-    float assist_spd = getAssistSpeedLimit();
+    // Globalny limit = tylko P08 (max speed). Assist NIE limituje tutaj.
+    // Assist-based limiting jest w calculatePasDuty() — dotyczy tylko PAS.
     uint8_t p08_limit = getSpeedLimitKmh();
-    float limit_f;
-    if (g_startup_state < 3 || assist_spd <= 0.0f) {
-        // ALIGN/STARTING lub brak limitu: uzyj P08 (pelna moc, bez limitowania assist)
-        limit_f = (p08_limit > 0) ? (float)p08_limit : 0.0f;
-    } else if (in_grace) {
-        // Grace period po starcie: nie limituj assist, tylko P08
-        limit_f = (p08_limit > 0) ? (float)p08_limit : 0.0f;
-    } else {
-        // RUN: limituj predkosc wedlug assist level
-        limit_f = assist_spd;
-        // P08 jest twardy - nigdy nie przekraczamy
-        if (p08_limit > 0 && limit_f > (float)p08_limit) limit_f = (float)p08_limit;
-    }
+    float limit_f = (p08_limit > 0) ? (float)p08_limit : 0.0f;
 
-    // Oblicz surowy wspĂłĹ‚czynnik mocy (0.0 .. 1.0)
-    // Fade zaczyna siÄ™ SPEED_LIMIT_FADE_BAND_KMH km/h przed limitem (staĹ‚e okno, niezaleĹĽne od limitu)
     if (limit_f <= 0.0f) {
+        // Brak limitu P08 -> pelna moc
         g_speed_limit_factor = 1.0f;
         return duty_in;
     }
 
+    // Oblicz surowy wspolczynnik mocy z histereza:
+    // [0, limit-fade]        => 1.0 (pelna moc)
+    // [limit-fade, limit]    => 1.0 -> MIN_FACTOR (lagodny liniowy spadek)
+    // [limit, limit+hyst]    => MIN_FACTOR (minimalna moc, nie zero — plynne krecenie)
+    // [limit+hyst, limit+hard] => MIN_FACTOR -> 0 (dopiero tu zamieramy)
+    // [limit+hard, ...]      => 0 (coast)
     float raw_factor;
-    if (speed_kmh >= limit_f) {
-        raw_factor = 0.0f;  // powyĹĽej limitu â†’ zero mocy
+    float fade_start = limit_f - SPEED_LIMIT_FADE_BAND_KMH;
+    if (fade_start < 0.0f) fade_start = 0.0f;
+
+    if (speed_kmh <= fade_start) {
+        raw_factor = 1.0f;
+    } else if (speed_kmh < limit_f) {
+        // Strefa fade: 1.0 -> MIN_FACTOR
+        float t = (speed_kmh - fade_start) / SPEED_LIMIT_FADE_BAND_KMH;
+        raw_factor = 1.0f - t * (1.0f - SPEED_LIMIT_MIN_FACTOR);
+    } else if (speed_kmh < limit_f + SPEED_LIMIT_HYSTERESIS) {
+        // Przekroczenie limitu, ale w strefie histerezy -> minimalna moc
+        raw_factor = SPEED_LIMIT_MIN_FACTOR;
+    } else if (speed_kmh < limit_f + SPEED_LIMIT_HARD_CUT) {
+        // Strefa hard cut: MIN_FACTOR -> 0
+        float t = (speed_kmh - limit_f - SPEED_LIMIT_HYSTERESIS)
+                  / (SPEED_LIMIT_HARD_CUT - SPEED_LIMIT_HYSTERESIS);
+        raw_factor = SPEED_LIMIT_MIN_FACTOR * (1.0f - t);
     } else {
-        float fade_start = limit_f - SPEED_LIMIT_FADE_BAND_KMH;
-        if (fade_start < 0.0f) fade_start = 0.0f;
-        if (speed_kmh <= fade_start) {
-            raw_factor = 1.0f;  // poniĹĽej strefy fade â†’ peĹ‚na moc
-        } else {
-            // Liniowy spadek 1.0â†’0.0 w strefie fade (ostatnie 3 km/h przed limitem)
-            raw_factor = (limit_f - speed_kmh) / SPEED_LIMIT_FADE_BAND_KMH;
-        }
+        raw_factor = 0.0f;
     }
 
-    // Asymetryczny filtr EMA:
-    // - Over-speed (raw < sl): szybka redukcja duty â†’ zapobiega przekroczeniu limitu
-    // - Under-speed (raw > sl): wolne narastanie â†’ zapobiega oscylacji bang-bang
+    // Asymetryczny filtr EMA (wolna rampa = plynnosc)
     float alpha = (raw_factor < g_speed_limit_factor) ? SPEED_LIMIT_ALPHA_DOWN : SPEED_LIMIT_ALPHA_UP;
     g_speed_limit_factor += alpha * (raw_factor - g_speed_limit_factor);
-
-    // Clamp do 0..1 (bezpieczeĹ„stwo numeryczne)
     if (g_speed_limit_factor < 0.0f) g_speed_limit_factor = 0.0f;
     if (g_speed_limit_factor > 1.0f) g_speed_limit_factor = 1.0f;
-
-    // Twardy clamp: jeĹ›li prÄ™dkoĹ›Ä‡ > limit+2km/h â†’ natychmiast zero (bezpieczeĹ„stwo)
-    if (speed_kmh > limit_f + 2.0f) {
-        g_speed_limit_factor = 0.0f;
-    }
 
     uint16_t result = (uint16_t)((float)duty_in * g_speed_limit_factor);
     return result;
