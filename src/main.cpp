@@ -136,6 +136,8 @@ static int8_t     g_web_assist_override = -1;   ///< -1=auto(display), 0..15=ove
 
 /// Startup state machine: 0=IDLE, 1=ALIGN, 2=STARTING, 3=RUN
 volatile uint8_t  g_startup_state = 0;
+volatile uint16_t g_startup_align_ms = 150;     ///< ISR copy of align time [ms]
+volatile uint8_t  g_startup_align_duty = 100; ///< ISR copy of align duty [%]
 volatile uint32_t g_startup_align_start_us = 0; ///< Timestamp rozpoczÄ™cia alignmentu [us]
 volatile uint8_t  g_startup_align_hall = 0;     ///< Hall zapisany na poczÄ…tku alignmentu
 
@@ -399,6 +401,7 @@ static inline const char* driveModeName(drive_mode_t mode) {
         case DRIVE_MODE_SINUS: return "SINUS";
         case DRIVE_MODE_FOC: return "FOC";
         case DRIVE_MODE_BLOCK12: return "BLOCK12";
+        case DRIVE_MODE_BLOCK24: return "BLOCK24";
         default: return "???";
     }
 }
@@ -468,8 +471,8 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
 #define SINE_PHASE_B_OFFSET     64              // 96*2/3 = 240Â°
 #define SINE_PHASE_C_OFFSET     32              // 96/3 = 120Â°
 #define SINE_STARTUP_COMMUT     18              // przejĹ›Ä‡ Halla w BLOCK przed przejĹ›ciem na SINUS/FOC (3 obroty el.)
-#define STARTUP_ALIGN_MS        150             // czas wyrĂłwnania rotora w BLOCK [ms]
-#define STARTUP_ALIGN_DUTY_PCT  100             // duty wyrĂłwnania [% PWM_MAX_DUTY]
+#define STARTUP_ALIGN_MS_DEFAULT 150             // czas wyrĂłwnania rotora w BLOCK [ms]
+#define STARTUP_ALIGN_DUTY_PCT_DEFAULT 100             // duty wyrĂłwnania [% PWM_MAX_DUTY]
 #define SINE_BLOCK_SPEED_THRESHOLD  10000       // Q16 speed poniĹĽej tego â†’ BLOCK zamiast SINUS/FOC (stall/oscylacja)
 #define SINE_STALL_FREEZE_MS    200             // ms bez Halla â†’ zamroĹĽenie kÄ…ta
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prÄ™dkoĹ›Ä‡ startowa â‰ 1 obr.elekt./s (52428800/166666)
@@ -2665,6 +2668,10 @@ void loop() {
             g_display.config.p10_drive_mode      = fbcfg.fb_drive_mode;
             g_display.config.p13_pas_magnets     = fbcfg.fb_pas_magnets;
         }
+        // ISR-safe kopia parametrow alignmentu z konfiguracji
+        g_startup_align_ms = config_get().startup_align_ms;
+        g_startup_align_duty = config_get().startup_align_duty_pct;
+
         // Wheeltime [ms] â€” ĹşrĂłdĹ‚o zaleĹĽy od P07:
         //   P07 >= 10 â†’ silnik direct-drive (hub), P07 = przejĹ›cia Halla na obrĂłt koĹ‚a
         //                (= 6 transitions/erev Ă— pole_pairs, np. 6Ă—15=90)
@@ -4090,9 +4097,9 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         // ALIGN: wymuszony jeden krok BLOCK z kontrolowanym duty
         if (g_startup_state == 1) {
             uint32_t elapsed_us = now_us - g_startup_align_start_us;
-            uint16_t align_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * STARTUP_ALIGN_DUTY_PCT / 100);
+            uint16_t align_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * g_startup_align_duty / 100);
             // Duty narastajace liniowo w pierwszej polowie alignmentu
-            uint32_t half_ms = STARTUP_ALIGN_MS / 2;
+            uint32_t half_ms = g_startup_align_ms / 2;
             uint32_t elapsed_ms = elapsed_us / 1000;
             if (elapsed_ms < half_ms) {
                 align_duty = (uint16_t)((uint32_t)align_duty * elapsed_ms / half_ms);
@@ -4110,7 +4117,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             }
             g_dbg_commut_path = 4;  // ALIGN
             // Przejscie do RUN po uplywie czasu ALIGN
-            if (elapsed_us >= (uint32_t)STARTUP_ALIGN_MS * 1000) {
+            if (elapsed_us >= (uint32_t)g_startup_align_ms * 1000) {
                 g_startup_state = 2;  // STARTING
                 if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
                     resetSineTracking(hall);
@@ -4138,6 +4145,62 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             g_dbg_commut_path = 3;  // FOC
             focCommutateISR(hall, d);
             return;
+        case DRIVE_MODE_BLOCK24:
+        {
+            // 24-step: 4 pod-kroki na sektor Halla (co 15 stopni elektr.)
+            // 0-25%: biezacy stan, pelne duty
+            // 25-50%: blend biezacy->nastepny (duty spada na biezacym, rosnie na nastepnym)
+            // 50-75%: nastepny stan, pelne duty
+            // 75-100%: blend nastepny->nastepny+1
+            g_dbg_commut_path = 6;  // BLOCK24
+            uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+            if (bh < 1 || bh > 6) { allMosfetsOff(); return; }
+            uint8_t next_bh = blockHallNextCw(bh);
+            uint8_t next2_bh = blockHallNextCw(next_bh);
+            if (g_hall_last_change_us > 0 && g_hall_period_us >= (2 * HALL_MIN_PERIOD_US)) {
+                uint32_t now_us = (uint32_t)esp_timer_get_time();
+                uint32_t dt_us = now_us - g_hall_last_change_us;
+                uint32_t period = g_hall_period_us;
+                if (dt_us < (period * 2U)) {
+                    uint32_t q1 = period >> 2;       // 25%
+                    uint32_t q2 = period >> 1;       // 50%
+                    uint32_t q3 = q1 + q2;           // 75%
+                    if (dt_us < q1) {
+                        // 0-25%: pelny biezacy stan
+                        applyBlockState(bh, d);
+                    } else if (dt_us < q2) {
+                        // 25-50%: blend bh -> next_bh
+                        uint32_t blend = ((dt_us - q1) * (uint32_t)d) / q1;
+                        uint16_t d_cur = d - (uint16_t)blend;
+                        uint16_t d_nxt = (uint16_t)blend;
+                        // Uzyj stanu z wiekszym duty
+                        if (d_cur >= d_nxt) {
+                            applyBlockState(bh, d);
+                        } else {
+                            applyBlockState(next_bh, d);
+                        }
+                    } else if (dt_us < q3) {
+                        // 50-75%: pelny nastepny stan
+                        applyBlockState(next_bh, d);
+                    } else {
+                        // 75-100%: blend next_bh -> next2_bh
+                        uint32_t blend = ((dt_us - q3) * (uint32_t)d) / q1;
+                        uint16_t d_cur = d - (uint16_t)blend;
+                        uint16_t d_nxt = (uint16_t)blend;
+                        if (d_cur >= d_nxt) {
+                            applyBlockState(next_bh, d);
+                        } else {
+                            applyBlockState(next2_bh, d);
+                        }
+                    }
+                } else {
+                    applyBlockState(bh, d);
+                }
+            } else {
+                applyBlockState(bh, d);
+            }
+            return;
+        }
         case DRIVE_MODE_BLOCK12:
         {
             g_dbg_commut_path = 5;  // BLOCK12
@@ -5115,6 +5178,13 @@ static String executeCommand(const String& cmd) {
         g_bldc_state.fault = false;
         return "BLOCK12 ON";
     }
+    if (cmd == "B24" || cmd == "m5" || cmd == "b24" || cmd == "b24on") {
+        g_mosfet_test_active = false;
+        g_manual_duty_override = false;
+        g_bldc_state.mode = DRIVE_MODE_BLOCK24;
+        g_bldc_state.fault = false;
+        return "BLOCK24 ON";
+    }
     if (cmd == "m2" || cmd == "S") {
         g_mosfet_test_active = false;
         g_manual_duty_override = false;
@@ -5767,10 +5837,10 @@ static String executeCommand(const String& cmd) {
         controller_config_t& cfg = config_get();
         if (cmd.startsWith("cfg:mode:")) {
             int val = cmd.substring(9).toInt();
-            if (val >= DRIVE_MODE_BLOCK && val <= DRIVE_MODE_BLOCK12) {
+            if (val >= DRIVE_MODE_BLOCK && val <= DRIVE_MODE_BLOCK24) {
                 cfg.drive_mode = (uint8_t)val;
                 config_save();
-                const char* names[] = {"OFF", "BLOCK", "SINUS", "FOC", "BLOCK12"};
+                const char* names[] = {"OFF", "BLOCK", "SINUS", "FOC", "BLOCK12", "BLOCK24"};
                 return String("Tryb boot: ") + names[val];
             }
             return "Bledna wartosc trybu";
@@ -6008,6 +6078,24 @@ static String executeCommand(const String& cmd) {
             }
             return "Zakres 1-50 km/h";
         }
+        if (cmd.startsWith("cfg:alignms:")) {
+            int val = cmd.substring(12).toInt();
+            if (val >= 10 && val <= 1000) {
+                cfg.startup_align_ms = (uint16_t)val;
+                config_save();
+                return "Align time: " + String(val) + " ms";
+            }
+            return "Zakres 10-1000 ms";
+        }
+        if (cmd.startsWith("cfg:alignduty:")) {
+            int val = cmd.substring(14).toInt();
+            if (val >= 5 && val <= 100) {
+                cfg.startup_align_duty_pct = (uint8_t)val;
+                config_save();
+                return "Align duty: " + String(val) + "%";
+            }
+            return "Zakres 5-100 %";
+        }
         return "Nieznany parametr cfg";
     }
 
@@ -6238,13 +6326,21 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 .dsec-h::after{content:'';display:inline-block;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--muted);transition:transform .2s}
 .dsec-h.open::after{transform:rotate(180deg)}
 .dsec-b{padding:9px 11px;display:none}.dsec-b.open{display:block}
-.cr{display:grid;grid-template-columns:1fr 86px 48px;gap:4px;align-items:center;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.cr{display:grid;grid-template-columns:1fr 24px minmax(80px,100px) 44px;gap:3px 5px;align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.04)}
 .cr:last-child{border-bottom:0}
-.cr label{font-size:.68rem;color:var(--text)}
-.cr .desc{font-size:.52rem;color:var(--muted);display:block;margin-top:-1px}
-.cr input,.cr select{padding:4px 5px;background:#0a0a18;color:var(--text);border:1px solid var(--border);border-radius:5px;font-size:.7rem;width:100%}
-.cr .bs{padding:3px 6px;font-size:.62rem;border-radius:5px;border:1px solid var(--border);background:var(--panel2);color:var(--cyan);cursor:pointer;width:100%;text-align:center;font-weight:700}
+.cr label{font-size:.72rem;color:var(--text)}
+.cr .desc{grid-column:1/-1;font-size:.57rem;color:var(--muted);margin-top:-1px;padding-bottom:1px}
+.cr input,.cr select{padding:5px 6px;background:#0a0a18;color:var(--text);border:1px solid var(--border);border-radius:5px;font-size:.74rem;width:100%}
+.cr .bs{padding:4px 6px;font-size:.66rem;border-radius:5px;border:1px solid var(--border);background:var(--panel2);color:var(--cyan);cursor:pointer;width:100%;text-align:center;font-weight:700}
 .cr .bs:active{background:var(--cyan);color:#fff}
+.hi{width:22px;height:22px;border-radius:50%;border:1px solid var(--border);background:var(--panel2);color:var(--cyan);font-size:.68rem;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.hi:active{background:var(--cyan);color:#fff}
+#hmod{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center}
+#hmod.show{display:flex}
+#hmod .hbox{background:var(--panel);border:1px solid var(--cyan);border-radius:12px;padding:16px 18px;max-width:340px;width:90%;max-height:70vh;overflow-y:auto}
+#hmod .htit{font-size:.84rem;font-weight:700;color:var(--cyan);margin-bottom:8px}
+#hmod .htxt{font-size:.74rem;color:var(--text);line-height:1.55}
+#hmod .hclose{margin-top:10px;padding:6px 16px;border-radius:7px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:.7rem;cursor:pointer;display:block;width:100%;text-align:center}
 .dpg{display:grid;grid-template-columns:auto 1fr;gap:1px 8px;font-size:.7rem}
 .dpg .pk{color:var(--muted)}.dpg .pv{color:var(--text);font-weight:600}
 .bbar{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px}
@@ -6313,6 +6409,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <button onclick="sm('d')">OFF</button>
 <button onclick="sm('B')">BLOCK</button>
 <button onclick="sm('B12')">BLK12</button>
+<button onclick="sm('B24')">BLK24</button>
 <button onclick="sm('S')">SINUS</button>
 <button onclick="sm('F')">FOC</button>
 </div>
@@ -6347,6 +6444,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <button class="bd br" onclick="sc('d')">&#9209; OFF</button>
 <button class="bd" onclick="sc('B')">BLOCK</button>
 <button class="bd" onclick="sc('B12')">BLOCK12</button>
+<button class="bd" onclick="sc('B24')">BLOCK24</button>
 <button class="bd" onclick="sc('S')">SINUS</button>
 <button class="bd" onclick="sc('F')">FOC</button>
 </div>
@@ -6385,53 +6483,55 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 </div>
 <div id="dp_fb" style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px">
 <div style="font-size:.6rem;color:var(--cyan);margin-bottom:4px">FALLBACK (bez wyswietlacza)</div>
-<div class="cr"><label>P06 Kolo [x10 cali]<span class="desc">Srednica kola do obliczania predkosci (260=26")</span></label><input id="fb_p06" type="number" min="100" max="400"><button class="bs" onclick="av('dp:p06:','fb_p06')">OK</button></div>
-<div class="cr"><label>P07 Magnesy speed<span class="desc">&lt;10: impulsy SPEED/obr kola, &ge;10: Hall (6*pary_bieg)</span></label><input id="fb_p07" type="number" min="1" max="100"><button class="bs" onclick="av('dp:p07:','fb_p07')">OK</button></div>
-<div class="cr"><label>P08 Limit predkosci<span class="desc">Max predkosc [km/h], 0=brak limitu</span></label><input id="fb_p08" type="number" min="0" max="72"><button class="bs" onclick="av('dp:p08:','fb_p08')">OK</button></div>
-<div class="cr"><label>P10 Tryb jazdy<span class="desc">0=PAS+gaz, 1=tylko gaz, 2=tylko PAS</span></label><select id="fb_p10"><option value="0">0: PAS+gaz</option><option value="1">1: Gaz</option><option value="2">2: PAS</option></select><button class="bs" onclick="av('dp:p10:','fb_p10')">OK</button></div>
-<div class="cr"><label>P13 Magnesy PAS<span class="desc">Liczba magnetow czujnika pedal-assist</span></label><input id="fb_p13" type="number" min="1" max="100"><button class="bs" onclick="av('dp:p13:','fb_p13')">OK</button></div>
+<div class="cr"><label>P06 Kolo [x10 cali]</label><span class="hi" onclick="hp('P06 Kolo [x10 cali]','Rozmiar kola w dziesiatkach cali, np. 260 oznacza 26 cali. Uzyty do przeliczenia czasu obrotu kola na predkosc km/h. Jezeli masz kolo 28 cali wpisz 280. Wartosc ta jest brana pod uwage gdy wyswietlacz S866 jest odlaczony.')">?</span><input id="fb_p06" type="number" min="100" max="400"><button class="bs" onclick="av('dp:p06:','fb_p06')">OK</button><span class="desc">Srednica kola do obliczania predkosci (260=26")</span></div>
+<div class="cr"><label>P07 Magnesy speed</label><span class="hi" onclick="hp('P07 Magnesy speed','Parametr P07 okresla zrodlo pomiaru predkosci. Wartosci 1-9: zewnetrzny czujnik SPEED na kole, wartosc = ile impulsow na obrot kola. Wartosci 10+: silnik direct-drive (hub), wartosc = 6 x liczba par biegunow (np. 90 = 6x15). Decyduje czy predkosc jest mierzona z czujnika kola czy z przejsc Halla silnika.')">?</span><input id="fb_p07" type="number" min="1" max="100"><button class="bs" onclick="av('dp:p07:','fb_p07')">OK</button><span class="desc">&lt;10: impulsy SPEED/obr kola, &ge;10: Hall (6*pary_bieg)</span></div>
+<div class="cr"><label>P08 Limit predkosci</label><span class="hi" onclick="hp('P08 Limit predkosci','Maksymalna dozwolona predkosc roweru w km/h. Po osiagnieciu tego limitu sterownik plynnie redukuje moc silnika. Wartosc 0 wylacza limit. W trybie z wyswietlaczem S866 ten parametr jest nadpisywany przez ustawienie P08 wyswietlacza. W trybie standalone uzywa wartosci z tej konfiguracji.')">?</span><input id="fb_p08" type="number" min="0" max="72"><button class="bs" onclick="av('dp:p08:','fb_p08')">OK</button><span class="desc">Max predkosc [km/h], 0=brak limitu</span></div>
+<div class="cr"><label>P10 Tryb jazdy</label><span class="hi" onclick="hp('P10 Tryb jazdy','Okresla zrodlo sterowania silnikiem. Tryb 0 (PAS+gaz): silnik reaguje na pedaly i manetke gazu - silniejsze zrodlo wygrywa. Tryb 1 (gaz): tylko manetka gazu, PAS ignorowany. Tryb 2 (PAS): tylko pedal-assist, manetka gazu ignorowana.')">?</span><select id="fb_p10"><option value="0">0: PAS+gaz</option><option value="1">1: Gaz</option><option value="2">2: PAS</option></select><button class="bs" onclick="av('dp:p10:','fb_p10')">OK</button><span class="desc">0=PAS+gaz, 1=tylko gaz, 2=tylko PAS</span></div>
+<div class="cr"><label>P13 Magnesy PAS</label><span class="hi" onclick="hp('P13 Magnesy PAS','Ilosc magnetow na tarczy czujnika PAS (pedal-assist sensor). Typowe wartosci: 5, 8, 12, 24. Wplywa na dokladnosc pomiaru kadencji pedalowania i czas reakcji systemu. Wieksza liczba magnetow = szybsza reakcja i plynniejsze wspomaganie.')">?</span><input id="fb_p13" type="number" min="1" max="100"><button class="bs" onclick="av('dp:p13:','fb_p13')">OK</button><span class="desc">Liczba magnetow czujnika pedal-assist</span></div>
 </div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">Silnik</div><div class="dsec-b">
-<div class="cr"><label>Tryb boot<span class="desc">Tryb sterowania po wlaczeniu zasilania</span></label><select id="cfg_mode"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option><option value="4">BLOCK12</option></select><button class="bs" onclick="av('cfg:mode:','cfg_mode')">OK</button></div>
-<div class="cr"><label>Rampa [ms]<span class="desc">Czas przyspieszania 0-100% (plynny start)</span></label><input id="cfg_ramp" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('cfg:ramp:','cfg_ramp')">OK</button></div>
-<div class="cr"><label>Regen<span class="desc">Hamowanie regeneracyjne (odzyskiwanie energii)</span></label><select id="cfg_regen"><option value="0">OFF</option><option value="1">ON</option></select><button class="bs" onclick="av('cfg:regen:','cfg_regen')">OK</button></div>
-<div class="cr"><label>Max step [%]<span class="desc">Max zmiana duty/cykl (plynnosc rampy)</span></label><input id="cfg_step" type="number" min="0" max="100"><button class="bs" onclick="av('cfg:step:','cfg_step')">OK</button></div>
-<div class="cr"><label>Kierunek<span class="desc">Kierunek obrotow silnika</span></label><select id="cfg_rev"><option value="0">CW</option><option value="1">CCW</option></select><button class="bs" onclick="av('cfg:rev:','cfg_rev')">OK</button></div>
-<div class="cr"><label>Offset Hall<span class="desc">Przesuniecie fazowe Hall-sinus (kalibracja SAT)</span></label><select id="cfg_so"></select><button class="bs" onclick="av('so:','cfg_so')">OK</button></div>
-<div class="cr"><label>Duty min [%]<span class="desc">Ponizej tej wartosci duty=0 (strefa martwa)</span></label><input id="cfg_dutymin" type="number" min="0" max="50"><button class="bs" onclick="av('cfg:dutymin:','cfg_dutymin')">OK</button></div>
-<div class="cr"><label>Boost startu [%]<span class="desc">Dodatkowa moc przy ruszaniu (0=wyl)</span></label><input id="cfg_sboost" type="number" min="0" max="200"><button class="bs" onclick="av('cfg:sboost:','cfg_sboost')">OK</button></div>
-<div class="cr"><label>Boost RPM fade<span class="desc">RPM przy ktorym boost zanika do zera</span></label><input id="cfg_sboostrpm" type="number" min="10" max="500"><button class="bs" onclick="av('cfg:sboostrpm:','cfg_sboostrpm')">OK</button></div>
-<div class="cr"><label>Min predkosc assist [km/h]<span class="desc">Predkosc przy assist=1. Powyzej: limitowanie wg poziomu</span></label><input id="cfg_aminspd" type="number" min="1" max="50"><button class="bs" onclick="av('cfg:aminspd:','cfg_aminspd')">OK</button></div>
+<div class="cr"><label>Tryb boot</label><span class="hi" onclick="hp('Tryb boot','Domyslny tryb komutacji silnika po starcie. BLOCK: prosta 6-krokowa komutacja trapezoidalna. BLOCK12: 12-krokowa z polkrokiem miedzy Hallami - plynniejsza niz BLOCK. BLOCK24: 24-krokowa z interpolacja duty - jeszcze plynniejsza. SINUS: sinusoidalne sterowanie faz. FOC: Field Oriented Control - najplynniejsze, wymaga kalibracji PI.')">?</span><select id="cfg_mode"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option><option value="4">BLOCK12</option><option value="5">BLOCK24</option></select><button class="bs" onclick="av('cfg:mode:','cfg_mode')">OK</button><span class="desc">Tryb sterowania po wlaczeniu zasilania</span></div>
+<div class="cr"><label>Rampa [ms]</label><span class="hi" onclick="hp('Rampa [ms]','Czas w milisekundach potrzebny na zmiane duty z 0% do 100%. Wieksza wartosc = wolniejsze, plynniejsze przyspieszanie. Mniejsza = szybsza reakcja ale mozliwe szarpniecia. Typowe wartosci: 500-2000 ms. Wartosc 0 = brak ograniczenia (natychmiastowa zmiana).')">?</span><input id="cfg_ramp" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('cfg:ramp:','cfg_ramp')">OK</button><span class="desc">Czas przyspieszania 0-100% (plynny start)</span></div>
+<div class="cr"><label>Regen</label><span class="hi" onclick="hp('Regen','Wlacza tryb hamowania regeneracyjnego. Gdy aktywny i hamulec wcisniety, silnik dziala jako generator i odzyskuje energie do baterii. Hamowanie jest proporcjonalne - im mocniej hamujesz, tym wiekszy opor silnika. Wymaga prawidlowego podlaczenia czujnika hamulca.')">?</span><select id="cfg_regen"><option value="0">OFF</option><option value="1">ON</option></select><button class="bs" onclick="av('cfg:regen:','cfg_regen')">OK</button><span class="desc">Hamowanie regeneracyjne (odzyskiwanie energii)</span></div>
+<div class="cr"><label>Max step [%]</label><span class="hi" onclick="hp('Max step [%]','Maksymalna zmiana wypelnienia PWM w jednym cyklu petli sterowania. Ogranicza szybkosc zmian mocy silnika niezaleznie od rampy. Wartosc 0 = brak limitu. Typowo 3-10%. Nizsze wartosci daja plynniejsza prace ale wolniejsza reakcje na gaz.')">?</span><input id="cfg_step" type="number" min="0" max="100"><button class="bs" onclick="av('cfg:step:','cfg_step')">OK</button><span class="desc">Max zmiana duty/cykl (plynnosc rampy)</span></div>
+<div class="cr"><label>Kierunek</label><span class="hi" onclick="hp('Kierunek','Odwraca kierunek obrotow silnika. CW = zgodnie z ruchem wskazowek zegara (domyslny). CCW = przeciwnie. Jezeli silnik kreci sie w zla strone - zmien ten parametr zamiast zamieniac przewody fazowe.')">?</span><select id="cfg_rev"><option value="0">CW</option><option value="1">CCW</option></select><button class="bs" onclick="av('cfg:rev:','cfg_rev')">OK</button><span class="desc">Kierunek obrotow silnika</span></div>
+<div class="cr"><label>Offset Hall</label><span class="hi" onclick="hp('Offset Hall','Offset fazowy miedzy czujnikami Halla a sinusoidalnym sterowaniem. Wartosc kalibrowana automatycznie komenda SAT (sine auto-tune). Kazdy wpis = 3.75 stopni elektrycznych. Nieprawidlowa wartosc powoduje slabszy moment obrotowy lub wiecej halasu. Dotyczy trybow SINUS i FOC.')">?</span><select id="cfg_so"></select><button class="bs" onclick="av('so:','cfg_so')">OK</button><span class="desc">Przesuniecie fazowe Hall-sinus (kalibracja SAT)</span></div>
+<div class="cr"><label>Duty min [%]</label><span class="hi" onclick="hp('Duty min [%]','Minimalne wypelnienie PWM ponizej ktorego silnik jest calkowicie wylaczony. Eliminuje bzyczenie przy bardzo niskim duty gdy silnik nie ma dosc mocy zeby sie krecic. Typowo 5-15%. Zbyt wysoka wartosc = strata zakresu sterowania na dole.')">?</span><input id="cfg_dutymin" type="number" min="0" max="50"><button class="bs" onclick="av('cfg:dutymin:','cfg_dutymin')">OK</button><span class="desc">Ponizej tej wartosci duty=0 (strefa martwa)</span></div>
+<div class="cr"><label>Boost startu [%]</label><span class="hi" onclick="hp('Boost startu [%]','Dodatkowe duty dodawane przy ruszaniu z miejsca, maleje liniowo w miare rozpedzania. Pomaga pokonac bezwladnosc i tarcie statyczne. Wartosc 50 = +50% duty przy 0 RPM, maleje do 0% przy Boost RPM. Wartosc 0 wylacza boost. Zbyt duzy boost moze powodowac szarpniecie.')">?</span><input id="cfg_sboost" type="number" min="0" max="200"><button class="bs" onclick="av('cfg:sboost:','cfg_sboost')">OK</button><span class="desc">Dodatkowa moc przy ruszaniu (0=wyl)</span></div>
+<div class="cr"><label>Boost RPM fade</label><span class="hi" onclick="hp('Boost RPM fade','Predkosc obrotowa przy ktorej dodatkowy boost startowy calkowicie zanika. Typowo 50-150 RPM. Nizsze wartosci = krotszy boost (tylko na ruszeniu). Wyzsze = boost utrzymuje sie dluzej podczas rozpedzania.')">?</span><input id="cfg_sboostrpm" type="number" min="10" max="500"><button class="bs" onclick="av('cfg:sboostrpm:','cfg_sboostrpm')">OK</button><span class="desc">RPM przy ktorym boost zanika do zera</span></div>
+<div class="cr"><label>Min predkosc assist [km/h]</label><span class="hi" onclick="hp('Min predkosc assist [km/h]','Minimalna predkosc wspomagania odpowiadajaca najnizszemu poziomowi assist (1). Poziomy wspomagania 1-15 sa mapowane liniowo na zakres predkosci od tej wartosci do P08 (max). Np. przy 6 km/h i P08=25: assist 1=6km/h, assist 8=13km/h, assist 15=25km/h. Silnik zawsze rusza z pelna moca - limit wspomagania zaczyna dzialac dopiero po osiagnieciu tej predkosci.')">?</span><input id="cfg_aminspd" type="number" min="1" max="50"><button class="bs" onclick="av('cfg:aminspd:','cfg_aminspd')">OK</button><span class="desc">Predkosc przy assist=1. Powyzej: limitowanie wg poziomu</span></div>
+<div class="cr"><label>Align czas [ms]</label><span class="hi" onclick="hp('Align czas [ms]','Czas trwania fazy wyrownania (alignment) rotora przed rozpoczeciem normalnej komutacji. W tej fazie na uzwojenia podawany jest staly wektor magnetyczny aby rotor ustalil znana pozycje. Zbyt krotki czas = rotor nie zdazy sie ustawic. Zbyt dlugi = opoznione ruszanie. Typowo 100-300ms.')">?</span><input id="cfg_alignms" type="number" min="10" max="1000"><button class="bs" onclick="av('cfg:alignms:','cfg_alignms')">OK</button><span class="desc">Czas wyrownania rotora przed ruszeniem</span></div>
+<div class="cr"><label>Align duty [%]</label><span class="hi" onclick="hp('Align duty [%]','Moc podawana podczas fazy wyrownania jako procent maksymalnego PWM. Wieksza wartosc = silniejsze przyciaganie rotora do pozycji. 100% = pelna moc. Przy slabszych silnikach lub lzejszym obciazeniu mozna zmniejszyc. Zbyt mala wartosc = rotor moze nie ustalic pozycji.')">?</span><input id="cfg_alignduty" type="number" min="5" max="100"><button class="bs" onclick="av('cfg:alignduty:','cfg_alignduty')">OK</button><span class="desc">Moc wyrownania (% max PWM)</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">System</div><div class="dsec-b">
-<div class="cr"><label>Limit pradu [A]<span class="desc">Max prad fazowy. 0=brak limitu. P14 z display nadpisuje</span></label><input id="cfg_ilim" type="number" min="0" max="50"><button class="bs" onclick="av('cfg:ilim:','cfg_ilim')">OK</button></div>
-<div class="cr"><label>Display wymagany<span class="desc">NIE = silnik dziala bez wyswietlacza (standalone)</span></label><select id="cfg_disp"><option value="1">TAK</option><option value="0">NIE</option></select><button class="bs" onclick="av('cfg:dispreq:','cfg_disp')">OK</button></div>
-<div class="cr"><label>Thr samples<span class="desc">Probki ADC gazu w burst (filtr szumow)</span></label><input id="cfg_thrn" type="number" min="2" max="16"><button class="bs" onclick="av('cfg:thrsamp:','cfg_thrn')">OK</button></div>
-<div class="cr"><label>Thr outlier<span class="desc">Max odchylenie od mediany ADC do odrzucenia</span></label><input id="cfg_thrd" type="number" min="10" max="2000" step="10"><button class="bs" onclick="av('cfg:thrdelta:','cfg_thrd')">OK</button></div>
-<div class="cr"><label>Speed ppr<span class="desc">Impulsy czujnika SPEED na obrot kola</span></label><input id="cfg_spdppr" type="number" min="1" max="20"><button class="bs" onclick="av('spdppr:','cfg_spdppr')">OK</button></div>
-<div class="cr"><label>PWM freq [Hz]<span class="desc">Czestotliwosc PWM MOSFETow (8-32 kHz)</span></label><input id="cfg_pwm" type="number" min="8000" max="32000" step="1000"><button class="bs" onclick="av('pwmfreq:','cfg_pwm')">OK</button></div>
+<div class="cr"><label>Limit pradu [A]</label><span class="hi" onclick="hp('Limit pradu [A]','Limit pradu fazowego w amperach. Sterownik redukuje duty gdy prad przekroczy te wartosc. 0 = brak ograniczenia. Typowo 10-25A w zaleznosci od silnika i sterownika. Jezeli wyswietlacz S866 jest podlaczony, parametr P14 z wyswietlacza nadpisuje ta wartosc. Chroni silnik i sterownik przed przegrzaniem.')">?</span><input id="cfg_ilim" type="number" min="0" max="50"><button class="bs" onclick="av('cfg:ilim:','cfg_ilim')">OK</button><span class="desc">Max prad fazowy. 0=brak limitu. P14 z display nadpisuje</span></div>
+<div class="cr"><label>Display wymagany</label><span class="hi" onclick="hp('Display wymagany','Okresla czy wyswietlacz S866 jest wymagany do pracy silnika. TAK (domyslnie): silnik nie ruszy bez podlaczonego wyswietlacza - bezpieczniejsze. NIE: silnik dziala samodzielnie uzywajac parametrow fallback z konfiguracji NVS. Tryb standalone przydatny do testow lub instalacji bez wyswietlacza.')">?</span><select id="cfg_disp"><option value="1">TAK</option><option value="0">NIE</option></select><button class="bs" onclick="av('cfg:dispreq:','cfg_disp')">OK</button><span class="desc">NIE = silnik dziala bez wyswietlacza (standalone)</span></div>
+<div class="cr"><label>Thr samples</label><span class="hi" onclick="hp('Thr samples','Liczba probek ADC pobieranych w jednym odczycie manetki gazu. Wiecej probek = lepsze filtrowanie szumow ale wolniejsza reakcja. Wartosc medianowa jest brana z tych probek. Typowo 4-8. Przy zaszumionym sygnal ADC zwieksz do 12-16.')">?</span><input id="cfg_thrn" type="number" min="2" max="16"><button class="bs" onclick="av('cfg:thrsamp:','cfg_thrn')">OK</button><span class="desc">Probki ADC gazu w burst (filtr szumow)</span></div>
+<div class="cr"><label>Thr outlier</label><span class="hi" onclick="hp('Thr outlier','Prog odrzucenia outlirow w pomiarze ADC manetki gazu. Jezeli probka odbiega od mediany o wiecej niz ta wartosc, jest ignorowana. Chroni przed chwilowymi zakloceniami EMI na linii sygnalowej gazu. Typowo 100-200.')">?</span><input id="cfg_thrd" type="number" min="10" max="2000" step="10"><button class="bs" onclick="av('cfg:thrdelta:','cfg_thrd')">OK</button><span class="desc">Max odchylenie od mediany ADC do odrzucenia</span></div>
+<div class="cr"><label>Speed ppr</label><span class="hi" onclick="hp('Speed ppr','Liczba impulsow generowanych przez zewnetrzny czujnik predkosci na jeden pelny obrot kola. Wiekszose czujnikow daje 1 impuls na obrot. Jezeli czujnik ma wiele magnetow, ustaw odpowiednia wartosc. Dotyczy tylko zewnetrznego czujnika SPEED (P07 < 10).')">?</span><input id="cfg_spdppr" type="number" min="1" max="20"><button class="bs" onclick="av('spdppr:','cfg_spdppr')">OK</button><span class="desc">Impulsy czujnika SPEED na obrot kola</span></div>
+<div class="cr"><label>PWM freq [Hz]</label><span class="hi" onclick="hp('PWM freq [Hz]','Czestotliwosc przelaczania MOSFETow mocy. 20kHz (domyslnie) jest powyzej progu slyszalnosci. Nizsze wartosci (8-15kHz) = mniejsze straty przelaczania ale slyszalne piszczenie. Wyzsze (25-32kHz) = cichsza praca ale wiecej strat cieplnych na MOSFETach. Zmiana wymaga restartu.')">?</span><input id="cfg_pwm" type="number" min="8000" max="32000" step="1000"><button class="bs" onclick="av('pwmfreq:','cfg_pwm')">OK</button><span class="desc">Czestotliwosc PWM MOSFETow (8-32 kHz)</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">PAS (Pedal Assist)</div><div class="dsec-b">
-<div class="cr"><label>Start delay [ms]<span class="desc">Czas ciaglego pedalowania do aktywacji PAS</span></label><input id="cfg_pas_s" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('passtart:','cfg_pas_s')">OK</button></div>
-<div class="cr"><label>Stop delay [ms]<span class="desc">Timeout: brak impulsow = wylacz wspomaganie</span></label><input id="cfg_pas_t" type="number" min="100" max="10000" step="100"><button class="bs" onclick="av('passtop:','cfg_pas_t')">OK</button></div>
-<div class="cr"><label>Ramp [ms]<span class="desc">Czas soft-start narastania mocy PAS 0-100%</span></label><input id="cfg_pas_r" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('pasramp:','cfg_pas_r')">OK</button></div>
-<div class="cr"><label>Invert<span class="desc">Odwroc konwencje kierunku czujnika PAS</span></label><select id="cfg_pas_d"><option value="0">Normal</option><option value="1">Invert</option></select><button class="bs" onclick="pd()">OK</button></div>
-<div class="cr"><label>Debounce [us]<span class="desc">Filtr EMI: ignoruj impulsy szybsze niz X us</span></label><input id="cfg_pas_db" type="number" min="500" max="10000" step="100"><button class="bs" onclick="av('pasdbnc:','cfg_pas_db')">OK</button></div>
-<div class="cr"><label>Half-period [ms]<span class="desc">Min polokres PAS (debounce krawedzi)</span></label><input id="cfg_pas_hp" type="number" min="1" max="200"><button class="bs" onclick="av('pashalf:','cfg_pas_hp')">OK</button></div>
-<div class="cr"><label>Asymmetry [%]<span class="desc">Prog asymetrii do detekcji kierunku pedalowania</span></label><input id="cfg_pas_as" type="number" min="1" max="50"><button class="bs" onclick="av('pasasym:','cfg_pas_as')">OK</button></div>
-<div class="cr"><label>Slew rate<span class="desc">Max zmiana duty PAS na krok (plynnosc)</span></label><input id="cfg_pas_sl" type="number" min="1" max="100"><button class="bs" onclick="av('passlew:','cfg_pas_sl')">OK</button></div>
-<div class="cr"><label>Holdoff [ms]<span class="desc">Blokada cofania PAS po zmianie kierunku</span></label><input id="cfg_pas_fh" type="number" min="50" max="2000" step="50"><button class="bs" onclick="av('pashold:','cfg_pas_fh')">OK</button></div>
+<div class="cr"><label>Start delay [ms]</label><span class="hi" onclick="hp('Start delay [ms]','Czas ciaglego pedalowania do przodu wymagany do aktywacji wspomagania PAS. Zapobiega przypadkowemu wlaczeniu silnika przy krotkim dotkniÄ™ciu pedalow. Typowo 1000-3000ms. Mniejsza wartosc = szybsza aktywacja, wieksza = bezpieczniejsze ale wolniejsze.')">?</span><input id="cfg_pas_s" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('passtart:','cfg_pas_s')">OK</button><span class="desc">Czas ciaglego pedalowania do aktywacji PAS</span></div>
+<div class="cr"><label>Stop delay [ms]</label><span class="hi" onclick="hp('Stop delay [ms]','Czas od ostatniego impulsu PAS po ktorym wspomaganie zostaje wylaczone. Okresla jak szybko silnik reaguje na zaprzestanie pedalowania. Typowo 500-2000ms. Mniejsza wartosc = szybsze wylaczenie, wieksza = silnik jedziÄ™ dluzej po zaprzestaniu pedalowania.')">?</span><input id="cfg_pas_t" type="number" min="100" max="10000" step="100"><button class="bs" onclick="av('passtop:','cfg_pas_t')">OK</button><span class="desc">Timeout: brak impulsow = wylacz wspomaganie</span></div>
+<div class="cr"><label>Ramp [ms]</label><span class="hi" onclick="hp('Ramp [ms]','Czas narastania mocy PAS od 0 do 100% po aktywacji czujnika pedal-assist. Dzialanie soft-start zapobiega szarpnieciom przy wlaczeniu wspomagania. Typowo 500-2000ms. Wartosc 0 = natychmiastowe pelne wspomaganie.')">?</span><input id="cfg_pas_r" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('pasramp:','cfg_pas_r')">OK</button><span class="desc">Czas soft-start narastania mocy PAS 0-100%</span></div>
+<div class="cr"><label>Invert</label><span class="hi" onclick="hp('Invert','Odwraca interpretacje kierunku pedalowania. Jezeli system wykrywa pedalowanie do tylu gdy tak naprawde krecisz do przodu - uzyj tego parametru. Zalezy od fizycznego montazu czujnika PAS.')">?</span><select id="cfg_pas_d"><option value="0">Normal</option><option value="1">Invert</option></select><button class="bs" onclick="pd()">OK</button><span class="desc">Odwroc konwencje kierunku czujnika PAS</span></div>
+<div class="cr"><label>Debounce [us]</label><span class="hi" onclick="hp('Debounce [us]','Minimalny czas miedzy impulsami PAS w mikrosekundach. Impulsy szybsze sa ignorowane jako szum EMI. Chroni przed falszywymi odczytami spowodowanymi zakluceniami elektromagnetycznymi od silnika. Typowo 2000-5000us.')">?</span><input id="cfg_pas_db" type="number" min="500" max="10000" step="100"><button class="bs" onclick="av('pasdbnc:','cfg_pas_db')">OK</button><span class="desc">Filtr EMI: ignoruj impulsy szybsze niz X us</span></div>
+<div class="cr"><label>Half-period [ms]</label><span class="hi" onclick="hp('Half-period [ms]','Minimalny czas polowki okresu sygnalu PAS w milisekundach. Dodatkowy filtr debounce na poziomie krawedzi. Eliminuje wielokrotne zliczanie jednego przejscia magnesu. Typowo 3-10ms.')">?</span><input id="cfg_pas_hp" type="number" min="1" max="200"><button class="bs" onclick="av('pashalf:','cfg_pas_hp')">OK</button><span class="desc">Min polokres PAS (debounce krawedzi)</span></div>
+<div class="cr"><label>Asymmetry [%]</label><span class="hi" onclick="hp('Asymmetry [%]','Prog procentowy asymetrii sygnalu PAS do rozpoznania kierunku pedalowania. Czujnik PAS daje rozne czasy wznoszenia/opadania zaleznie od kierunku. Nizszy prog = wyzsze czulosc detekcji kierunku. Typowo 3-10%.')">?</span><input id="cfg_pas_as" type="number" min="1" max="50"><button class="bs" onclick="av('pasasym:','cfg_pas_as')">OK</button><span class="desc">Prog asymetrii do detekcji kierunku pedalowania</span></div>
+<div class="cr"><label>Slew rate</label><span class="hi" onclick="hp('Slew rate','Maksymalna zmiana duty PAS w jednym kroku obliczen. Ogranicza szybkosc zmian mocy od czujnika pedal-assist. Wieksza wartosc = szybsza reakcja ale mozliwe szarpniecia. Mniejsza = plynniejsze ale wolniejsze. Typowo 20-50.')">?</span><input id="cfg_pas_sl" type="number" min="1" max="100"><button class="bs" onclick="av('passlew:','cfg_pas_sl')">OK</button><span class="desc">Max zmiana duty PAS na krok (plynnosc)</span></div>
+<div class="cr"><label>Holdoff [ms]</label><span class="hi" onclick="hp('Holdoff [ms]','Czas blokady po wykryciu pedalowania do tylu, zanim system ponownie zaakceptuje kierunek forward. Zapobiega falszywym przelaczeniom kierunku spowodowanym szumem lub wahaniem pedalow. Typowo 200-500ms.')">?</span><input id="cfg_pas_fh" type="number" min="50" max="2000" step="50"><button class="bs" onclick="av('pashold:','cfg_pas_fh')">OK</button><span class="desc">Blokada cofania PAS po zmianie kierunku</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">FOC (Field Oriented Control)</div><div class="dsec-b">
-<div class="cr"><label>Kp q+d<span class="desc">Wzmocnienie proporcjonalne regulatora PI pradu</span></label><input id="cfg_fkpq" type="number" min="0" max="100" step="0.01"><button class="bs" onclick="av('fkp:','cfg_fkpq')">OK</button></div>
-<div class="cr"><label>Ki q+d<span class="desc">Wzmocnienie calkujace regulatora PI pradu</span></label><input id="cfg_fkiq" type="number" min="0" max="1000" step="0.1"><button class="bs" onclick="av('fki:','cfg_fkiq')">OK</button></div>
-<div class="cr"><label>Kp d<span class="desc">Kp osi d (odmagnesowujaca, chcemy Id=0)</span></label><input id="cfg_fkpd" type="number" min="0" max="100" step="0.01"><button class="bs" onclick="av('fkpd:','cfg_fkpd')">OK</button></div>
-<div class="cr"><label>Ki d<span class="desc">Ki osi d</span></label><input id="cfg_fkid" type="number" min="0" max="1000" step="0.1"><button class="bs" onclick="av('fkid:','cfg_fkid')">OK</button></div>
+<div class="cr"><label>Kp q+d</label><span class="hi" onclick="hp('Kp q+d','Wspolczynnik proporcjonalny (Kp) regulatora PI pradu osi q (moment obrotowy) i d (odmagnesowujaca). Wyzsze wartosci = szybsza reakcja ale mozliwe oscylacje. Kalibracja automatyczna komenda fpitune. Dotyczy tylko trybu FOC.')">?</span><input id="cfg_fkpq" type="number" min="0" max="100" step="0.01"><button class="bs" onclick="av('fkp:','cfg_fkpq')">OK</button><span class="desc">Wzmocnienie proporcjonalne regulatora PI pradu</span></div>
+<div class="cr"><label>Ki q+d</label><span class="hi" onclick="hp('Ki q+d','Wspolczynnik calkujacy (Ki) regulatora PI pradu. Odpowiada za eliminacje bledu ustalowego. Zbyt duzy Ki = oscylacje i niestabilnosc. Zbyt maly = wolna reakcja na zmiany obciazenia. Kalibracja automatyczna komenda fpitune.')">?</span><input id="cfg_fkiq" type="number" min="0" max="1000" step="0.1"><button class="bs" onclick="av('fki:','cfg_fkiq')">OK</button><span class="desc">Wzmocnienie calkujace regulatora PI pradu</span></div>
+<div class="cr"><label>Kp d</label><span class="hi" onclick="hp('Kp d','Wspolczynnik Kp osobny dla osi d (odmagnesowujacej). W trybie FOC os d sluzy do kontrolowania strumienia magnetycznego - chcemy utrzymac Id=0 (brak pradu odmagnesowujacego). Oddzielny Kp pozwala na niezalezne strojenie.')">?</span><input id="cfg_fkpd" type="number" min="0" max="100" step="0.01"><button class="bs" onclick="av('fkpd:','cfg_fkpd')">OK</button><span class="desc">Kp osi d (odmagnesowujaca, chcemy Id=0)</span></div>
+<div class="cr"><label>Ki d</label><span class="hi" onclick="hp('Ki d','Wspolczynnik Ki osobny dla osi d. Kontroluje calke bledu pradu odmagnesowujacego. Pozwala na niezalezne strojenie dynamiki osi d wzgledem osi q (momentu obrotowego).')">?</span><input id="cfg_fkid" type="number" min="0" max="1000" step="0.1"><button class="bs" onclick="av('fkid:','cfg_fkid')">OK</button><span class="desc">Ki osi d</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">EEPROM / NVS</div><div class="dsec-b">
@@ -6464,8 +6564,8 @@ const ge=id=>document.getElementById(id);
 let C={},T={};
 const hA=[],hB=[],hC=[],HM=180;
 let curTab='ride',notifTimer=0;
-const MODES=['d','B','B12','S','F'];
-const MODE_MAP={0:'d',1:'B',4:'B12',2:'S',3:'F'};
+const MODES=['d','B','B12','B24','S','F'];
+const MODE_MAP={0:'d',1:'B',4:'B12',5:'B24',2:'S',3:'F'};
 
 function showTab(t){curTab=t;document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));ge(t).classList.add('active');document.querySelectorAll('.tab-bar button').forEach(b=>b.classList.remove('active'));ge('tab_'+t).classList.add('active');}
 function tgl(el){el.classList.toggle('open');el.nextElementSibling.classList.toggle('open');}
@@ -6474,6 +6574,7 @@ function note(m,bad){const n=ge('notif');n.textContent=m;n.style.color=bad?'var(
 async function pc(cmd){const body=new URLSearchParams({cmd:String(cmd)}).toString();const r=await fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body});return r.text();}
 async function sc(cmd){try{const t=await pc(cmd);note((t||'OK')+' < '+cmd,false);await lA();}catch(e){note('Err: '+e,true);}}
 function av(pfx,id){return sc(pfx+ge(id).value);}
+function hp(t,d){ge('htit').textContent=t;ge('htxt').textContent=d;ge('hmod').classList.add('show');}
 function sa(lvl){return sc(lvl==='auto'?'assist:auto':'assist:'+lvl);}
 function pd(){sc('pasdir');}
 function sd(){const i=ge('direct_cmd');const c=i.value.trim();if(!c)return;sc(c).then(()=>i.value='');}
@@ -6604,6 +6705,7 @@ fs('cfg_fkpd',Number(C.foc_kp_d??0).toFixed(3));fs('cfg_fkid',Number(C.foc_ki_d?
 fs('fb_p06',C.fb_p06??260);fs('fb_p07',C.fb_p07??1);fs('fb_p08',C.fb_p08??25);
 fs('fb_p10',C.fb_p10??0);fs('fb_p13',C.fb_p13??12);
 fs('cfg_aminspd',C.assist_min_speed_kmh??6);
+fs('cfg_alignms',C.startup_align_ms??150);fs('cfg_alignduty',C.startup_align_duty_pct??100);
 }
 
 (()=>{const s=ge('cfg_so');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'deg)';s.appendChild(o);}})();
@@ -6617,7 +6719,8 @@ async function lA(){try{await Promise.all([lC(),lT()]);}catch(e){note('Err: '+e,
 setInterval(()=>lT().catch(e=>note('T:'+e,true)),500);
 setInterval(()=>lC().catch(e=>note('C:'+e,true)),10000);
 lA();
-</script></body></html>)bldc_html";
+</script><div id="hmod" onclick="if(event.target===this)this.classList.remove('show')"><div class="hbox"><div class="htit" id="htit"></div><div class="htxt" id="htxt"></div><button class="hclose" onclick="ge('hmod').classList.remove('show')">Zamknij</button></div></div>
+</body></html>)bldc_html";
 
 // --- Handlery HTTP ---
 
@@ -6647,7 +6750,7 @@ static void webHandleApiConfig() {
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"speed_pulses_per_rev\":%d,\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
         "\"startup_boost_pct\":%u,\"startup_boost_rpm\":%u,"
-        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,"
+        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,"
         "\"assist_override\":%d,\"queued_cmd\":\"%s\"}",
         (int)cfg.drive_mode, (int)cfg.ramp_time_ms, (int)cfg.regen_enabled,
         (int)cfg.pas_dir_invert, (int)cfg.pas_start_delay_ms,
@@ -6674,6 +6777,8 @@ static void webHandleApiConfig() {
         (unsigned)cfg.fb_drive_mode,
         (unsigned)cfg.fb_pas_magnets,
         (unsigned)cfg.assist_min_speed_kmh,
+        (unsigned)cfg.startup_align_ms,
+        (unsigned)cfg.startup_align_duty_pct,
         (int)g_web_assist_override,
         g_web_queued_cmd.c_str()
     );

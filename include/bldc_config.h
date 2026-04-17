@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  19
+#define CONFIG_VERSION  20
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -78,13 +78,15 @@ typedef struct __attribute__((packed)) {
     uint8_t         fb_drive_mode;        ///< Fallback P10: 0=PAS+gaz, 1=gaz, 2=PAS. Domyślnie 0. Komenda: dp:p10:N
     uint8_t         fb_pas_magnets;       ///< Fallback P13: magnesy PAS. 1–100, domyślnie 12. Komenda: dp:p13:N
     uint8_t         assist_min_speed_kmh; ///< Min prędkość przy najniższym assist [km/h]. 1–50, domyślnie 6. Komenda: cfg:aminspd:N
+    uint16_t        startup_align_ms;     ///< Czas wyrównania rotora [ms]. 10–1000, domyślnie 150. Komenda: cfg:alignms:N
+    uint8_t         startup_align_duty_pct; ///< Duty wyrównania [%]. 5–100, domyślnie 100. Komenda: cfg:alignduty:N
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[1];       ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[2];       ///< Padding do stałego rozmiaru (68 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)
-static_assert(sizeof(controller_config_t) == 64, "controller_config_t must be 64 bytes");
+static_assert(sizeof(controller_config_t) == 68, "controller_config_t must be 68 bytes");
 
 /**
  * @brief Inicjalizuje system konfiguracji — odczytuje NVS lub tworzy domyślne.

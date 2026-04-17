@@ -21,7 +21,8 @@ typedef enum {
     DRIVE_MODE_BLOCK,           ///< Komutacja blokowa (trapezoidalna / 6-step)
     DRIVE_MODE_SINUS,           ///< Sterowanie sinusoidalne
     DRIVE_MODE_FOC,             ///< Field Oriented Control
-    DRIVE_MODE_BLOCK12          ///< Komutacja blokowa 12-step (pół-krok między Hallami)
+    DRIVE_MODE_BLOCK12,         ///< Komutacja blokowa 12-step (pół-krok między Hallami)
+    DRIVE_MODE_BLOCK24          ///< Komutacja blokowa 24-step (4 pod-kroki z interpolacją duty)
 } drive_mode_t;
 
 /**

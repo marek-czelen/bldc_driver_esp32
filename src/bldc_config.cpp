@@ -67,6 +67,8 @@ static void config_apply_defaults() {
     g_config.fb_drive_mode        = 0;                                // Fallback P10: PAS+gaz
     g_config.fb_pas_magnets       = 12;                               // Fallback P13: 12 magnesów PAS
     g_config.assist_min_speed_kmh = 6;                                // Min prędkość przy assist=1: 6 km/h
+    g_config.startup_align_ms      = 150;                              // Czas wyrównania: 150 ms
+    g_config.startup_align_duty_pct = 100;                             // Duty wyrównania: 100%
 }
 
 void config_init() {
