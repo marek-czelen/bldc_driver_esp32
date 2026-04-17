@@ -160,9 +160,11 @@ void s866_service(s866_display_t* ctx) {
                 ctx->last_valid_ms = now;
                 if (ctx->first_valid_ms == 0) {
                     ctx->first_valid_ms = now;
+                    Serial.printf("[S866] first valid frame, starting %lu ms confirm\n", (unsigned long)S866_CONNECT_CONFIRM_MS);
                 }
                 if (!ctx->connected && (now - ctx->first_valid_ms >= S866_CONNECT_CONFIRM_MS)) {
                     ctx->connected = true;
+                    Serial.printf("[S866] CONNECTED after %lu ms continuous\n", now - ctx->first_valid_ms);
                 }
 
                 // Wyślij odpowiedź (TX params muszą być zaktualizowane wcześniej w loop)
@@ -172,6 +174,12 @@ void s866_service(s866_display_t* ctx) {
                 ctx->rx_count = 0;
             } else {
                 // ✗ Zły checksum — przesuń bufor o 1 bajt (sliding window resync)
+                static unsigned long s_last_bad_log = 0;
+                if (now - s_last_bad_log > 2000) {
+                    Serial.printf("[S866] bad checksum (got 0x%02X exp 0x%02X)\n",
+                                  ctx->rx_buf[S866_RX_FRAME_LEN - 1], expected);
+                    s_last_bad_log = now;
+                }
                 memmove(ctx->rx_buf, ctx->rx_buf + 1, S866_RX_FRAME_LEN - 1);
                 ctx->rx_count = S866_RX_FRAME_LEN - 1;
             }
@@ -187,8 +195,10 @@ void s866_service(s866_display_t* ctx) {
     if (ctx->connected && (now - ctx->last_valid_ms > S866_TIMEOUT_MS)) {
         ctx->connected = false;
         ctx->first_valid_ms = 0;
+        Serial.printf("[S866] DISCONNECTED (no valid frame for %lu ms)\n", now - ctx->last_valid_ms);
     }
     if (!ctx->connected && ctx->first_valid_ms > 0 && (now - ctx->last_valid_ms > S866_TIMEOUT_MS)) {
+        Serial.printf("[S866] confirm aborted (gap %lu ms > timeout)\n", now - ctx->last_valid_ms);
         ctx->first_valid_ms = 0;
     }
 }

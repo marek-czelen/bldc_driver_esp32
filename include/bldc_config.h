@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  18
+#define CONFIG_VERSION  19
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -77,9 +77,10 @@ typedef struct __attribute__((packed)) {
     uint8_t         fb_speed_limit;       ///< Fallback P08: limit prędkości [km/h]. 0=brak. Domyślnie 25. Komenda: dp:p08:N
     uint8_t         fb_drive_mode;        ///< Fallback P10: 0=PAS+gaz, 1=gaz, 2=PAS. Domyślnie 0. Komenda: dp:p10:N
     uint8_t         fb_pas_magnets;       ///< Fallback P13: magnesy PAS. 1–100, domyślnie 12. Komenda: dp:p13:N
+    uint8_t         assist_min_speed_kmh; ///< Min prędkość przy najniższym assist [km/h]. 1–50, domyślnie 6. Komenda: cfg:aminspd:N
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[2];       ///< Padding do stałego rozmiaru (64 - użyte bajty)
+    uint8_t         _reserved[1];       ///< Padding do stałego rozmiaru (64 - użyte bajty)
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)

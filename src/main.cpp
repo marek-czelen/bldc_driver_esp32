@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file main.cpp
  * @brief BLDC Motor Driver â€” ESP32
  * @version 2.0.0
@@ -134,7 +134,7 @@ volatile uint32_t g_sine_last_hall_ms = 0;     ///< HAL tick ostatniego przejĹ�
 volatile int8_t   g_sine_hall_phase_offset = 0; ///< Runtime-tunable Hall phase offset (-48..+48 entries, 1 entry = 3.75Â°)
 static int8_t     g_web_assist_override = -1;   ///< -1=auto(display), 0..15=override z WWW
 
-/// Startup state machine for SINUS/FOC: 0=IDLE, 1=ALIGN, 2=RUN
+/// Startup state machine: 0=IDLE, 1=ALIGN, 2=STARTING, 3=RUN
 volatile uint8_t  g_startup_state = 0;
 volatile uint32_t g_startup_align_start_us = 0; ///< Timestamp rozpoczÄ™cia alignmentu [us]
 volatile uint8_t  g_startup_align_hall = 0;     ///< Hall zapisany na poczÄ…tku alignmentu
@@ -898,18 +898,16 @@ static uint16_t getAssistMaxDuty() {
     uint8_t assist_raw = getEffectiveAssistRaw();
     if (!g_display.connected && g_web_assist_override < 0) {
         if (config_get().display_required) {
-            return 0;  // wyĹ›wietlacz wymagany ale niepodĹ‚Ä…czony â†’ silnik wyĹ‚Ä…czony
+            return 0;
         }
-        return PWM_MAX_DUTY;  // brak wyĹ›wietlacza â†’ peĹ‚na moc (standalone)
+        return PWM_MAX_DUTY;
     }
     if (assist_raw == 0) {
-        return 0;  // assist level 0 â†’ silnik wyĹ‚Ä…czony
+        return 0;
     }
-    // Raw assist_level z wyĹ›wietlacza S866 jest zawsze 0-15 (bajt 4, bity 0-3),
-    // niezaleĹĽnie od ustawienia P05 (ktĂłre definiuje ile krokĂłw widzi uĹĽytkownik).
-    uint16_t maxDuty = (uint16_t)((uint32_t)assist_raw * PWM_MAX_DUTY / 15);
-    if (maxDuty > PWM_MAX_DUTY) maxDuty = PWM_MAX_DUTY;
-    return maxDuty;
+    // Assist nie ogranicza duty - moc zawsze pelna.
+    // Ograniczenie predkosci realizuje applyGlobalSpeedLimit() + getAssistSpeedLimit().
+    return PWM_MAX_DUTY;
 }
 
 /**
@@ -952,6 +950,28 @@ static uint8_t getEffectiveCurrentLimit() {
  * @param speed_kmh Aktualna prÄ™dkoĹ›Ä‡ koĹ‚a [km/h].
  * @return Duty po limitowaniu.
  */
+// ---- Assist-based speed limiting ----
+// Poziom wspomagania mapuje sie na max dozwolona predkosc:
+//   assist=15 (max) -> P08 (max speed limit)
+//   assist=1  (min) -> assist_min_speed_kmh (konfigurowalny, domyslnie 6)
+//   assist=0         -> silnik wylaczony (obslugiwane w getAssistMaxDuty)
+// Limitowanie wspomagania dziala TYLKO w stanie RUN (state==3).
+// W stanie STARTING (state==2) silnik rusza bez limitowania - pelna moc.
+
+static float getAssistSpeedLimit() {
+    uint8_t assist_raw = getEffectiveAssistRaw();
+    uint8_t p08 = getSpeedLimitKmh();
+    if (p08 == 0 || assist_raw == 0) return 0.0f;  // 0 = brak limitu / silnik wyl
+    if (assist_raw >= 15) return (float)p08;  // max assist = max predkosc
+
+    float min_spd = (float)config_get().assist_min_speed_kmh;
+    if (min_spd < 1.0f) min_spd = 6.0f;  // safety fallback
+    float max_spd = (float)p08;
+    // Liniowa interpolacja: assist=1 -> min_spd, assist=15 -> P08
+    float spd = min_spd + ((float)assist_raw / 15.0f) * (max_spd - min_spd);
+    if (spd > max_spd) spd = max_spd;
+    return spd;
+}
 static float g_speed_limit_factor = 1.0f;           ///< EMA-filtrowany wspĂłĹ‚czynnik mocy 0..1
 #define SPEED_LIMIT_ALPHA_DOWN    0.03f              ///< EMA Î± spadek (over-speed â†’ szybka redukcja duty)
 #define SPEED_LIMIT_ALPHA_UP      0.02f              ///< EMA Î± wzrost (under-speed â†’ narastanie duty)
@@ -962,16 +982,32 @@ static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
         // Przy zerowym duty nie modyfikuj filtra â€” silnik nie jedzie
         return 0;
     }
-    uint8_t limit_kmh = getSpeedLimitKmh();
-    if (limit_kmh == 0) {
-        // P08==0: brak limitu prÄ™dkoĹ›ci â€” peĹ‚na moc bez ograniczeĹ„
-        g_speed_limit_factor = 1.0f;
-        return duty_in;
+    // STARTING->RUN: przejscie gdy predkosc >= assist_min_speed_kmh
+    if (g_startup_state == 2 && speed_kmh >= (float)config_get().assist_min_speed_kmh) {
+        g_startup_state = 3;  // RUN
     }
-    float limit_f = (float)limit_kmh;
+
+    // Efektywny limit predkosci: mniejszy z P08 i assist_speed
+    float assist_spd = getAssistSpeedLimit();
+    uint8_t p08_limit = getSpeedLimitKmh();
+    float limit_f;
+    if (g_startup_state < 3 || assist_spd <= 0.0f) {
+        // ALIGN/STARTING lub brak limitu: uzyj P08 (pelna moc, bez limitowania assist)
+        limit_f = (p08_limit > 0) ? (float)p08_limit : 0.0f;
+    } else {
+        // RUN: limituj predkosc wedlug assist level
+        limit_f = assist_spd;
+        // P08 jest twardy - nigdy nie przekraczamy
+        if (p08_limit > 0 && limit_f > (float)p08_limit) limit_f = (float)p08_limit;
+    }
 
     // Oblicz surowy wspĂłĹ‚czynnik mocy (0.0 .. 1.0)
     // Fade zaczyna siÄ™ SPEED_LIMIT_FADE_BAND_KMH km/h przed limitem (staĹ‚e okno, niezaleĹĽne od limitu)
+    if (limit_f <= 0.0f) {
+        g_speed_limit_factor = 1.0f;
+        return duty_in;
+    }
+
     float raw_factor;
     if (speed_kmh >= limit_f) {
         raw_factor = 0.0f;  // powyĹĽej limitu â†’ zero mocy
@@ -2620,8 +2656,8 @@ void loop() {
         if (g_bldc_state.phase_current[2] > maxI) maxI = g_bldc_state.phase_current[2];
         g_display.tx.current_x10 = (uint16_t)(maxI * 10.0f);
 
-        // Fallback: gdy display offline i standalone mode, uzyj NVS parametrow
-        if (!g_display.connected && !config_get().display_required) {
+        // Fallback: gdy display offline, uzyj NVS parametrow (P06/P07/P08/P10/P13)
+        if (!g_display.connected) {
             const controller_config_t& fbcfg = config_get();
             g_display.config.p06_wheel_size_x10 = fbcfg.fb_wheel_size_x10;
             g_display.config.p07_speed_magnets   = fbcfg.fb_speed_magnets;
@@ -4026,9 +4062,10 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
     uint16_t d = g_duty_isr;
 
     // — Startup alignment state machine (wszystkie tryby) —
-    // IDLE(0) -> ALIGN(1) -> RUN(2)
+    // IDLE(0) -> ALIGN(1) -> STARTING(2) -> RUN(3)
     // ALIGN: wymusza jeden krok BLOCK z narastajacym duty (150ms)
     // aby rotor ustalil pozycje przed normalna komutacja.
+    // STARTING: ruszanie az do min predkosci -> RUN (limitowanie assist)
     {
         uint32_t now_us = (uint32_t)esp_timer_get_time();
 
@@ -4074,7 +4111,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             g_dbg_commut_path = 4;  // ALIGN
             // Przejscie do RUN po uplywie czasu ALIGN
             if (elapsed_us >= (uint32_t)STARTUP_ALIGN_MS * 1000) {
-                g_startup_state = 2;  // RUN
+                g_startup_state = 2;  // STARTING
                 if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
                     resetSineTracking(hall);
                 }
@@ -5962,6 +5999,15 @@ static String executeCommand(const String& cmd) {
             }
             return "Zakres 10-500 RPM";
         }
+        if (cmd.startsWith("cfg:aminspd:")) {
+            int val = cmd.substring(12).toInt();
+            if (val >= 1 && val <= 50) {
+                cfg.assist_min_speed_kmh = (uint8_t)val;
+                config_save();
+                return "Assist min speed: " + String(val) + " km/h";
+            }
+            return "Zakres 1-50 km/h";
+        }
         return "Nieznany parametr cfg";
     }
 
@@ -6357,6 +6403,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="cr"><label>Duty min [%]<span class="desc">Ponizej tej wartosci duty=0 (strefa martwa)</span></label><input id="cfg_dutymin" type="number" min="0" max="50"><button class="bs" onclick="av('cfg:dutymin:','cfg_dutymin')">OK</button></div>
 <div class="cr"><label>Boost startu [%]<span class="desc">Dodatkowa moc przy ruszaniu (0=wyl)</span></label><input id="cfg_sboost" type="number" min="0" max="200"><button class="bs" onclick="av('cfg:sboost:','cfg_sboost')">OK</button></div>
 <div class="cr"><label>Boost RPM fade<span class="desc">RPM przy ktorym boost zanika do zera</span></label><input id="cfg_sboostrpm" type="number" min="10" max="500"><button class="bs" onclick="av('cfg:sboostrpm:','cfg_sboostrpm')">OK</button></div>
+<div class="cr"><label>Min predkosc assist [km/h]<span class="desc">Predkosc przy assist=1. Powyzej: limitowanie wg poziomu</span></label><input id="cfg_aminspd" type="number" min="1" max="50"><button class="bs" onclick="av('cfg:aminspd:','cfg_aminspd')">OK</button></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">System</div><div class="dsec-b">
@@ -6556,6 +6603,7 @@ fs('cfg_fkpq',Number(C.foc_kp_q??0).toFixed(3));fs('cfg_fkiq',Number(C.foc_ki_q?
 fs('cfg_fkpd',Number(C.foc_kp_d??0).toFixed(3));fs('cfg_fkid',Number(C.foc_ki_d??0).toFixed(3));
 fs('fb_p06',C.fb_p06??260);fs('fb_p07',C.fb_p07??1);fs('fb_p08',C.fb_p08??25);
 fs('fb_p10',C.fb_p10??0);fs('fb_p13',C.fb_p13??12);
+fs('cfg_aminspd',C.assist_min_speed_kmh??6);
 }
 
 (()=>{const s=ge('cfg_so');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'deg)';s.appendChild(o);}})();
@@ -6599,7 +6647,7 @@ static void webHandleApiConfig() {
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"speed_pulses_per_rev\":%d,\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
         "\"startup_boost_pct\":%u,\"startup_boost_rpm\":%u,"
-        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,"
+        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,"
         "\"assist_override\":%d,\"queued_cmd\":\"%s\"}",
         (int)cfg.drive_mode, (int)cfg.ramp_time_ms, (int)cfg.regen_enabled,
         (int)cfg.pas_dir_invert, (int)cfg.pas_start_delay_ms,
@@ -6625,6 +6673,7 @@ static void webHandleApiConfig() {
         (unsigned)cfg.fb_speed_limit,
         (unsigned)cfg.fb_drive_mode,
         (unsigned)cfg.fb_pas_magnets,
+        (unsigned)cfg.assist_min_speed_kmh,
         (int)g_web_assist_override,
         g_web_queued_cmd.c_str()
     );
