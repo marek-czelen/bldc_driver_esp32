@@ -69,6 +69,7 @@ static void config_apply_defaults() {
     g_config.assist_min_speed_kmh = 6;                                // Min prędkość przy assist=1: 6 km/h
     g_config.startup_align_ms      = 150;                              // Czas wyrównania: 150 ms
     g_config.startup_align_duty_pct = 100;                             // Duty wyrównania: 100%
+    g_config.run_grace_s            = 3;                               // Grace period po starcie: 3s
 }
 
 void config_init() {

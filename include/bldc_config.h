@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  20
+#define CONFIG_VERSION  21
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -80,9 +80,10 @@ typedef struct __attribute__((packed)) {
     uint8_t         assist_min_speed_kmh; ///< Min prędkość przy najniższym assist [km/h]. 1–50, domyślnie 6. Komenda: cfg:aminspd:N
     uint16_t        startup_align_ms;     ///< Czas wyrównania rotora [ms]. 10–1000, domyślnie 150. Komenda: cfg:alignms:N
     uint8_t         startup_align_duty_pct; ///< Duty wyrównania [%]. 5–100, domyślnie 100. Komenda: cfg:alignduty:N
+    uint8_t         run_grace_s;          ///< Grace period po wejściu w RUN [s]. 0–30, domyślnie 3. Komenda: cfg:grace:N
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[2];       ///< Padding do stałego rozmiaru (68 - użyte bajty)
+    uint8_t         _reserved[1];       ///< Padding do stałego rozmiaru
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru (kompilator odmówi jeśli != 64)

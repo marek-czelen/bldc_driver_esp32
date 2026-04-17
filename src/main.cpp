@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file main.cpp
  * @brief BLDC Motor Driver â€” ESP32
  * @version 2.0.0
@@ -136,6 +136,7 @@ static int8_t     g_web_assist_override = -1;   ///< -1=auto(display), 0..15=ove
 
 /// Startup state machine: 0=IDLE, 1=ALIGN, 2=STARTING, 3=RUN
 volatile uint8_t  g_startup_state = 0;
+static uint32_t   g_run_enter_ms = 0;            ///< millis() gdy wejscie w RUN (grace period)
 volatile uint16_t g_startup_align_ms = 150;     ///< ISR copy of align time [ms]
 volatile uint8_t  g_startup_align_duty = 100; ///< ISR copy of align duty [%]
 volatile uint32_t g_startup_align_start_us = 0; ///< Timestamp rozpoczÄ™cia alignmentu [us]
@@ -401,7 +402,7 @@ static inline const char* driveModeName(drive_mode_t mode) {
         case DRIVE_MODE_SINUS: return "SINUS";
         case DRIVE_MODE_FOC: return "FOC";
         case DRIVE_MODE_BLOCK12: return "BLOCK12";
-        case DRIVE_MODE_BLOCK24: return "BLOCK24";
+        case DRIVE_MODE_BLOCK24: return "BLOCK12BL";
         default: return "???";
     }
 }
@@ -988,6 +989,17 @@ static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
     // STARTING->RUN: przejscie gdy predkosc >= assist_min_speed_kmh
     if (g_startup_state == 2 && speed_kmh >= (float)config_get().assist_min_speed_kmh) {
         g_startup_state = 3;  // RUN
+        g_run_enter_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);  // zapisz timestamp
+    }
+
+    // Grace period: przez run_grace_s sekund po wejsciu w RUN nie limituj assist
+    bool in_grace = false;
+    if (g_startup_state == 3 && config_get().run_grace_s > 0) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        uint32_t grace_ms = (uint32_t)config_get().run_grace_s * 1000U;
+        if ((now_ms - g_run_enter_ms) < grace_ms) {
+            in_grace = true;
+        }
     }
 
     // Efektywny limit predkosci: mniejszy z P08 i assist_speed
@@ -996,6 +1008,9 @@ static uint16_t applyGlobalSpeedLimit(uint16_t duty_in, float speed_kmh) {
     float limit_f;
     if (g_startup_state < 3 || assist_spd <= 0.0f) {
         // ALIGN/STARTING lub brak limitu: uzyj P08 (pelna moc, bez limitowania assist)
+        limit_f = (p08_limit > 0) ? (float)p08_limit : 0.0f;
+    } else if (in_grace) {
+        // Grace period po starcie: nie limituj assist, tylko P08
         limit_f = (p08_limit > 0) ? (float)p08_limit : 0.0f;
     } else {
         // RUN: limituj predkosc wedlug assist level
@@ -1300,8 +1315,17 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     float speed_kmh = (ma_count > 0) ? (speed_sum / (float)ma_count) : 0.0f;
 
     // --- Speed ramp-down (strefa 3 km/h) ---
+    // Grace period: przez run_grace_s po wejsciu w RUN nie limituj assist w PAS
+    bool pas_in_grace = false;
+    if (g_startup_state == 3 && config_get().run_grace_s > 0) {
+        uint32_t now_grace = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        uint32_t grace_ms = (uint32_t)config_get().run_grace_s * 1000U;
+        if ((now_grace - g_run_enter_ms) < grace_ms) {
+            pas_in_grace = true;
+        }
+    }
     float speed_factor;
-    if (pas_speed_unlimited) {
+    if (pas_speed_unlimited || pas_in_grace) {
         speed_factor = 1.0f;  // P08==0: brak limitu â†’ zawsze peĹ‚na moc
     } else if (speed_kmh >= v_target) {
         speed_factor = 0.0f;
@@ -2764,7 +2788,17 @@ void loop() {
             uint32_t now_us = (uint32_t)esp_timer_get_time();
             // Timeout: jeĹ›li >2s od ostatniego przejĹ›cia Halla â†’ silnik stoi
             if (hp > 0 && hp < 2000000 && last > 0 && (now_us - last) < 2000000) {
-                wt_us = (uint32_t)hp * (uint32_t)p07;  // bez Ă—6! P07 juĹĽ zawiera 6Ă—pole_pairs
+                uint32_t raw_wt = (uint32_t)hp * (uint32_t)p07;
+                // EMA filtr na wheeltime (Hall hub motor jest szumny)
+                // alpha=0.15 (~39/256) -> ~7 probek do stabilizacji
+                static uint32_t hub_wt_ema = 0;
+                if (hub_wt_ema == 0 || raw_wt > hub_wt_ema * 3 || raw_wt < hub_wt_ema / 3) {
+                    hub_wt_ema = raw_wt;  // init lub skok >3x -> reset
+                } else {
+                    int32_t diff = (int32_t)raw_wt - (int32_t)hub_wt_ema;
+                    hub_wt_ema = (uint32_t)((int32_t)hub_wt_ema + diff * 39 / 256);
+                }
+                wt_us = hub_wt_ema;
             }
         }
 
@@ -4076,11 +4110,18 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
     {
         uint32_t now_us = (uint32_t)esp_timer_get_time();
 
-        // Reset do IDLE gdy duty=0 (manetka puszczona)
+        // Reset do IDLE gdy duty=0 I silnik faktycznie stoi.
+        // Gdy duty=0 z powodu speed limitera ale silnik jeszcze sie kreci
+        // (hall_period < 500ms = >2 RPM) -> NIE resetuj state machine,
+        // bo speed limiter zetnie duty chwilowo i silnik sam zwolni.
         if (d == 0 && g_startup_state != 0) {
-            g_startup_state = 0;
-            if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
-                resetSineTracking(hall);
+            bool motor_spinning = (g_hall_period_us > 0 && g_hall_period_us < 500000);
+            uint32_t hall_age = (uint32_t)esp_timer_get_time() - g_hall_last_change_us;
+            if (!motor_spinning || hall_age > 2000000) {
+                g_startup_state = 0;
+                if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
+                    resetSineTracking(hall);
+                }
             }
         }
 
@@ -4147,58 +4188,60 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             return;
         case DRIVE_MODE_BLOCK24:
         {
-            // 24-step: 4 pod-kroki na sektor Halla (co 15 stopni elektr.)
-            // 0-25%: biezacy stan, pelne duty
-            // 25-50%: blend biezacy->nastepny (duty spada na biezacym, rosnie na nastepnym)
-            // 50-75%: nastepny stan, pelne duty
-            // 75-100%: blend nastepny->nastepny+1
-            g_dbg_commut_path = 6;  // BLOCK24
+            // BLOCK12BL: 12-step z plynnym blendingiem duty miedzy stanami komutacji.
+            // Zamiast twardego przelaczenia faz, duty na odchodzacej fazie maleje
+            // liniowo a na przychodzacej rosnie -> gladki przebieg pradowy.
+            // Blending dziala na fazach PWM (high-side), fazy GND przelaczane progowo.
+            g_dbg_commut_path = 6;  // BLOCK12BL
             uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
             if (bh < 1 || bh > 6) { allMosfetsOff(); return; }
             uint8_t next_bh = blockHallNextCw(bh);
-            uint8_t next2_bh = blockHallNextCw(next_bh);
+            // Oblicz blend 0..255 liniowo przez caly sektor Halla (60 deg elektr.)
+            uint8_t blend = 0;
             if (g_hall_last_change_us > 0 && g_hall_period_us >= (2 * HALL_MIN_PERIOD_US)) {
                 uint32_t now_us = (uint32_t)esp_timer_get_time();
                 uint32_t dt_us = now_us - g_hall_last_change_us;
                 uint32_t period = g_hall_period_us;
                 if (dt_us < (period * 2U)) {
-                    uint32_t q1 = period >> 2;       // 25%
-                    uint32_t q2 = period >> 1;       // 50%
-                    uint32_t q3 = q1 + q2;           // 75%
-                    if (dt_us < q1) {
-                        // 0-25%: pelny biezacy stan
-                        applyBlockState(bh, d);
-                    } else if (dt_us < q2) {
-                        // 25-50%: blend bh -> next_bh
-                        uint32_t blend = ((dt_us - q1) * (uint32_t)d) / q1;
-                        uint16_t d_cur = d - (uint16_t)blend;
-                        uint16_t d_nxt = (uint16_t)blend;
-                        // Uzyj stanu z wiekszym duty
-                        if (d_cur >= d_nxt) {
-                            applyBlockState(bh, d);
-                        } else {
-                            applyBlockState(next_bh, d);
-                        }
-                    } else if (dt_us < q3) {
-                        // 50-75%: pelny nastepny stan
-                        applyBlockState(next_bh, d);
-                    } else {
-                        // 75-100%: blend next_bh -> next2_bh
-                        uint32_t blend = ((dt_us - q3) * (uint32_t)d) / q1;
-                        uint16_t d_cur = d - (uint16_t)blend;
-                        uint16_t d_nxt = (uint16_t)blend;
-                        if (d_cur >= d_nxt) {
-                            applyBlockState(next_bh, d);
-                        } else {
-                            applyBlockState(next2_bh, d);
-                        }
-                    }
-                } else {
-                    applyBlockState(bh, d);
+                    blend = (uint8_t)((dt_us * 255U) / period);
                 }
-            } else {
-                applyBlockState(bh, d);
             }
+            const uint8_t *pf = g_block_phase_tbl[bh];
+            const uint8_t *pt = g_block_phase_tbl[next_bh];
+            uint16_t dbg_d[3] = {0, 0, 0};
+            for (int ph = 0; ph < 3; ph++) {
+                uint8_t sf = pf[ph];  // stan from (0=Off,1=GND,2=PWM)
+                uint8_t st = pt[ph];  // stan to
+                if (sf == st) {
+                    // Bez zmian: utrzymaj stan
+                    if (sf == 2)      { mcpwm_phase_pwm(ph, d); dbg_d[ph] = d; }
+                    else if (sf == 1) mcpwm_phase_gnd(ph);
+                    else              mcpwm_phase_off(ph);
+                } else if (sf == 2 && st == 0) {
+                    // PWM -> OFF: duty maleje z blendem
+                    uint16_t db = (uint16_t)(((uint32_t)d * (255U - blend)) >> 8);
+                    if (db > 0) { mcpwm_phase_pwm(ph, db); dbg_d[ph] = db; }
+                    else        mcpwm_phase_off(ph);
+                } else if (sf == 0 && st == 2) {
+                    // OFF -> PWM: duty rosnie z blendem
+                    uint16_t db = (uint16_t)(((uint32_t)d * blend) >> 8);
+                    if (db > 0) { mcpwm_phase_pwm(ph, db); dbg_d[ph] = db; }
+                    else        mcpwm_phase_off(ph);
+                } else if (sf == 1 && st == 0) {
+                    // GND -> OFF: przejscie progowe w polowie
+                    if (blend < 128) mcpwm_phase_gnd(ph);
+                    else             mcpwm_phase_off(ph);
+                } else if (sf == 0 && st == 1) {
+                    // OFF -> GND: przejscie progowe w polowie
+                    if (blend < 128) mcpwm_phase_off(ph);
+                    else             mcpwm_phase_gnd(ph);
+                } else {
+                    mcpwm_phase_off(ph);
+                }
+            }
+            g_dbg_last_da = dbg_d[0];
+            g_dbg_last_db = dbg_d[1];
+            g_dbg_last_dc = dbg_d[2];
             return;
         }
         case DRIVE_MODE_BLOCK12:
@@ -5178,12 +5221,12 @@ static String executeCommand(const String& cmd) {
         g_bldc_state.fault = false;
         return "BLOCK12 ON";
     }
-    if (cmd == "B24" || cmd == "m5" || cmd == "b24" || cmd == "b24on") {
+    if (cmd == "B12BL" || cmd == "b12bl" || cmd == "B24" || cmd == "m5" || cmd == "b24" || cmd == "b24on") {
         g_mosfet_test_active = false;
         g_manual_duty_override = false;
         g_bldc_state.mode = DRIVE_MODE_BLOCK24;
         g_bldc_state.fault = false;
-        return "BLOCK24 ON";
+        return "BLOCK12BL ON";
     }
     if (cmd == "m2" || cmd == "S") {
         g_mosfet_test_active = false;
@@ -5840,7 +5883,7 @@ static String executeCommand(const String& cmd) {
             if (val >= DRIVE_MODE_BLOCK && val <= DRIVE_MODE_BLOCK24) {
                 cfg.drive_mode = (uint8_t)val;
                 config_save();
-                const char* names[] = {"OFF", "BLOCK", "SINUS", "FOC", "BLOCK12", "BLOCK24"};
+                const char* names[] = {"OFF", "BLOCK", "SINUS", "FOC", "BLOCK12", "BLOCK12BL"};
                 return String("Tryb boot: ") + names[val];
             }
             return "Bledna wartosc trybu";
@@ -6095,6 +6138,15 @@ static String executeCommand(const String& cmd) {
                 return "Align duty: " + String(val) + "%";
             }
             return "Zakres 5-100 %";
+        }
+        if (cmd.startsWith("cfg:grace:")) {
+            int val = cmd.substring(10).toInt();
+            if (val >= 0 && val <= 30) {
+                cfg.run_grace_s = (uint8_t)val;
+                config_save();
+                return "Run grace: " + String(val) + " s";
+            }
+            return "Zakres 0-30 s";
         }
         return "Nieznany parametr cfg";
     }
@@ -6409,7 +6461,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <button onclick="sm('d')">OFF</button>
 <button onclick="sm('B')">BLOCK</button>
 <button onclick="sm('B12')">BLK12</button>
-<button onclick="sm('B24')">BLK24</button>
+<button onclick="sm('B12BL')">B12BL</button>
 <button onclick="sm('S')">SINUS</button>
 <button onclick="sm('F')">FOC</button>
 </div>
@@ -6444,7 +6496,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <button class="bd br" onclick="sc('d')">&#9209; OFF</button>
 <button class="bd" onclick="sc('B')">BLOCK</button>
 <button class="bd" onclick="sc('B12')">BLOCK12</button>
-<button class="bd" onclick="sc('B24')">BLOCK24</button>
+<button class="bd" onclick="sc('B12BL')">BLOCK12BL</button>
 <button class="bd" onclick="sc('S')">SINUS</button>
 <button class="bd" onclick="sc('F')">FOC</button>
 </div>
@@ -6492,7 +6544,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">Silnik</div><div class="dsec-b">
-<div class="cr"><label>Tryb boot</label><span class="hi" onclick="hp('Tryb boot','Domyslny tryb komutacji silnika po starcie. BLOCK: prosta 6-krokowa komutacja trapezoidalna. BLOCK12: 12-krokowa z polkrokiem miedzy Hallami - plynniejsza niz BLOCK. BLOCK24: 24-krokowa z interpolacja duty - jeszcze plynniejsza. SINUS: sinusoidalne sterowanie faz. FOC: Field Oriented Control - najplynniejsze, wymaga kalibracji PI.')">?</span><select id="cfg_mode"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option><option value="4">BLOCK12</option><option value="5">BLOCK24</option></select><button class="bs" onclick="av('cfg:mode:','cfg_mode')">OK</button><span class="desc">Tryb sterowania po wlaczeniu zasilania</span></div>
+<div class="cr"><label>Tryb boot</label><span class="hi" onclick="hp('Tryb boot','Domyslny tryb komutacji silnika po starcie. BLOCK: prosta 6-krokowa komutacja trapezoidalna. BLOCK12: 12-krokowa z polkrokiem miedzy Hallami - plynniejsza niz BLOCK. BLOCK12BL: alternatywny wariant 12-krokowy o nizszym halasie (opcja 1). SINUS: sinusoidalne sterowanie faz. FOC: Field Oriented Control - najplynniejsze, wymaga kalibracji PI.')">?</span><select id="cfg_mode"><option value="1">BLOCK</option><option value="2">SINUS</option><option value="3">FOC</option><option value="4">BLOCK12</option><option value="5">BLOCK12BL</option></select><button class="bs" onclick="av('cfg:mode:','cfg_mode')">OK</button><span class="desc">Tryb sterowania po wlaczeniu zasilania</span></div>
 <div class="cr"><label>Rampa [ms]</label><span class="hi" onclick="hp('Rampa [ms]','Czas w milisekundach potrzebny na zmiane duty z 0% do 100%. Wieksza wartosc = wolniejsze, plynniejsze przyspieszanie. Mniejsza = szybsza reakcja ale mozliwe szarpniecia. Typowe wartosci: 500-2000 ms. Wartosc 0 = brak ograniczenia (natychmiastowa zmiana).')">?</span><input id="cfg_ramp" type="number" min="0" max="10000" step="100"><button class="bs" onclick="av('cfg:ramp:','cfg_ramp')">OK</button><span class="desc">Czas przyspieszania 0-100% (plynny start)</span></div>
 <div class="cr"><label>Regen</label><span class="hi" onclick="hp('Regen','Wlacza tryb hamowania regeneracyjnego. Gdy aktywny i hamulec wcisniety, silnik dziala jako generator i odzyskuje energie do baterii. Hamowanie jest proporcjonalne - im mocniej hamujesz, tym wiekszy opor silnika. Wymaga prawidlowego podlaczenia czujnika hamulca.')">?</span><select id="cfg_regen"><option value="0">OFF</option><option value="1">ON</option></select><button class="bs" onclick="av('cfg:regen:','cfg_regen')">OK</button><span class="desc">Hamowanie regeneracyjne (odzyskiwanie energii)</span></div>
 <div class="cr"><label>Max step [%]</label><span class="hi" onclick="hp('Max step [%]','Maksymalna zmiana wypelnienia PWM w jednym cyklu petli sterowania. Ogranicza szybkosc zmian mocy silnika niezaleznie od rampy. Wartosc 0 = brak limitu. Typowo 3-10%. Nizsze wartosci daja plynniejsza prace ale wolniejsza reakcje na gaz.')">?</span><input id="cfg_step" type="number" min="0" max="100"><button class="bs" onclick="av('cfg:step:','cfg_step')">OK</button><span class="desc">Max zmiana duty/cykl (plynnosc rampy)</span></div>
@@ -6504,6 +6556,7 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="cr"><label>Min predkosc assist [km/h]</label><span class="hi" onclick="hp('Min predkosc assist [km/h]','Minimalna predkosc wspomagania odpowiadajaca najnizszemu poziomowi assist (1). Poziomy wspomagania 1-15 sa mapowane liniowo na zakres predkosci od tej wartosci do P08 (max). Np. przy 6 km/h i P08=25: assist 1=6km/h, assist 8=13km/h, assist 15=25km/h. Silnik zawsze rusza z pelna moca - limit wspomagania zaczyna dzialac dopiero po osiagnieciu tej predkosci.')">?</span><input id="cfg_aminspd" type="number" min="1" max="50"><button class="bs" onclick="av('cfg:aminspd:','cfg_aminspd')">OK</button><span class="desc">Predkosc przy assist=1. Powyzej: limitowanie wg poziomu</span></div>
 <div class="cr"><label>Align czas [ms]</label><span class="hi" onclick="hp('Align czas [ms]','Czas trwania fazy wyrownania (alignment) rotora przed rozpoczeciem normalnej komutacji. W tej fazie na uzwojenia podawany jest staly wektor magnetyczny aby rotor ustalil znana pozycje. Zbyt krotki czas = rotor nie zdazy sie ustawic. Zbyt dlugi = opoznione ruszanie. Typowo 100-300ms.')">?</span><input id="cfg_alignms" type="number" min="10" max="1000"><button class="bs" onclick="av('cfg:alignms:','cfg_alignms')">OK</button><span class="desc">Czas wyrownania rotora przed ruszeniem</span></div>
 <div class="cr"><label>Align duty [%]</label><span class="hi" onclick="hp('Align duty [%]','Moc podawana podczas fazy wyrownania jako procent maksymalnego PWM. Wieksza wartosc = silniejsze przyciaganie rotora do pozycji. 100% = pelna moc. Przy slabszych silnikach lub lzejszym obciazeniu mozna zmniejszyc. Zbyt mala wartosc = rotor moze nie ustalic pozycji.')">?</span><input id="cfg_alignduty" type="number" min="5" max="100"><button class="bs" onclick="av('cfg:alignduty:','cfg_alignduty')">OK</button><span class="desc">Moc wyrownania (% max PWM)</span></div>
+<div class="cr"><label>Grace period [s]</label><span class="hi" onclick="hp('Grace period [s]','Czas po wejsciu w faze RUN, przez ktory limiter wspomagania (assist) nie ogranicza predkosci. Pozwala silnikowi rozpedzic rower po startowym kopnieciu bez natychmiastowego sciecia mocy przez niski poziom assist. Po uplywie tego czasu zaczyna dzialac normalny limit predkosci wg poziomu wspomagania. 0 = brak grace period.')">?</span><input id="cfg_grace" type="number" min="0" max="30"><button class="bs" onclick="av('cfg:grace:','cfg_grace')">OK</button><span class="desc">Czas bez limitu assist po starcie (0=wyl)</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">System</div><div class="dsec-b">
@@ -6564,8 +6617,8 @@ const ge=id=>document.getElementById(id);
 let C={},T={};
 const hA=[],hB=[],hC=[],HM=180;
 let curTab='ride',notifTimer=0;
-const MODES=['d','B','B12','B24','S','F'];
-const MODE_MAP={0:'d',1:'B',4:'B12',5:'B24',2:'S',3:'F'};
+const MODES=['d','B','B12','B12BL','S','F'];
+const MODE_MAP={0:'d',1:'B',4:'B12',5:'B12BL',2:'S',3:'F'};
 
 function showTab(t){curTab=t;document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));ge(t).classList.add('active');document.querySelectorAll('.tab-bar button').forEach(b=>b.classList.remove('active'));ge('tab_'+t).classList.add('active');}
 function tgl(el){el.classList.toggle('open');el.nextElementSibling.classList.toggle('open');}
@@ -6705,7 +6758,7 @@ fs('cfg_fkpd',Number(C.foc_kp_d??0).toFixed(3));fs('cfg_fkid',Number(C.foc_ki_d?
 fs('fb_p06',C.fb_p06??260);fs('fb_p07',C.fb_p07??1);fs('fb_p08',C.fb_p08??25);
 fs('fb_p10',C.fb_p10??0);fs('fb_p13',C.fb_p13??12);
 fs('cfg_aminspd',C.assist_min_speed_kmh??6);
-fs('cfg_alignms',C.startup_align_ms??150);fs('cfg_alignduty',C.startup_align_duty_pct??100);
+fs('cfg_alignms',C.startup_align_ms??150);fs('cfg_alignduty',C.startup_align_duty_pct??100);fs('cfg_grace',C.run_grace_s??3);
 }
 
 (()=>{const s=ge('cfg_so');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'deg)';s.appendChild(o);}})();
@@ -6750,7 +6803,7 @@ static void webHandleApiConfig() {
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"speed_pulses_per_rev\":%d,\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
         "\"startup_boost_pct\":%u,\"startup_boost_rpm\":%u,"
-        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,"
+        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,\"run_grace_s\":%u,"
         "\"assist_override\":%d,\"queued_cmd\":\"%s\"}",
         (int)cfg.drive_mode, (int)cfg.ramp_time_ms, (int)cfg.regen_enabled,
         (int)cfg.pas_dir_invert, (int)cfg.pas_start_delay_ms,
@@ -6779,6 +6832,7 @@ static void webHandleApiConfig() {
         (unsigned)cfg.assist_min_speed_kmh,
         (unsigned)cfg.startup_align_ms,
         (unsigned)cfg.startup_align_duty_pct,
+        (unsigned)cfg.run_grace_s,
         (int)g_web_assist_override,
         g_web_queued_cmd.c_str()
     );
