@@ -5987,6 +5987,19 @@ static String executeCommand(const String& cmd) {
             cfg.thr_outlier_thresh  = 150;
             cfg.speed_pulses_per_rev = 1;
             cfg.pwm_freq_hz         = 20000;
+            cfg.current_limit_a      = 15;
+            cfg.duty_min_pct         = 10;
+            cfg.startup_boost_pct    = 50;
+            cfg.startup_boost_rpm    = 80;
+            cfg.fb_wheel_size_x10    = 260;
+            cfg.fb_speed_magnets     = 1;
+            cfg.fb_speed_limit       = 25;
+            cfg.fb_drive_mode        = 0;
+            cfg.fb_pas_magnets       = 12;
+            cfg.assist_min_speed_kmh = 6;
+            cfg.startup_align_ms     = 150;
+            cfg.startup_align_duty_pct = 100;
+            cfg.run_grace_s          = 3;
             // Zastosuj do runtime
             g_bldc_state.ramp_time_ms   = cfg.ramp_time_ms;
             g_bldc_state.regen_enabled  = false;
@@ -6008,6 +6021,8 @@ static String executeCommand(const String& cmd) {
             g_foc_pi_d.ki = g_foc_pi_q.ki = FOC_KI_DEFAULT;
             g_foc_pi_d.integral = g_foc_pi_q.integral = 0.0f;
             g_foc_voltage_mode      = false;
+            g_pas_pi_integral           = 0.0f;
+            g_pas_pi_last_us            = 0;
             Serial.println("[CFG] Wartosci domyslne zaladowane do runtime (nie zapisano do EEPROM).");
             Serial.println("[CFG] Uzyj cfg:save aby zapisac do EEPROM.");
             return "";
