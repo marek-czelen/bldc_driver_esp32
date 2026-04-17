@@ -71,6 +71,8 @@ static void config_apply_defaults() {
     g_config.run_grace_s            = 3;                               // Grace period po starcie: 3s
     g_config.pas_speed_kp           = 30;                              // PI Kp: 0.30 (30/100)
     g_config.pas_speed_ki           = 5;                               // PI Ki: 0.05/s (5/100)
+    g_config.pas_hyst_off            = 2;                               // Histereza OFF: wyłącz assist powyżej v_target+2 km/h
+    g_config.pas_hyst_on             = 2;                               // Histereza ON: włącz assist poniżej v_target-2 km/h
 }
 
 void config_init() {

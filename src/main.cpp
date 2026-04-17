@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file main.cpp
  * @brief BLDC Motor Driver â€” ESP32
  * @version 2.0.0
@@ -1133,6 +1133,7 @@ static uint16_t g_pas_fwd_holdoff_ms = 300;
 // --- PI regulator limitera predkosci PAS ---
 static float g_pas_pi_integral = 0.0f;     ///< Stan calkowy PI regulatora
 static uint32_t g_pas_pi_last_us = 0;      ///< Timestamp ostatniego wywolania PI [us]
+static bool g_pas_freewheel = false;         ///< Flaga freewheel (histereza PAS)
 
 /**
  * @brief Oblicza prÄ™dkoĹ›Ä‡ koĹ‚a [km/h] z wheeltime_ms i rozmiaru koĹ‚a P06.
@@ -1186,6 +1187,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_vtarget_smooth = 0.0f;
         g_pas_pi_integral = 0.0f;
         g_pas_pi_last_us = 0;
+        g_pas_freewheel = false;
         return 0;
     }
 
@@ -1220,6 +1222,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_vtarget_smooth = 0.0f;
         g_pas_pi_integral = 0.0f;
         g_pas_pi_last_us = 0;
+        g_pas_freewheel = false;
         // Slew rate w dĂłĹ‚: Ĺ‚agodne wygaszenie zamiast twardego 0
         if (g_pas_prev_duty > g_pas_slew_rate_max) {
             g_pas_prev_duty -= g_pas_slew_rate_max;
@@ -1245,6 +1248,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_vtarget_smooth = 0.0f;
         g_pas_pi_integral = 0.0f;
         g_pas_pi_last_us = 0;
+        g_pas_freewheel = false;
         if (g_pas_prev_duty > g_pas_slew_rate_max) {
             g_pas_prev_duty -= g_pas_slew_rate_max;
             return g_pas_prev_duty;
@@ -1330,39 +1334,55 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_pi_integral = 1.0f;
         g_pas_pi_last_us = (uint32_t)esp_timer_get_time();
     } else {
-        // PI regulator: error = v_target - speed_kmh
-        // Wyjscie = wspolczynnik mocy 0..1 (1=pelna moc, 0=coast)
-        // Kp, Ki z konfiguracji (uint8_t / 100.0)
-        float kp = (float)config_get().pas_speed_kp * 0.01f;
-        float ki = (float)config_get().pas_speed_ki * 0.01f;
+        // --- Histereza freewheel PAS ---
+        // Dwa progi: hyst_off (wylacz assist powyzej v_target+hyst_off),
+        //            hyst_on  (wlacz assist ponizej v_target-hyst_on)
+        float hyst_off = (float)config_get().pas_hyst_off;
+        float hyst_on  = (float)config_get().pas_hyst_on;
 
-        uint32_t now_pi_us = (uint32_t)esp_timer_get_time();
-        float dt_s;
-        if (g_pas_pi_last_us == 0) {
-            dt_s = 0.0005f;  // fallback: 500us (2kHz loop)
-        } else {
-            uint32_t dt_us = now_pi_us - g_pas_pi_last_us;
-            if (dt_us > 100000) dt_us = 100000;  // clamp dt do 100ms (safety)
-            dt_s = (float)dt_us * 1e-6f;
+        if (!g_pas_freewheel && speed_kmh >= v_target + hyst_off) {
+            g_pas_freewheel = true;
+        } else if (g_pas_freewheel && speed_kmh < v_target - hyst_on) {
+            g_pas_freewheel = false;
         }
-        g_pas_pi_last_us = now_pi_us;
 
-        float error = v_target - speed_kmh;  // >0 = ponizej targetu, <0 = powyzej
+        if (g_pas_freewheel) {
+            // Freewheel: zeruj moc, resetuj PI integral
+            speed_factor = 0.0f;
+            g_pas_pi_integral = 0.0f;
+            g_pas_pi_last_us = (uint32_t)esp_timer_get_time();
+        } else {
+            // PI regulator: error = v_target - speed_kmh
+            // Wyjscie = wspolczynnik mocy 0..1 (1=pelna moc, 0=coast)
+            float kp = (float)config_get().pas_speed_kp * 0.01f;
+            float ki = (float)config_get().pas_speed_ki * 0.01f;
 
-        // Czlon proporcjonalny
-        float p_out = kp * error;
+            uint32_t now_pi_us = (uint32_t)esp_timer_get_time();
+            float dt_s;
+            if (g_pas_pi_last_us == 0) {
+                dt_s = 0.0005f;  // fallback: 500us (2kHz loop)
+            } else {
+                uint32_t dt_us = now_pi_us - g_pas_pi_last_us;
+                if (dt_us > 100000) dt_us = 100000;  // clamp dt do 100ms (safety)
+                dt_s = (float)dt_us * 1e-6f;
+            }
+            g_pas_pi_last_us = now_pi_us;
 
-        // Czlon calkowy z anti-windup:
-        // Calkuj tylko gdy wyjscie nie jest nasycone (lub error zmniejsza nasycenie)
-        float candidate = g_pas_pi_integral + ki * error * dt_s;
-        // Anti-windup: clamp integrala do [0, 1]
-        if (candidate > 1.0f) candidate = 1.0f;
-        if (candidate < 0.0f) candidate = 0.0f;
-        g_pas_pi_integral = candidate;
+            float error = v_target - speed_kmh;  // >0 = ponizej targetu, <0 = powyzej
 
-        speed_factor = p_out + g_pas_pi_integral;
-        if (speed_factor > 1.0f) speed_factor = 1.0f;
-        if (speed_factor < 0.0f) speed_factor = 0.0f;
+            // Czlon proporcjonalny
+            float p_out = kp * error;
+
+            // Czlon calkowy z anti-windup
+            float candidate = g_pas_pi_integral + ki * error * dt_s;
+            if (candidate > 1.0f) candidate = 1.0f;
+            if (candidate < 0.0f) candidate = 0.0f;
+            g_pas_pi_integral = candidate;
+
+            speed_factor = p_out + g_pas_pi_integral;
+            if (speed_factor > 1.0f) speed_factor = 1.0f;
+            if (speed_factor < 0.0f) speed_factor = 0.0f;
+        }
     }
     // --- Wynikowe duty (przed slew rate) ---
     float factor = soft_start_factor * speed_factor;
@@ -5979,6 +5999,8 @@ static String executeCommand(const String& cmd) {
             cfg.pas_fwd_holdoff_ms     = 300;
             cfg.pas_speed_kp          = 30;
             cfg.pas_speed_ki          = 5;
+            cfg.pas_hyst_off          = 2;
+            cfg.pas_hyst_on           = 2;
             cfg.display_required    = 1;
             cfg.thr_samples         = 8;
             cfg.thr_outlier_thresh  = 150;
@@ -6018,6 +6040,7 @@ static String executeCommand(const String& cmd) {
             g_foc_voltage_mode      = false;
             g_pas_pi_integral           = 0.0f;
             g_pas_pi_last_us            = 0;
+            g_pas_freewheel             = false;
             Serial.println("[CFG] Wartosci domyslne zaladowane do runtime (nie zapisano do EEPROM).");
             Serial.println("[CFG] Uzyj cfg:save aby zapisac do EEPROM.");
             return "";
@@ -6203,6 +6226,24 @@ static String executeCommand(const String& cmd) {
                 return "PAS speed PI Ki: " + String((float)val * 0.01f, 2) + " /s";
             }
             return "Zakres 0-255 (x0.01 /s)";
+        }
+        if (cmd.startsWith("cfg:pashystoff:")) {
+            int val = cmd.substring(15).toInt();
+            if (val >= 0 && val <= 20) {
+                cfg.pas_hyst_off = (uint8_t)val;
+                config_save();
+                return "PAS hyst OFF: " + String(val) + " km/h";
+            }
+            return "Zakres 0-20 km/h";
+        }
+        if (cmd.startsWith("cfg:pashyston:")) {
+            int val = cmd.substring(14).toInt();
+            if (val >= 0 && val <= 20) {
+                cfg.pas_hyst_on = (uint8_t)val;
+                config_save();
+                return "PAS hyst ON: " + String(val) + " km/h";
+            }
+            return "Zakres 0-20 km/h";
         }
         return "Nieznany parametr cfg";
     }
@@ -6635,6 +6676,8 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="cr"><label>Holdoff [ms]</label><span class="hi" onclick="hp('Holdoff [ms]','Czas blokady po wykryciu pedalowania do tylu, zanim system ponownie zaakceptuje kierunek forward. Zapobiega falszywym przelaczeniom kierunku spowodowanym szumem lub wahaniem pedalow. Typowo 200-500ms.')">?</span><input id="cfg_pas_fh" type="number" min="50" max="2000" step="50"><button class="bs" onclick="av('pashold:','cfg_pas_fh')">OK</button><span class="desc">Blokada cofania PAS po zmianie kierunku</span></div>
 <div class="cr"><label>PAS PI Kp (x0.01)</label><span class="hi" onclick="hp('PAS PI Kp','Czlon proporcjonalny regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01. Np. 30 = Kp=0.30. Wieksze Kp = silniejsza reakcja na blad predkosci (szybsze hamowanie przy zblianiu do limitu). Za duze = oscylacje. Typowo 20-50.')">?</span><input id="cfg_paskp" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paskp:','cfg_paskp')">OK</button><span class="desc">Proporcjonalny: 30=0.30 (wiekszy=ostrzejszy)</span></div>
 <div class="cr"><label>PAS PI Ki (x0.01/s)</label><span class="hi" onclick="hp('PAS PI Ki','Czlon calkowy regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01, jednostka /s. Np. 5 = Ki=0.05/s. Czlon calkowy eliminuje blad ustalony - utrzymuje predkosc dokladnie na targecie. Wiesze Ki = szybsza korekcja, ale za duzy = niestabilnosc. Typowo 3-15.')">?</span><input id="cfg_paski" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paski:','cfg_paski')">OK</button><span class="desc">Calkowy: 5=0.05/s (wiekszy=szybsza korekcja)</span></div>
+<div class="cr"><label>Hyst OFF [km/h]</label><span class="hi" onclick="hp('Hyst OFF','Prog wylaczenia wspomagania PAS. Gdy predkosc przekroczy v_target + hyst_off, wspomaganie zostaje wylaczone (freewheel). Wiekszy prog = pozniejsze wylaczenie. 0 = wylacz od razu przy v_target. Typowo 1-5 km/h.')">?</span><input id="cfg_hystoff" type="number" min="0" max="20"><button class="bs" onclick="av('cfg:pashystoff:','cfg_hystoff')">OK</button><span class="desc">Wylacz assist powyzej v_target + N km/h</span></div>
+<div class="cr"><label>Hyst ON [km/h]</label><span class="hi" onclick="hp('Hyst ON','Prog ponownego wlaczenia wspomagania PAS po freewheel. Gdy predkosc spadnie ponizej v_target - hyst_on, wspomaganie wlacza sie ponownie. Wiekszy prog = pozniejsze wlaczenie. 0 = wlacz od razu przy v_target. Typowo 1-5 km/h.')">?</span><input id="cfg_hyston" type="number" min="0" max="20"><button class="bs" onclick="av('cfg:pashyston:','cfg_hyston')">OK</button><span class="desc">Wlacz assist ponizej v_target - N km/h</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">FOC (Field Oriented Control)</div><div class="dsec-b">
@@ -6817,6 +6860,7 @@ fs('fb_p10',C.fb_p10??0);fs('fb_p13',C.fb_p13??12);
 fs('cfg_aminspd',C.assist_min_speed_kmh??6);
 fs('cfg_alignms',C.startup_align_ms??150);fs('cfg_alignduty',C.startup_align_duty_pct??100);fs('cfg_grace',C.run_grace_s??3);
 fs('cfg_paskp',C.pas_speed_kp??30);fs('cfg_paski',C.pas_speed_ki??5);
+fs('cfg_hystoff',C.pas_hyst_off??2);fs('cfg_hyston',C.pas_hyst_on??2);
 }
 
 (()=>{const s=ge('cfg_so');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'deg)';s.appendChild(o);}})();
@@ -6861,7 +6905,7 @@ static void webHandleApiConfig() {
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
         "\"startup_boost_pct\":%u,\"startup_boost_rpm\":%u,"
-        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,\"run_grace_s\":%u,\"pas_speed_kp\":%u,\"pas_speed_ki\":%u,"
+        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,\"run_grace_s\":%u,\"pas_speed_kp\":%u,\"pas_speed_ki\":%u,\"pas_hyst_off\":%u,\"pas_hyst_on\":%u,"
         "\"assist_override\":%d,\"queued_cmd\":\"%s\"}",
         (int)cfg.drive_mode, (int)cfg.ramp_time_ms, (int)cfg.regen_enabled,
         (int)cfg.pas_dir_invert, (int)cfg.pas_start_delay_ms,
@@ -6892,6 +6936,8 @@ static void webHandleApiConfig() {
         (unsigned)cfg.run_grace_s,
         (unsigned)cfg.pas_speed_kp,
         (unsigned)cfg.pas_speed_ki,
+        (unsigned)cfg.pas_hyst_off,
+        (unsigned)cfg.pas_hyst_on,
         (int)g_web_assist_override,
         g_web_queued_cmd.c_str()
     );

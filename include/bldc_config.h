@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  23
+#define CONFIG_VERSION  25
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -82,9 +82,8 @@ typedef struct __attribute__((packed)) {
     uint8_t         run_grace_s;          ///< Grace period po wejściu w RUN [s]. 0–30, domyślnie 3. Komenda: cfg:grace:N
     uint8_t         pas_speed_kp;         ///< PI Kp limiter prędkości PAS (×0.01). 0–255 → 0.00–2.55. Domyślnie 30 (0.30). Komenda: cfg:paskp:N
     uint8_t         pas_speed_ki;         ///< PI Ki limiter prędkości PAS (×0.01, /s). 0–255 → 0.00–2.55. Domyślnie 5 (0.05). Komenda: cfg:paski:N
-
-    // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[2];       ///< Padding do stałego rozmiaru
+    uint8_t         pas_hyst_off;         ///< Histereza OFF PAS [km/h]. Wyłącz wspomaganie gdy speed >= v_target + hyst_off. 0–20, dom. 2. Komenda: cfg:pashystoff:N
+    uint8_t         pas_hyst_on;          ///< Histereza ON PAS [km/h]. Włącz ponownie gdy speed < v_target - hyst_on. 0–20, dom. 2. Komenda: cfg:pashyston:N
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru
