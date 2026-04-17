@@ -29,7 +29,7 @@
 #define CONFIG_MAGIC    0x424C4401  // "BLD\x01"
 
 /// Wersja struktury — inkrementuj przy każdej zmianie layoutu
-#define CONFIG_VERSION  22
+#define CONFIG_VERSION  23
 
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
@@ -67,7 +67,6 @@ typedef struct __attribute__((packed)) {
     uint8_t         pas_dir_asymmetry_pct; ///< Próg asymetrii do detekcji kierunku [%]. 1–50, domyślnie 5. Komenda: pasasym:N
     uint8_t         pas_slew_rate;        ///< Max zmiana duty PAS na krok. 1–100, domyślnie 30 (~6% PWM). Komenda: passlew:N
     uint16_t        pas_fwd_holdoff_ms;   ///< Holdoff reverse PAS [ms]. 50–2000, domyślnie 300. Komenda: pashold:N
-    uint8_t         speed_pulses_per_rev; ///< Impulsy SPEED na obrót koła. 1–20, domyślnie 1. Kalibracja: spdcal
     uint16_t        pwm_freq_hz;          ///< Częstotliwość PWM [Hz]. 8000–32000, domyślnie 20000. Komenda: pwmfreq:N
     uint8_t         duty_min_pct;         ///< Min duty [%]. Poniżej → 0. 0–50, domyślnie 10. Komenda: dutymin:N
     uint8_t         startup_boost_pct;    ///< Boost duty na starcie [%]. 0–200, domyślnie 50. Komenda: cfg:sboost:N
@@ -85,7 +84,7 @@ typedef struct __attribute__((packed)) {
     uint8_t         pas_speed_ki;         ///< PI Ki limiter prędkości PAS (×0.01, /s). 0–255 → 0.00–2.55. Domyślnie 5 (0.05). Komenda: cfg:paski:N
 
     // === Rezerwa na przyszłe parametry ===
-    uint8_t         _reserved[1];       ///< Padding do stałego rozmiaru
+    uint8_t         _reserved[2];       ///< Padding do stałego rozmiaru
 } controller_config_t;
 
 // Statyczne sprawdzenie rozmiaru

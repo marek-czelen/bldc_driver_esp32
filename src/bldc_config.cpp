@@ -56,7 +56,6 @@ static void config_apply_defaults() {
     g_config.pas_dir_asymmetry_pct = 5;                               // Próg asymetrii kierunku PAS: 5%
     g_config.pas_slew_rate         = 30;                              // Slew rate PAS: 30 (~6% PWM/step)
     g_config.pas_fwd_holdoff_ms    = 300;                             // Holdoff reverse PAS: 300 ms
-    g_config.speed_pulses_per_rev  = 1;                               // Impulsy SPEED na obrót: 1 (kalibracja: spdcal)
     g_config.pwm_freq_hz           = 20000;                           // Częstotliwość PWM: 20 kHz (domyślna)
     g_config.duty_min_pct          = 10;                              // Min duty: 10% (poniżej → 0)
     g_config.startup_boost_pct     = 50;                              // Boost na starcie: +50% duty przy 0 RPM

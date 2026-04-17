@@ -268,7 +268,6 @@ static uint32_t g_speed_period_buf[3] = {0, 0, 0};
 static uint8_t  g_speed_period_idx = 0;
 static uint8_t  g_speed_period_valid = 0;  ///< Ile pomiarĂłw w buforze (0..3)
 static uint32_t g_speed_outlier_count = 0; ///< Ile pomiarĂłw odrzuconych jako outlier (>3x lub <1/3 mediany)
-static uint8_t  g_speed_pulses_per_rev = 1; ///< Impulsy SPEED na obrĂłt koĹ‚a (z NVS, kalibracja: spdcal)
 static uint32_t g_speed_last_processed_sp = 0;  ///< Ostatni przetworzony period ISR (skip duplikatĂłw)
 static uint32_t g_speed_last_accepted_us = 0;   ///< Timestamp ostatniego zaakceptowanego pomiaru do mediany
 
@@ -1570,8 +1569,6 @@ void setup() {
     g_pas_dir_min_asymmetry = cfg.pas_dir_asymmetry_pct;
     g_pas_slew_rate_max     = cfg.pas_slew_rate;
     g_pas_fwd_holdoff_ms    = cfg.pas_fwd_holdoff_ms;
-    g_speed_pulses_per_rev  = cfg.speed_pulses_per_rev;
-    if (g_speed_pulses_per_rev < 1) g_speed_pulses_per_rev = 1;
     g_reverse_isr = (cfg.motor_reverse != 0);
 
     // Inicjalizacja regulatorĂłw PI dla FOC â€” z wartoĹ›ciami zapisanymi w NVS
@@ -2090,11 +2087,11 @@ static void spdCalStep() {
         if (ppr > 20) ppr = 20;
 
         Serial.printf("[SPDCAL] Obliczony pulses_per_rev: %d (bylo: %d)\n",
-                      (int)ppr, (int)g_speed_pulses_per_rev);
+                      (int)ppr, (int)g_display.config.p07_speed_magnets);
 
         // Zastosuj i zapisz
-        g_speed_pulses_per_rev = ppr;
-        config_get().speed_pulses_per_rev = ppr;
+        g_display.config.p07_speed_magnets = ppr;
+        config_get().fb_speed_magnets = ppr;
         config_save();
 
         // Reset filtra mediany (nowe parametry â†’ czysta historia)
@@ -3626,7 +3623,7 @@ void printDiagnostics() {
             g_bldc_state.wheel_speed_kmh,
             (unsigned long)(g_speed_period_us / 1000),
             (unsigned)g_bldc_state.wheeltime_ms,
-            (int)g_speed_pulses_per_rev,
+            (int)g_display.config.p07_speed_magnets,
             (unsigned long)g_speed_pulse_count,
             (unsigned long)g_speed_reject_count,
             (unsigned long)g_speed_outlier_count,
@@ -5600,7 +5597,7 @@ static String executeCommand(const String& cmd) {
         Serial.printf("pulse_count:      %lu (accepted)\n", (unsigned long)g_speed_pulse_count);
         Serial.printf("reject_count:     %lu (debounce < %d us)\n", (unsigned long)g_speed_reject_count, SPEED_DEBOUNCE_US);
         Serial.printf("outlier_count:    %lu (outside 1/3..3x median)\n", (unsigned long)g_speed_outlier_count);
-        Serial.printf("pulses_per_rev:   %d (kalibracja: spdcal, reczne: spdppr:N)\n", (int)g_speed_pulses_per_rev);
+        Serial.printf("pulses_per_rev:   %d (kalibracja: spdcal, reczne: spdppr:N)\n", (int)g_display.config.p07_speed_magnets);
         Serial.printf("median_buf[]:     %lu, %lu, %lu us\n",
                       (unsigned long)g_speed_period_buf[0],
                       (unsigned long)g_speed_period_buf[1],
@@ -5639,8 +5636,8 @@ static String executeCommand(const String& cmd) {
     if (cmd.startsWith("spdppr:")) {
         int val = cmd.substring(7).toInt();
         if (val >= 1 && val <= 20) {
-            g_speed_pulses_per_rev = (uint8_t)val;
-            config_get().speed_pulses_per_rev = (uint8_t)val;
+            g_display.config.p07_speed_magnets = (uint8_t)val;
+            config_get().fb_speed_magnets = (uint8_t)val;
             config_save();
             g_speed_period_valid = 0;  // reset mediany
             g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
@@ -5985,7 +5982,6 @@ static String executeCommand(const String& cmd) {
             cfg.display_required    = 1;
             cfg.thr_samples         = 8;
             cfg.thr_outlier_thresh  = 150;
-            cfg.speed_pulses_per_rev = 1;
             cfg.pwm_freq_hz         = 20000;
             cfg.current_limit_a      = 15;
             cfg.duty_min_pct         = 10;
@@ -6010,7 +6006,6 @@ static String executeCommand(const String& cmd) {
             g_pas_dir_min_asymmetry     = 5;
             g_pas_slew_rate_max         = 30;
             g_pas_fwd_holdoff_ms        = 300;
-            g_speed_pulses_per_rev      = 1;
             g_speed_period_valid        = 0;
             g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
             g_speed_last_accepted_us    = 0;
@@ -6044,7 +6039,6 @@ static String executeCommand(const String& cmd) {
             cfg.pas_dir_asymmetry_pct  = g_pas_dir_min_asymmetry;
             cfg.pas_slew_rate          = (uint8_t)g_pas_slew_rate_max;
             cfg.pas_fwd_holdoff_ms     = g_pas_fwd_holdoff_ms;
-            cfg.speed_pulses_per_rev   = g_speed_pulses_per_rev;
             cfg.pwm_freq_hz            = g_pwm_freq_hz;
             // display_required nie ma runtime var â€” zapisuje siÄ™ bezpoĹ›rednio w cfg
             config_save();
@@ -6069,8 +6063,6 @@ static String executeCommand(const String& cmd) {
             g_pas_dir_min_asymmetry = c.pas_dir_asymmetry_pct;
             g_pas_slew_rate_max     = c.pas_slew_rate;
             g_pas_fwd_holdoff_ms    = c.pas_fwd_holdoff_ms;
-            g_speed_pulses_per_rev  = c.speed_pulses_per_rev;
-            if (g_speed_pulses_per_rev < 1) g_speed_pulses_per_rev = 1;
             g_speed_period_valid    = 0;  // reset mediany po reload
             g_speed_period_buf[0] = g_speed_period_buf[1] = g_speed_period_buf[2] = 0;
             g_speed_last_accepted_us = 0;
@@ -6621,8 +6613,6 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="cr"><label>Align czas [ms]</label><span class="hi" onclick="hp('Align czas [ms]','Czas trwania fazy wyrownania (alignment) rotora przed rozpoczeciem normalnej komutacji. W tej fazie na uzwojenia podawany jest staly wektor magnetyczny aby rotor ustalil znana pozycje. Zbyt krotki czas = rotor nie zdazy sie ustawic. Zbyt dlugi = opoznione ruszanie. Typowo 100-300ms.')">?</span><input id="cfg_alignms" type="number" min="10" max="1000"><button class="bs" onclick="av('cfg:alignms:','cfg_alignms')">OK</button><span class="desc">Czas wyrownania rotora przed ruszeniem</span></div>
 <div class="cr"><label>Align duty [%]</label><span class="hi" onclick="hp('Align duty [%]','Moc podawana podczas fazy wyrownania jako procent maksymalnego PWM. Wieksza wartosc = silniejsze przyciaganie rotora do pozycji. 100% = pelna moc. Przy slabszych silnikach lub lzejszym obciazeniu mozna zmniejszyc. Zbyt mala wartosc = rotor moze nie ustalic pozycji.')">?</span><input id="cfg_alignduty" type="number" min="5" max="100"><button class="bs" onclick="av('cfg:alignduty:','cfg_alignduty')">OK</button><span class="desc">Moc wyrownania (% max PWM)</span></div>
 <div class="cr"><label>Grace period [s]</label><span class="hi" onclick="hp('Grace period [s]','Czas po wejsciu w faze RUN, przez ktory limiter wspomagania (assist) nie ogranicza predkosci. Pozwala silnikowi rozpedzic rower po startowym kopnieciu bez natychmiastowego sciecia mocy przez niski poziom assist. Po uplywie tego czasu zaczyna dzialac normalny limit predkosci wg poziomu wspomagania. 0 = brak grace period.')">?</span><input id="cfg_grace" type="number" min="0" max="30"><button class="bs" onclick="av('cfg:grace:','cfg_grace')">OK</button><span class="desc">Czas bez limitu assist po starcie (0=wyl)</span></div>
-<div class="cr"><label>PAS PI Kp (x0.01)</label><span class="hi" onclick="hp('PAS PI Kp','Czlon proporcjonalny regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01. Np. 30 = Kp=0.30. Wieksze Kp = silniejsza reakcja na blad predkosci (szybsze hamowanie przy zblianiu do limitu). Za duze = oscylacje. Typowo 20-50.')">?</span><input id="cfg_paskp" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paskp:','cfg_paskp')">OK</button><span class="desc">Proporcjonalny: 30=0.30 (wiekszy=ostrzejszy)</span></div>
-<div class="cr"><label>PAS PI Ki (x0.01/s)</label><span class="hi" onclick="hp('PAS PI Ki','Czlon calkowy regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01, jednostka /s. Np. 5 = Ki=0.05/s. Czlon calkowy eliminuje blad ustalony - utrzymuje predkosc dokladnie na targecie. Wiesze Ki = szybsza korekcja, ale za duzy = niestabilnosc. Typowo 3-15.')">?</span><input id="cfg_paski" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paski:','cfg_paski')">OK</button><span class="desc">Calkowy: 5=0.05/s (wiekszy=szybsza korekcja)</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">System</div><div class="dsec-b">
@@ -6630,7 +6620,6 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="cr"><label>Display wymagany</label><span class="hi" onclick="hp('Display wymagany','Okresla czy wyswietlacz S866 jest wymagany do pracy silnika. TAK (domyslnie): silnik nie ruszy bez podlaczonego wyswietlacza - bezpieczniejsze. NIE: silnik dziala samodzielnie uzywajac parametrow fallback z konfiguracji NVS. Tryb standalone przydatny do testow lub instalacji bez wyswietlacza.')">?</span><select id="cfg_disp"><option value="1">TAK</option><option value="0">NIE</option></select><button class="bs" onclick="av('cfg:dispreq:','cfg_disp')">OK</button><span class="desc">NIE = silnik dziala bez wyswietlacza (standalone)</span></div>
 <div class="cr"><label>Thr samples</label><span class="hi" onclick="hp('Thr samples','Liczba probek ADC pobieranych w jednym odczycie manetki gazu. Wiecej probek = lepsze filtrowanie szumow ale wolniejsza reakcja. Wartosc medianowa jest brana z tych probek. Typowo 4-8. Przy zaszumionym sygnal ADC zwieksz do 12-16.')">?</span><input id="cfg_thrn" type="number" min="2" max="16"><button class="bs" onclick="av('cfg:thrsamp:','cfg_thrn')">OK</button><span class="desc">Probki ADC gazu w burst (filtr szumow)</span></div>
 <div class="cr"><label>Thr outlier</label><span class="hi" onclick="hp('Thr outlier','Prog odrzucenia outlirow w pomiarze ADC manetki gazu. Jezeli probka odbiega od mediany o wiecej niz ta wartosc, jest ignorowana. Chroni przed chwilowymi zakloceniami EMI na linii sygnalowej gazu. Typowo 100-200.')">?</span><input id="cfg_thrd" type="number" min="10" max="2000" step="10"><button class="bs" onclick="av('cfg:thrdelta:','cfg_thrd')">OK</button><span class="desc">Max odchylenie od mediany ADC do odrzucenia</span></div>
-<div class="cr"><label>Speed ppr</label><span class="hi" onclick="hp('Speed ppr','Liczba impulsow generowanych przez zewnetrzny czujnik predkosci na jeden pelny obrot kola. Wiekszose czujnikow daje 1 impuls na obrot. Jezeli czujnik ma wiele magnetow, ustaw odpowiednia wartosc. Dotyczy tylko zewnetrznego czujnika SPEED (P07 < 10).')">?</span><input id="cfg_spdppr" type="number" min="1" max="20"><button class="bs" onclick="av('spdppr:','cfg_spdppr')">OK</button><span class="desc">Impulsy czujnika SPEED na obrot kola</span></div>
 <div class="cr"><label>PWM freq [Hz]</label><span class="hi" onclick="hp('PWM freq [Hz]','Czestotliwosc przelaczania MOSFETow mocy. 20kHz (domyslnie) jest powyzej progu slyszalnosci. Nizsze wartosci (8-15kHz) = mniejsze straty przelaczania ale slyszalne piszczenie. Wyzsze (25-32kHz) = cichsza praca ale wiecej strat cieplnych na MOSFETach. Zmiana wymaga restartu.')">?</span><input id="cfg_pwm" type="number" min="8000" max="32000" step="1000"><button class="bs" onclick="av('pwmfreq:','cfg_pwm')">OK</button><span class="desc">Czestotliwosc PWM MOSFETow (8-32 kHz)</span></div>
 </div></div>
 
@@ -6644,6 +6633,8 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="cr"><label>Asymmetry [%]</label><span class="hi" onclick="hp('Asymmetry [%]','Prog procentowy asymetrii sygnalu PAS do rozpoznania kierunku pedalowania. Czujnik PAS daje rozne czasy wznoszenia/opadania zaleznie od kierunku. Nizszy prog = wyzsze czulosc detekcji kierunku. Typowo 3-10%.')">?</span><input id="cfg_pas_as" type="number" min="1" max="50"><button class="bs" onclick="av('pasasym:','cfg_pas_as')">OK</button><span class="desc">Prog asymetrii do detekcji kierunku pedalowania</span></div>
 <div class="cr"><label>Slew rate</label><span class="hi" onclick="hp('Slew rate','Maksymalna zmiana duty PAS w jednym kroku obliczen. Ogranicza szybkosc zmian mocy od czujnika pedal-assist. Wieksza wartosc = szybsza reakcja ale mozliwe szarpniecia. Mniejsza = plynniejsze ale wolniejsze. Typowo 20-50.')">?</span><input id="cfg_pas_sl" type="number" min="1" max="100"><button class="bs" onclick="av('passlew:','cfg_pas_sl')">OK</button><span class="desc">Max zmiana duty PAS na krok (plynnosc)</span></div>
 <div class="cr"><label>Holdoff [ms]</label><span class="hi" onclick="hp('Holdoff [ms]','Czas blokady po wykryciu pedalowania do tylu, zanim system ponownie zaakceptuje kierunek forward. Zapobiega falszywym przelaczeniom kierunku spowodowanym szumem lub wahaniem pedalow. Typowo 200-500ms.')">?</span><input id="cfg_pas_fh" type="number" min="50" max="2000" step="50"><button class="bs" onclick="av('pashold:','cfg_pas_fh')">OK</button><span class="desc">Blokada cofania PAS po zmianie kierunku</span></div>
+<div class="cr"><label>PAS PI Kp (x0.01)</label><span class="hi" onclick="hp('PAS PI Kp','Czlon proporcjonalny regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01. Np. 30 = Kp=0.30. Wieksze Kp = silniejsza reakcja na blad predkosci (szybsze hamowanie przy zblianiu do limitu). Za duze = oscylacje. Typowo 20-50.')">?</span><input id="cfg_paskp" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paskp:','cfg_paskp')">OK</button><span class="desc">Proporcjonalny: 30=0.30 (wiekszy=ostrzejszy)</span></div>
+<div class="cr"><label>PAS PI Ki (x0.01/s)</label><span class="hi" onclick="hp('PAS PI Ki','Czlon calkowy regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01, jednostka /s. Np. 5 = Ki=0.05/s. Czlon calkowy eliminuje blad ustalony - utrzymuje predkosc dokladnie na targecie. Wiesze Ki = szybsza korekcja, ale za duzy = niestabilnosc. Typowo 3-15.')">?</span><input id="cfg_paski" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paski:','cfg_paski')">OK</button><span class="desc">Calkowy: 5=0.05/s (wiekszy=szybsza korekcja)</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">FOC (Field Oriented Control)</div><div class="dsec-b">
@@ -6813,7 +6804,7 @@ fs('cfg_step',C.duty_max_step_pct??5);fs('cfg_rev',C.motor_reverse??0);fs('cfg_s
 fs('cfg_dutymin',C.duty_min_pct??0);fs('cfg_sboost',C.startup_boost_pct??50);fs('cfg_sboostrpm',C.startup_boost_rpm??80);
 fs('cfg_ilim',C.current_limit_a??0);fs('cfg_disp',C.display_required??1);
 fs('cfg_thrn',C.thr_samples??8);fs('cfg_thrd',C.thr_outlier_thresh??150);
-fs('cfg_spdppr',C.speed_pulses_per_rev??1);fs('cfg_pwm',C.pwm_freq_hz??20000);
+fs('cfg_pwm',C.pwm_freq_hz??20000);
 fs('cfg_pas_s',C.pas_start_delay_ms??2000);fs('cfg_pas_t',C.pas_stop_delay_ms??1000);
 fs('cfg_pas_r',C.pas_ramp_ms??1500);fs('cfg_pas_d',C.pas_dir_invert??0);
 fs('cfg_pas_db',C.pas_debounce_us??3000);fs('cfg_pas_hp',C.pas_min_halfperiod_ms??5);
@@ -6868,7 +6859,7 @@ static void webHandleApiConfig() {
         "\"display_required\":%d,"
         "\"current_limit_a\":%d,"
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
-        "\"speed_pulses_per_rev\":%d,\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
+        "\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
         "\"startup_boost_pct\":%u,\"startup_boost_rpm\":%u,"
         "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,\"run_grace_s\":%u,\"pas_speed_kp\":%u,\"pas_speed_ki\":%u,"
         "\"assist_override\":%d,\"queued_cmd\":\"%s\"}",
@@ -6886,7 +6877,6 @@ static void webHandleApiConfig() {
         (int)cfg.display_required,
         (int)cfg.current_limit_a,
         (int)cfg.thr_samples, (int)cfg.thr_outlier_thresh,
-        (int)cfg.speed_pulses_per_rev,
         (unsigned)cfg.pwm_freq_hz,
         (unsigned)cfg.duty_min_pct,
         (unsigned)cfg.startup_boost_pct,
