@@ -1131,6 +1131,10 @@ static uint16_t g_pas_slew_rate_max = 30;
 /// DomyĹ›lnie 300. Nadpisywany z NVS (pas_fwd_holdoff_ms).
 static uint16_t g_pas_fwd_holdoff_ms = 300;
 
+// --- PI regulator limitera predkosci PAS ---
+static float g_pas_pi_integral = 0.0f;     ///< Stan calkowy PI regulatora
+static uint32_t g_pas_pi_last_us = 0;      ///< Timestamp ostatniego wywolania PI [us]
+
 /**
  * @brief Oblicza prÄ™dkoĹ›Ä‡ koĹ‚a [km/h] z wheeltime_ms i rozmiaru koĹ‚a P06.
  *
@@ -1181,6 +1185,8 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_active_since_ms = 0;
         g_pas_prev_duty = 0;
         g_pas_vtarget_smooth = 0.0f;
+        g_pas_pi_integral = 0.0f;
+        g_pas_pi_last_us = 0;
         return 0;
     }
 
@@ -1213,6 +1219,8 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_fwd_since_ms = 0;
         g_pas_active_since_ms = 0;
         g_pas_vtarget_smooth = 0.0f;
+        g_pas_pi_integral = 0.0f;
+        g_pas_pi_last_us = 0;
         // Slew rate w dĂłĹ‚: Ĺ‚agodne wygaszenie zamiast twardego 0
         if (g_pas_prev_duty > g_pas_slew_rate_max) {
             g_pas_prev_duty -= g_pas_slew_rate_max;
@@ -1236,6 +1244,8 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
         g_pas_fwd_since_ms = 0;
         g_pas_active_since_ms = 0;
         g_pas_vtarget_smooth = 0.0f;
+        g_pas_pi_integral = 0.0f;
+        g_pas_pi_last_us = 0;
         if (g_pas_prev_duty > g_pas_slew_rate_max) {
             g_pas_prev_duty -= g_pas_slew_rate_max;
             return g_pas_prev_duty;
@@ -1303,7 +1313,7 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
     for (uint8_t i = 0; i < ma_count; i++) speed_sum += g_pas_speed_ma_buf[i];
     float speed_kmh = (ma_count > 0) ? (speed_sum / (float)ma_count) : 0.0f;
 
-    // --- Speed ramp-down (strefa 3 km/h) ---
+    // --- PI regulator limitera predkosci PAS ---
     // Grace period: przez run_grace_s po wejsciu w RUN nie limituj assist w PAS
     bool pas_in_grace = false;
     if (g_startup_state == 3 && config_get().run_grace_s > 0) {
@@ -1313,18 +1323,48 @@ static uint16_t calculatePasDuty(uint16_t maxDuty) {
             pas_in_grace = true;
         }
     }
+
     float speed_factor;
     if (pas_speed_unlimited || pas_in_grace) {
-        speed_factor = 1.0f;  // P08==0: brak limitu â†’ zawsze peĹ‚na moc
-    } else if (speed_kmh >= v_target) {
-        speed_factor = 0.0f;
-    } else if (speed_kmh > v_target - 3.0f) {
-        // Liniowa redukcja: v_target-3 = 100%, v_target = 0%
-        speed_factor = (v_target - speed_kmh) / 3.0f;
-    } else {
         speed_factor = 1.0f;
-    }
+        // Reset PI gdy brak limitu (zapobiega akumulacji integrala)
+        g_pas_pi_integral = 1.0f;
+        g_pas_pi_last_us = (uint32_t)esp_timer_get_time();
+    } else {
+        // PI regulator: error = v_target - speed_kmh
+        // Wyjscie = wspolczynnik mocy 0..1 (1=pelna moc, 0=coast)
+        // Kp, Ki z konfiguracji (uint8_t / 100.0)
+        float kp = (float)config_get().pas_speed_kp * 0.01f;
+        float ki = (float)config_get().pas_speed_ki * 0.01f;
 
+        uint32_t now_pi_us = (uint32_t)esp_timer_get_time();
+        float dt_s;
+        if (g_pas_pi_last_us == 0) {
+            dt_s = 0.0005f;  // fallback: 500us (2kHz loop)
+        } else {
+            uint32_t dt_us = now_pi_us - g_pas_pi_last_us;
+            if (dt_us > 100000) dt_us = 100000;  // clamp dt do 100ms (safety)
+            dt_s = (float)dt_us * 1e-6f;
+        }
+        g_pas_pi_last_us = now_pi_us;
+
+        float error = v_target - speed_kmh;  // >0 = ponizej targetu, <0 = powyzej
+
+        // Czlon proporcjonalny
+        float p_out = kp * error;
+
+        // Czlon calkowy z anti-windup:
+        // Calkuj tylko gdy wyjscie nie jest nasycone (lub error zmniejsza nasycenie)
+        float candidate = g_pas_pi_integral + ki * error * dt_s;
+        // Anti-windup: clamp integrala do [0, 1]
+        if (candidate > 1.0f) candidate = 1.0f;
+        if (candidate < 0.0f) candidate = 0.0f;
+        g_pas_pi_integral = candidate;
+
+        speed_factor = p_out + g_pas_pi_integral;
+        if (speed_factor > 1.0f) speed_factor = 1.0f;
+        if (speed_factor < 0.0f) speed_factor = 0.0f;
+    }
     // --- Wynikowe duty (przed slew rate) ---
     float factor = soft_start_factor * speed_factor;
     if (factor < 0.0f) factor = 0.0f;
@@ -5940,6 +5980,8 @@ static String executeCommand(const String& cmd) {
             cfg.pas_dir_asymmetry_pct  = 5;
             cfg.pas_slew_rate          = 30;
             cfg.pas_fwd_holdoff_ms     = 300;
+            cfg.pas_speed_kp          = 30;
+            cfg.pas_speed_ki          = 5;
             cfg.display_required    = 1;
             cfg.thr_samples         = 8;
             cfg.thr_outlier_thresh  = 150;
@@ -6136,6 +6178,24 @@ static String executeCommand(const String& cmd) {
                 return "Run grace: " + String(val) + " s";
             }
             return "Zakres 0-30 s";
+        }
+        if (cmd.startsWith("cfg:paskp:")) {
+            int val = cmd.substring(10).toInt();
+            if (val >= 0 && val <= 255) {
+                cfg.pas_speed_kp = (uint8_t)val;
+                config_save();
+                return "PAS speed PI Kp: " + String((float)val * 0.01f, 2);
+            }
+            return "Zakres 0-255 (x0.01)";
+        }
+        if (cmd.startsWith("cfg:paski:")) {
+            int val = cmd.substring(10).toInt();
+            if (val >= 0 && val <= 255) {
+                cfg.pas_speed_ki = (uint8_t)val;
+                config_save();
+                return "PAS speed PI Ki: " + String((float)val * 0.01f, 2) + " /s";
+            }
+            return "Zakres 0-255 (x0.01 /s)";
         }
         return "Nieznany parametr cfg";
     }
@@ -6546,6 +6606,8 @@ static const char BLDC_WEB_HTML[] PROGMEM = R"bldc_html(<!DOCTYPE html><html lan
 <div class="cr"><label>Align czas [ms]</label><span class="hi" onclick="hp('Align czas [ms]','Czas trwania fazy wyrownania (alignment) rotora przed rozpoczeciem normalnej komutacji. W tej fazie na uzwojenia podawany jest staly wektor magnetyczny aby rotor ustalil znana pozycje. Zbyt krotki czas = rotor nie zdazy sie ustawic. Zbyt dlugi = opoznione ruszanie. Typowo 100-300ms.')">?</span><input id="cfg_alignms" type="number" min="10" max="1000"><button class="bs" onclick="av('cfg:alignms:','cfg_alignms')">OK</button><span class="desc">Czas wyrownania rotora przed ruszeniem</span></div>
 <div class="cr"><label>Align duty [%]</label><span class="hi" onclick="hp('Align duty [%]','Moc podawana podczas fazy wyrownania jako procent maksymalnego PWM. Wieksza wartosc = silniejsze przyciaganie rotora do pozycji. 100% = pelna moc. Przy slabszych silnikach lub lzejszym obciazeniu mozna zmniejszyc. Zbyt mala wartosc = rotor moze nie ustalic pozycji.')">?</span><input id="cfg_alignduty" type="number" min="5" max="100"><button class="bs" onclick="av('cfg:alignduty:','cfg_alignduty')">OK</button><span class="desc">Moc wyrownania (% max PWM)</span></div>
 <div class="cr"><label>Grace period [s]</label><span class="hi" onclick="hp('Grace period [s]','Czas po wejsciu w faze RUN, przez ktory limiter wspomagania (assist) nie ogranicza predkosci. Pozwala silnikowi rozpedzic rower po startowym kopnieciu bez natychmiastowego sciecia mocy przez niski poziom assist. Po uplywie tego czasu zaczyna dzialac normalny limit predkosci wg poziomu wspomagania. 0 = brak grace period.')">?</span><input id="cfg_grace" type="number" min="0" max="30"><button class="bs" onclick="av('cfg:grace:','cfg_grace')">OK</button><span class="desc">Czas bez limitu assist po starcie (0=wyl)</span></div>
+<div class="cr"><label>PAS PI Kp (x0.01)</label><span class="hi" onclick="hp('PAS PI Kp','Czlon proporcjonalny regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01. Np. 30 = Kp=0.30. Wieksze Kp = silniejsza reakcja na blad predkosci (szybsze hamowanie przy zblianiu do limitu). Za duze = oscylacje. Typowo 20-50.')">?</span><input id="cfg_paskp" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paskp:','cfg_paskp')">OK</button><span class="desc">Proporcjonalny: 30=0.30 (wiekszy=ostrzejszy)</span></div>
+<div class="cr"><label>PAS PI Ki (x0.01/s)</label><span class="hi" onclick="hp('PAS PI Ki','Czlon calkowy regulatora PI limitera predkosci PAS. Wartosc przechowywana jako uint8 (0-255), mnoznik x0.01, jednostka /s. Np. 5 = Ki=0.05/s. Czlon calkowy eliminuje blad ustalony - utrzymuje predkosc dokladnie na targecie. Wiesze Ki = szybsza korekcja, ale za duzy = niestabilnosc. Typowo 3-15.')">?</span><input id="cfg_paski" type="number" min="0" max="255"><button class="bs" onclick="av('cfg:paski:','cfg_paski')">OK</button><span class="desc">Calkowy: 5=0.05/s (wiekszy=szybsza korekcja)</span></div>
 </div></div>
 
 <div class="dsec"><div class="dsec-h" onclick="tgl(this)">System</div><div class="dsec-b">
@@ -6748,6 +6810,7 @@ fs('fb_p06',C.fb_p06??260);fs('fb_p07',C.fb_p07??1);fs('fb_p08',C.fb_p08??25);
 fs('fb_p10',C.fb_p10??0);fs('fb_p13',C.fb_p13??12);
 fs('cfg_aminspd',C.assist_min_speed_kmh??6);
 fs('cfg_alignms',C.startup_align_ms??150);fs('cfg_alignduty',C.startup_align_duty_pct??100);fs('cfg_grace',C.run_grace_s??3);
+fs('cfg_paskp',C.pas_speed_kp??30);fs('cfg_paski',C.pas_speed_ki??5);
 }
 
 (()=>{const s=ge('cfg_so');for(let i=-48;i<=48;i+=2){const o=document.createElement('option');o.value=i;o.textContent=i+' ('+(i*3.75).toFixed(1)+'deg)';s.appendChild(o);}})();
@@ -6792,7 +6855,7 @@ static void webHandleApiConfig() {
         "\"thr_samples\":%d,\"thr_outlier_thresh\":%d,"
         "\"speed_pulses_per_rev\":%d,\"pwm_freq_hz\":%u,\"duty_min_pct\":%u,"
         "\"startup_boost_pct\":%u,\"startup_boost_rpm\":%u,"
-        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,\"run_grace_s\":%u,"
+        "\"fb_p06\":%u,\"fb_p07\":%u,\"fb_p08\":%u,\"fb_p10\":%u,\"fb_p13\":%u,\"assist_min_speed_kmh\":%u,\"startup_align_ms\":%u,\"startup_align_duty_pct\":%u,\"run_grace_s\":%u,\"pas_speed_kp\":%u,\"pas_speed_ki\":%u,"
         "\"assist_override\":%d,\"queued_cmd\":\"%s\"}",
         (int)cfg.drive_mode, (int)cfg.ramp_time_ms, (int)cfg.regen_enabled,
         (int)cfg.pas_dir_invert, (int)cfg.pas_start_delay_ms,
@@ -6822,6 +6885,8 @@ static void webHandleApiConfig() {
         (unsigned)cfg.startup_align_ms,
         (unsigned)cfg.startup_align_duty_pct,
         (unsigned)cfg.run_grace_s,
+        (unsigned)cfg.pas_speed_kp,
+        (unsigned)cfg.pas_speed_ki,
         (int)g_web_assist_override,
         g_web_queued_cmd.c_str()
     );

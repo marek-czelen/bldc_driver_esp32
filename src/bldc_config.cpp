@@ -70,6 +70,8 @@ static void config_apply_defaults() {
     g_config.startup_align_ms      = 150;                              // Czas wyrównania: 150 ms
     g_config.startup_align_duty_pct = 100;                             // Duty wyrównania: 100%
     g_config.run_grace_s            = 3;                               // Grace period po starcie: 3s
+    g_config.pas_speed_kp           = 30;                              // PI Kp: 0.30 (30/100)
+    g_config.pas_speed_ki           = 5;                               // PI Ki: 0.05/s (5/100)
 }
 
 void config_init() {
