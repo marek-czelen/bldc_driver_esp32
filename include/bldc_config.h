@@ -34,7 +34,7 @@
 /**
  * @brief Struktura konfiguracji sterownika — persystowana w NVS.
  *
- * Rozmiar jest stały (64 bajty) dzięki polu `_reserved[]`.
+ * Rozmiar jest stały (70 bajtów).
  * Przy dodawaniu nowych pól zmniejsz `_reserved` i zwiększ `CONFIG_VERSION`.
  */
 typedef struct __attribute__((packed)) {

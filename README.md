@@ -1,10 +1,10 @@
 # BLDC Motor Driver — ESP32
 
-**Wersja firmware: 2.0.0** | CONFIG_VERSION: 16 | PlatformIO espressif32
+**Wersja firmware: 2.1.0** | CONFIG_VERSION: 25 | PlatformIO espressif32
 
 Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
-Obsługiwane metody sterowania: **komutacja blokowa (6-step / trapezoidalna)**, **komutacja sinusoidalna** oraz **FOC (Field Oriented Control)**.  
-Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-startem i regulacją prędkości docelowej.  
+Obsługiwane metody sterowania: **komutacja blokowa (6-step)**, **blokowa 12-step**, **blokowa 12-step z duty blending (BLOCK12BL)**, **sinusoidalna** oraz **FOC (Field Oriented Control)**.  
+Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-startem, regulatorem PI prędkości docelowej i dwuprogową histerezą freewheel.  
 Konfiguracja przez **Serial 115200 baud** oraz **WiFi AP** (responsywny interfejs webowy).
 
 ---
@@ -178,7 +178,7 @@ platformio.ini      — konfiguracja PlatformIO (platforma, prędkość, partycj
 include/
   pinout.h          — wszystkie definicje GPIO, stałe MCPWM (frequency, period, duty)
   bldc_types.h      — typy danych, struktury, enumeracje
-  bldc_config.h     — konfiguracja NVS (controller_config_t, CONFIG_VERSION=16)
+  bldc_config.h     — konfiguracja NVS (controller_config_t, CONFIG_VERSION=25, 70 bajtów)
   display_s866.h    — definicje protokołu wyświetlacza S866, struktury ramek
 src/
   main.cpp          — cała logika aplikacji (komutacja MCPWM, regen, pomiar prędkości/mocy)
@@ -231,7 +231,7 @@ onCommutationTimer() [ISR, 20 kHz = co 50 µs]
   ├── hamulec aktywny + regen → regenCommutateISR()
   ├── hamulec aktywny bez regen → allMosfetsOff() (coast)
   ├── sprawdzenie g_motor_enabled
-  ├── dispatch trybu sterowania (g_mode_isr → BLOCK / SINUS / FOC)
+  ├── dispatch trybu sterowania (g_mode_isr → BLOCK / BLOCK12 / BLOCK12BL / SINUS / FOC)
   └── ustawienie 3 operatorów MCPWM (gen_force + compare) zgodnie z trybem
 ```
 
@@ -245,7 +245,7 @@ Zmienne współdzielone między `loop()` a `onCommutationTimer()` są `volatile`
 - `g_duty_isr` — aktualne wypełnienie PWM
 - `g_motor_enabled` — czy silnik ma się kręcić
 - `g_brake_isr` — czy hamulec aktywny
-- `g_mode_isr` — aktualny tryb sterowania (BLOCK/SINUS/FOC/DISABLED)
+- `g_mode_isr` — aktualny tryb sterowania (DISABLED/BLOCK/SINUS/FOC/BLOCK12/BLOCK12BL)
 
 ---
 
@@ -298,6 +298,20 @@ Jeśli kolejne przejście Halla nastąpi przed końcem crossfade, nowe przejści
 | `BLOCK_CROSS_TICKS` | 8 | Tiki ISR crossfade (8 × 50 µs = 400 µs) |
 
 > **Strojenie:** Przy wolnych obrotach można zwiększyć (12–16 = 600–800 µs) dla jeszcze cichszej pracy. Przy szybkich obrotach zmniejszyć (4–6 = 200–300 µs) — crossfade nie powinien trwać dłużej niż ~30% okresu Halla.
+
+### Tryby komutacji blokowej — porównanie
+
+| Tryb | Enum | Opis | Gest. w ISR |
+|------|------|------|-------------|
+| BLOCK (6-step) | `DRIVE_MODE_BLOCK` (1) | Klasyczna 6-krokowa z crossfade | Przejście co zmianę Halla |
+| BLOCK12 (12-step) | `DRIVE_MODE_BLOCK12` (4) | Pół-krok między stanami Halla (interpolacja pozycji) | 12 przejść na obrót elektr. |
+| BLOCK12BL (12-step + blending) | `DRIVE_MODE_BLOCK24` (5) | 12-step z płynnym crossfade duty między krokami | Najcichsza praca blokowa |
+
+**BLOCK12** dzieli każdy 60° sektor Halla na dwa pod-sektory po 30°. W połowie sektora ISR przełącza na dodatkowy krok interpolacyjny, zmniejszając pulsacje momentu.
+
+**BLOCK12BL** (enum: BLOCK24) rozszerza tryb 12-step o płynny blending duty — w obrębie każdego pod-sektora ISR interpoluje liniowo duty między aktualnym a następnym wektorem komutacji (współczynnik blend 0–255). Daje najgładszy moment obrotowy wśród trybów blokowych, zbliżony do sinusa, przy znacznie mniejszym koszcie obliczeniowym niż FOC.
+
+Komenda wyboru trybu: `m4` / `b12` (BLOCK12), `m5` / `b12bl` / `b24` (BLOCK12BL), lub `cfg:mode:4` / `cfg:mode:5`.
 
 ### PWM — MCPWM center-aligned
 
@@ -1026,15 +1040,27 @@ Stany:
    | L4 | 12 | 21.2 km/h |
    | L5 | 15 | 25.0 km/h |
 
-3. **Speed ramp-down** (strefa 3 km/h):
-   - `v_curr < V_target − 3` → pełna moc (100%)
-   - `v_curr ∈ [V_target−3, V_target]` → liniowa redukcja 100%→0%
-   - `v_curr ≥ V_target` → duty = 0
+3. **PI regulator prędkości docelowej** (zamiast liniowej rampy):
+   - `error = V_target − speed_kmh` (>0 = poniżej targetu)
+   - `P = Kp × error` (człon proporcjonalny)
+   - `I += Ki × error × dt` (człon całkowy z anti-windup: clamp do [0, 1])
+   - `speed_factor = clamp(P + I, 0, 1)` — współczynnik mocy
+   - Parametry: `pas_speed_kp` (×0.01, dom. 30=0.30), `pas_speed_ki` (×0.01/s, dom. 5=0.05)
+   - PI reset na: timeout PAS, reverse, assist=0
 
-4. **Slew rate limiter:** duty zmienia się max ±30 PWM na wywołanie (~6% z 500).
+4. **Dwuprogowa histereza freewheel:**
+   - Wejście w freewheel: `speed_kmh ≥ V_target + hyst_off` → duty = 0 (allMosfetsOff = wysoka impedancja)
+   - Wyjście z freewheel: `speed_kmh < V_target − hyst_on` → PI włączony
+   - Parametry: `pas_hyst_off` (dom. 2 km/h), `pas_hyst_on` (dom. 2 km/h)
+   - Zapobiega oscylacjom włącz/wyłącz wokół limitu prędkości
+
+5. **Grace period** (`run_grace_s`, dom. 3s): przez N sekund po wejściu w stan RUN
+   PI nie limituje prędkości — pełna moc na rozruch.
+
+6. **Slew rate limiter:** duty zmienia się max ±30 PWM na wywołanie (~6% z 500).
    Przy ~2 kHz pętli = max ~60%/s. Zapobiega skokom duty.
 
-5. **Globalny limit P08:** stosowany osobno przez `applyGlobalSpeedLimit()` (dotyczy też manetki).
+7. **Globalny limit P08:** stosowany osobno przez `applyGlobalSpeedLimit()` (dotyczy też manetki).
 
 ### Filtracja prędkości (Moving Average)
 
@@ -1103,6 +1129,14 @@ Jeśli ostatni zmierzony **okres** jest dłuższy niż stop_delay — to nie jes
 | `pas_stop_delay_ms` | 1000 | `passtop:N` | Timeout braku impulsów PAS → wyłącz wspomaganie [ms] |
 | `pas_ramp_ms` | 1500 | `pasramp:N` | Soft-start: czas narastania mocy 0→100% [ms] |
 | `pas_debounce_us` | 3000 | `pasdbnc:N` | Czas potwierdzenia stanu PAS [µs]. N=debounce/500 próbek filtra |
+| `pas_min_halfperiod_ms` | 5 | `pashalf:N` | Min półokres PAS [ms] (debounce krawędzi). 1–200 |
+| `pas_dir_asymmetry_pct` | 5 | `pasasym:N` | Próg asymetrii do detekcji kierunku [%]. 1–50 |
+| `pas_slew_rate` | 30 | `passlew:N` | Max zmiana duty PAS na krok. 1–100 (~6% PWM) |
+| `pas_fwd_holdoff_ms` | 300 | `pashold:N` | Holdoff reverse PAS [ms]. 50–2000 |
+| `pas_speed_kp` | 30 | `cfg:paskp:N` | PI Kp limitera prędkości (×0.01). 0–255 → 0.00–2.55 |
+| `pas_speed_ki` | 5 | `cfg:paski:N` | PI Ki limitera prędkości (×0.01/s). 0–255 → 0.00–2.55 |
+| `pas_hyst_off` | 2 | `cfg:pashystoff:N` | Histereza OFF [km/h]: wyłącz assist gdy speed ≥ V_target + N. 0–20 |
+| `pas_hyst_on` | 2 | `cfg:pashyston:N` | Histereza ON [km/h]: włącz assist gdy speed < V_target − N. 0–20 |
 
 ### Diagnostyka
 
@@ -1178,6 +1212,8 @@ P13 magnets:      12
 | `e`             | Włącz silnik — tryb BLOCK |
 | `S`             | Włącz silnik — tryb SINUS |
 | `m2` Enter      | Włącz silnik — tryb SINUS (alternatywna) |
+| `m4` Enter      | Włącz silnik — tryb BLOCK12 (12-step) |
+| `m5` Enter      | Włącz silnik — tryb BLOCK12BL (12-step + duty blending) |
 | `d`             | Wyłącz silnik, duty = 0 |
 | `+`             | Zwiększ duty o 5% |
 | `-`             | Zmniejsz duty o 5% |
@@ -1221,17 +1257,40 @@ P13 magnets:      12
 | `passtart:N`   | Ustaw opóźnienie startu PAS 0-10000 ms (zapis NVS) |
 | `passtop:N`    | Ustaw timeout PAS 100-10000 ms (zapis NVS) |
 | `pasramp:N`    | Ustaw czas soft-start PAS 0-10000 ms (zapis NVS) |
+| `pasdbnc:N`    | Debounce PAS 500-10000 µs (zapis NVS) |
+| `pashalf:N`    | Min półokres PAS 1-200 ms (zapis NVS) |
+| `pasasym:N`    | Próg asymetrii kierunku 1-50% (zapis NVS) |
+| `passlew:N`    | Slew rate PAS 1-100 (zapis NVS) |
+| `pashold:N`    | Forward holdoff reverse 50-2000 ms (zapis NVS) |
 | `pasdbg`       | Wyświetl pełną diagnostykę PAS (jednorazowo) |
 | **Konfiguracja NVS** | |
 | `cfg`          | Pokaż konfigurację NVS + runtime |
-| `cfg:mode:N` Enter | Tryb boot: 1=BLOCK, 2=SINUS, 3=FOC (zapis NVS) |
+| `cfg:mode:N` Enter | Tryb boot: 0=OFF, 1=BLOCK, 2=SINUS, 3=FOC, 4=BLOCK12, 5=BLOCK12BL (zapis NVS) |
 | `cfg:ramp:N` Enter | Czas rampy 0-10000 ms (zapis NVS + natychmiast runtime) |
 | `cfg:regen:N` Enter | Regeneracja boot: 0=OFF, 1=ON (zapis NVS + natychmiast runtime) |
 | `cfg:rev:N` Enter | Kierunek obrotów: 0=CW, 1=CCW (zapis NVS + natychmiast runtime) |
 | `cfg:step:N` Enter | Max zmiana duty na krok: 0-100% (0=brak limitu, zapis NVS) |
-| `cfg:defaults` | Zaladuj wartości domyślne do runtime (bez zapisu EEPROM) |
+| `cfg:ilim:N` | Limit prądu [A]: 0-50 (0=brak), zapis NVS |
+| `cfg:sboost:N` | Boost duty startu [%]: 0-200, zapis NVS |
+| `cfg:sboostrpm:N` | RPM zanikania boost: 10-500, zapis NVS |
+| `cfg:aminspd:N` | Min prędkość assist [km/h]: 1-50, zapis NVS |
+| `cfg:alignms:N` | Czas align rotora [ms]: 10-1000, zapis NVS |
+| `cfg:alignduty:N` | Duty align [%]: 5-100, zapis NVS |
+| `cfg:grace:N` | Grace period [s]: 0-30, zapis NVS |
+| `cfg:paskp:N` | PI Kp PAS (×0.01): 0-255, zapis NVS |
+| `cfg:paski:N` | PI Ki PAS (×0.01/s): 0-255, zapis NVS |
+| `cfg:pashystoff:N` | Histereza OFF [km/h]: 0-20, zapis NVS |
+| `cfg:pashyston:N` | Histereza ON [km/h]: 0-20, zapis NVS |
+| `cfg:defaults` | Załaduj wartości domyślne do runtime (bez zapisu EEPROM) |
 | `cfg:save` | Zapisz aktualne wartości runtime do EEPROM |
 | `cfg:reload` | Wczytaj wartości z EEPROM i zastosuj do runtime (w tym tryb silnika) |
+| `pwmfreq:N` | Częstotliwość PWM [Hz]: 8000-32000, zapis NVS (wymaga restartu) |
+| `dutymin:N` | Min duty [%]: 0-50, zapis NVS |
+| `dp:p06:N` | Fallback P06 (koło ×10 cali): 100-400, zapis NVS |
+| `dp:p07:N` | Fallback P07 (magnesy prędkości): 1-100, zapis NVS |
+| `dp:p08:N` | Fallback P08 (limit km/h): 0-100, zapis NVS |
+| `dp:p10:N` | Fallback P10 (tryb): 0/1/2, zapis NVS |
+| `dp:p13:N` | Fallback P13 (magnesy PAS): 1-100, zapis NVS |
 
 ### Format statusu (jedna linia)
 
@@ -1332,13 +1391,13 @@ Jedyne piny ADC2 nie są używane do pomiarów analogowych — konflikt ADC2/WiF
 Sterownik zapisuje konfigurację w pamięci nieulotnej ESP32 (NVS — Non-Volatile Storage).
 Konfiguracja przetrwa restart i wyłączenie zasilania.
 
-### Struktura `controller_config_t` (64 bajty)
+### Struktura `controller_config_t` (70 bajtów)
 
 | Pole | Typ | Domyślnie | Opis |
 |---|---|---|---|
 | `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 16 | Wersja struktury (CONFIG_VERSION) |
-| `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (1=BLOCK, 2=SINUS, 3=FOC) |
+| `version` | uint16_t | 25 | Wersja struktury (CONFIG_VERSION) |
+| `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (0=OFF, 1=BLOCK, 2=SINUS, 3=FOC, 4=BLOCK12, 5=BLOCK12BL) |
 | `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
 | `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
 | `pas_dir_invert` | uint8_t | 0 | Odwróć konwencję kierunku PAS (0/1) |
@@ -1358,7 +1417,27 @@ Konfiguracja przetrwa restart i wyłączenie zasilania.
 | `thr_samples` | uint8_t | 8 | Liczba próbek ADC przepustnicy w burście (2–16) |
 | `thr_outlier_thresh` | uint16_t | 150 | Max odchylenie próbki od mediany ADC (10–2000) |
 | `current_limit_a` | uint8_t | 15 | Limit prądu fazowego [A] (0=brak, nadpisywany przez P14 z display) |
-| `_reserved[20]` | uint8_t[] | 0 | Padding do stałego rozmiaru 64 bajtów |
+| `pas_min_halfperiod_ms` | uint8_t | 5 | Min półokres PAS [ms] (debounce krawędzi). 1–200 |
+| `pas_dir_asymmetry_pct` | uint8_t | 5 | Próg asymetrii do detekcji kierunku [%]. 1–50 |
+| `pas_slew_rate` | uint8_t | 30 | Max zmiana duty PAS na krok. 1–100 (~6% PWM) |
+| `pas_fwd_holdoff_ms` | uint16_t | 300 | Holdoff reverse PAS [ms]. 50–2000 |
+| `pwm_freq_hz` | uint16_t | 20000 | Częstotliwość PWM [Hz]. 8000–32000 |
+| `duty_min_pct` | uint8_t | 10 | Min duty [%]. Poniżej → 0. 0–50 |
+| `startup_boost_pct` | uint8_t | 50 | Boost duty na starcie [%]. 0–200 |
+| `startup_boost_rpm` | uint16_t | 80 | RPM przy którym boost zanika. 10–500 |
+| `fb_wheel_size_x10` | uint16_t | 260 | Fallback P06: rozmiar koła ×10 [cale] (260=26") |
+| `fb_speed_magnets` | uint8_t | 1 | Fallback P07: magnesy czujnika prędkości |
+| `fb_speed_limit` | uint8_t | 25 | Fallback P08: limit prędkości [km/h]. 0=brak |
+| `fb_drive_mode` | uint8_t | 0 | Fallback P10: 0=PAS+gaz, 1=gaz, 2=PAS |
+| `fb_pas_magnets` | uint8_t | 12 | Fallback P13: magnesy PAS. 1–100 |
+| `assist_min_speed_kmh` | uint8_t | 6 | Min prędkość przy najniższym assist [km/h]. 1–50 |
+| `startup_align_ms` | uint16_t | 150 | Czas wyrównania rotora [ms]. 10–1000 |
+| `startup_align_duty_pct` | uint8_t | 100 | Duty wyrównania [%]. 5–100 |
+| `run_grace_s` | uint8_t | 3 | Grace period po wejściu w RUN [s]. 0–30 |
+| `pas_speed_kp` | uint8_t | 30 | PI Kp limitera prędkości PAS (×0.01). 0–255 → 0.00–2.55 |
+| `pas_speed_ki` | uint8_t | 5 | PI Ki limitera prędkości PAS (×0.01/s). 0–255 → 0.00–2.55 |
+| `pas_hyst_off` | uint8_t | 2 | Histereza OFF PAS [km/h]: wyłącz assist ≥ V_target+N. 0–20 |
+| `pas_hyst_on` | uint8_t | 2 | Histereza ON PAS [km/h]: włącz assist < V_target−N. 0–20 |
 
 ### Walidacja
 
@@ -1371,7 +1450,7 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | Komenda | Opis |
 |---|---|
 | `cfg` | Wyświetla aktualną konfigurację NVS + parametry runtime |
-| `cfg:mode:N` | Zmienia tryb boot (1=BLOCK, 2=SINUS, 3=FOC), zapisuje NVS |
+| `cfg:mode:N` | Zmienia tryb boot (0=OFF, 1=BLOCK, 2=SINUS, 3=FOC, 4=BLOCK12, 5=BLOCK12BL), zapisuje NVS |
 | `cfg:ramp:N` | Zmienia czas rampy 0-10000 ms, **natychmiast aktualizuje runtime**, zapisuje NVS |
 | `cfg:regen:N` | Zmienia regen (0/1), **natychmiast aktualizuje runtime**, zapisuje NVS |
 | `cfg:rev:N` | Kierunek obrotów: 0=CW, 1=CCW, zapisuje NVS |
@@ -1379,6 +1458,17 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | `cfg:dispreq:N` | Wymagany wyświetlacz: 0=NIE (standalone), 1=TAK, zapisuje NVS |
 | `cfg:thrsamp:N` | Próbki burst przepustnicy: 2-16, zapisuje NVS |
 | `cfg:thrdelta:N` | Max odchylenie od mediany ADC: 10-2000, zapisuje NVS |
+| `cfg:ilim:N` | Limit prądu fazowego [A]: 0-50 (0=brak), zapisuje NVS |
+| `cfg:sboost:N` | Boost duty na starcie [%]: 0-200, zapisuje NVS |
+| `cfg:sboostrpm:N` | RPM zanikania boost: 10-500, zapisuje NVS |
+| `cfg:aminspd:N` | Min prędkość przy najniższym assist [km/h]: 1-50, zapisuje NVS |
+| `cfg:alignms:N` | Czas wyrównania rotora [ms]: 10-1000, zapisuje NVS |
+| `cfg:alignduty:N` | Duty wyrównania [%]: 5-100, zapisuje NVS |
+| `cfg:grace:N` | Grace period po starcie [s]: 0-30, zapisuje NVS |
+| `cfg:paskp:N` | PI Kp limitera prędkości PAS (×0.01): 0-255, zapisuje NVS |
+| `cfg:paski:N` | PI Ki limitera prędkości PAS (×0.01/s): 0-255, zapisuje NVS |
+| `cfg:pashystoff:N` | Histereza OFF [km/h]: wyłącz assist powyżej V_target+N. 0-20, zapisuje NVS |
+| `cfg:pashyston:N` | Histereza ON [km/h]: włącz assist poniżej V_target−N. 0-20, zapisuje NVS |
 | `cfg:defaults` | Ładuje wartości domyślne do runtime i config struct **(bez zapisu NVS)** |
 | `cfg:save` | Synchronizuje runtime → NVS (zapisuje aktualny stan) |
 | `cfg:reload` | Wczytuje NVS → runtime + przełącza tryb silnika jeśli zmieniony |
@@ -1387,6 +1477,17 @@ Przy starcie firmware sprawdza `magic` i `version` w NVS:
 | `passtop:N` | Timeout PAS 100-10000 ms, zapisuje NVS |
 | `pasramp:N` | Soft-start PAS 0-10000 ms, zapisuje NVS |
 | `pasdbnc:N` | Czas potwierdzenia stanu PAS 500-10000 µs (filtr = N/500 próbek), zapisuje NVS |
+| `pashalf:N` | Min półokres PAS [ms]: 1-200, zapisuje NVS |
+| `pasasym:N` | Próg asymetrii kierunku [%]: 1-50, zapisuje NVS |
+| `passlew:N` | Slew rate duty PAS: 1-100, zapisuje NVS |
+| `pashold:N` | Forward holdoff reverse PAS [ms]: 50-2000, zapisuje NVS |
+| `pwmfreq:N` | Częstotliwość PWM [Hz]: 8000-32000, zapisuje NVS (wymaga restartu) |
+| `dutymin:N` | Min duty [%]: 0-50, zapisuje NVS |
+| `dp:p06:N` | Fallback P06 rozmiar koła ×10 [cale]: 100-400 (260=26"), zapisuje NVS |
+| `dp:p07:N` | Fallback P07 magnesy prędkości: 1-100, zapisuje NVS |
+| `dp:p08:N` | Fallback P08 limit km/h: 0-100 (0=brak), zapisuje NVS |
+| `dp:p10:N` | Fallback P10 tryb: 0=PAS+gaz, 1=gaz, 2=PAS, zapisuje NVS |
+| `dp:p13:N` | Fallback P13 magnesy PAS: 1-100, zapisuje NVS |
 
 ### Przykład wyjścia `cfg`
 
@@ -1797,13 +1898,20 @@ ale z ramą dq.
 | 4 | **FOC (Field Oriented Control)** | Komenda `F` / `m3` — feedforward + PI, Park/Clarke, SVPWM, tryb napięciowy i PI |
 | 5 | **PAS — Pedal Assist Sensor** | Timer sampling 2 kHz, filtr cyfrowy, detekcja kierunku, soft-start, maszyna stanów |
 | 6 | **WiFi — interfejs WWW** | AP mode, responsive UI, REST API, kolejka komend trybu |
-| 7 | **Konfiguracja NVS (EEPROM)** | 22 parametry, CONFIG_VERSION=16, Serial `cfg` + Web UI |
+| 7 | **Konfiguracja NVS (EEPROM)** | 42 parametry, CONFIG_VERSION=25, 70 bajtów, Serial `cfg` + Web UI |
 | 8 | **Filtracja przepustnicy** | Ring buffer + median + odrzucanie outlierów (odporność na EMI) |
 | 9 | **Filtracja PAS** | Timer sampling 500 µs, N kolejnych zgodnych próbek (odporność na EMI) |
 | 10 | **Wyświetlacz S866** | Protokół 2, prędkość, moc, poziomy wspomagania, flaga `display_required` |
 | 11 | **Crossfade blokowy** | Płynne przejścia duty między fazami przy komutacji (eliminacja terkotu) |
 | 12 | **PLL per-sector speed** | Kompensacja nierównych Halli — per-sektor prędkość, pełna korekcja kąta |
 | 13 | **Debug zdarzeniowy** | Ring buffer 64 zdarzeń, komenda `cdbg`, logi przejść Halla z kątem i duty |
+| 14 | **BLOCK12 / BLOCK12BL** | Komutacja 12-step (pół-krok) i 12-step z duty blending — cichsza praca blokowa |
+| 15 | **PI limiter prędkości PAS** | Regulator PI (Kp+Ki) zamiast liniowej rampy, anti-windup, konfigurowalne wzmocnienia |
+| 16 | **Histereza freewheel PAS** | Dwuprogowa: OFF powyżej V_target+hyst_off, ON poniżej V_target−hyst_on |
+| 17 | **Grace period startu** | Przez `run_grace_s` sekund po wejściu w RUN — pełna moc bez limitu prędkości |
+| 18 | **Filtr EMA prędkości koła** | Wygładzenie wheeltime dla silników hub (P07≥10) — eliminacja oscylacji |
+| 19 | **Fallback parametry display** | P06/P07/P08/P10/P13 z NVS gdy brak wyświetlacza S866 (tryb standalone) |
+| 20 | **Startup boost + align** | Konfigurowalne boost duty i czas wyrównania rotora przy rozruchu |
 
 ### Planowane rozszerzenia
 
