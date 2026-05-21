@@ -141,6 +141,9 @@ volatile uint16_t g_startup_align_ms = 150;     ///< ISR copy of align time [ms]
 volatile uint8_t  g_startup_align_duty = 100; ///< ISR copy of align duty [%]
 volatile uint32_t g_startup_align_start_us = 0; ///< Timestamp rozpoczÄ™cia alignmentu [us]
 volatile uint8_t  g_startup_align_hall = 0;     ///< Hall zapisany na poczÄ…tku alignmentu
+volatile bool     g_startup_unstick_active = false; ///< Wymuszony open-loop rozruch aktywny
+volatile uint8_t  g_startup_unstick_bh = 1;         ///< Aktualny krok 6-step (remapowany Hall)
+volatile uint32_t g_startup_unstick_last_step_us = 0; ///< Timestamp ostatniego kroku unstick [us]
 
 // FOC state â€” regulatory PI i wektory napiÄ™ciowe
 struct foc_pi_t {
@@ -477,6 +480,9 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
 #define SINE_STALL_FREEZE_MS    200             // ms bez Halla â†’ zamroĹĽenie kÄ…ta
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prÄ™dkoĹ›Ä‡ startowa â‰ 1 obr.elekt./s (52428800/166666)
 #define SINE_STALL_FALLBACK_MS  400             // minimalny timeout fallback (histereza, anty-szarpanie)
+#define STARTUP_UNSTICK_TIMEOUT_US 120000       // brak Halla >120ms w STARTING -> wymuszony rozruch open-loop
+#define STARTUP_UNSTICK_STEP_US    12000        // krok open-loop co 12ms (~83 eHz)
+#define STARTUP_UNSTICK_MIN_DUTY_PCT 35         // min duty podczas unstick [% PWM_MAX_DUTY]
 #define SINE_START_MAX_HALL_US  30000           // max okres Halla (min prÄ™dkoĹ›Ä‡) do wejĹ›cia w SINUS
 #define SINE_PHASE_CORR_SHIFT   0               // korekcja peĹ‚nego bĹ‚Ä™du na przejĹ›cie Halla
                                                 // Hall jest wiarygodne â†’ nie filtruj o poĹ‚owÄ™
@@ -4165,6 +4171,7 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             uint32_t hall_age = (uint32_t)esp_timer_get_time() - g_hall_last_change_us;
             if (!motor_spinning || hall_age > 2000000) {
                 g_startup_state = 0;
+                g_startup_unstick_active = false;
                 if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
                     resetSineTracking(hall);
                 }
@@ -4176,6 +4183,9 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             g_startup_state = 1;  // ALIGN
             g_startup_align_start_us = now_us;
             g_startup_align_hall = hall;
+            g_startup_unstick_active = false;
+            g_startup_unstick_last_step_us = now_us;
+            g_startup_unstick_bh = 1;
             if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
                 resetSineTracking(hall);
             }
@@ -4206,11 +4216,51 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
             // Przejscie do RUN po uplywie czasu ALIGN
             if (elapsed_us >= (uint32_t)g_startup_align_ms * 1000) {
                 g_startup_state = 2;  // STARTING
+                g_startup_unstick_active = false;
+                g_startup_unstick_last_step_us = now_us;
+                uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+                g_startup_unstick_bh = (bh >= 1 && bh <= 6) ? bh : 1;
                 if (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC) {
                     resetSineTracking(hall);
                 }
             }
             return;
+        }
+    }
+
+    // STARTING anti-stall: gdy Hall nie zmienia się przez dłuższy czas,
+    // wymuś sekwencję 6-step open-loop z podbiciem duty, aby pewniej ruszyć rotor.
+    // Działa dla wszystkich trybów jako bezpieczny fallback na etapie ruszania.
+    if (g_startup_state == 2 && d > 0) {
+        uint32_t now_us = (uint32_t)esp_timer_get_time();
+        uint32_t hall_age_us = (g_hall_last_change_us > 0)
+            ? (now_us - g_hall_last_change_us)
+            : (now_us - g_startup_align_start_us);
+        if (hall_age_us > STARTUP_UNSTICK_TIMEOUT_US) {
+            if (!g_startup_unstick_active) {
+                g_startup_unstick_active = true;
+                g_startup_unstick_last_step_us = now_us;
+                uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+                g_startup_unstick_bh = (bh >= 1 && bh <= 6) ? bh : 1;
+            }
+
+            uint16_t unstick_duty = d;
+            uint16_t min_unstick_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * STARTUP_UNSTICK_MIN_DUTY_PCT / 100U);
+            if (unstick_duty < min_unstick_duty) unstick_duty = min_unstick_duty;
+
+            if ((now_us - g_startup_unstick_last_step_us) >= STARTUP_UNSTICK_STEP_US) {
+                g_startup_unstick_last_step_us = now_us;
+                g_startup_unstick_bh = blockHallNextCw(g_startup_unstick_bh);
+            }
+
+            g_dbg_commut_path = 4;  // BLOCK startup / unstick
+            applyBlockState(g_startup_unstick_bh, unstick_duty);
+            return;
+        } else if (g_startup_unstick_active) {
+            g_startup_unstick_active = false;
+            uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
+            g_startup_unstick_bh = (bh >= 1 && bh <= 6) ? bh : 1;
+            g_startup_unstick_last_step_us = now_us;
         }
     }
 
