@@ -1,1958 +1,269 @@
-# BLDC Motor Driver — ESP32
-
-**Wersja firmware: 2.1.0** | CONFIG_VERSION: 25 | PlatformIO espressif32
-
-Sterownik silnika BLDC (bezszczotkowego prądu stałego) na bazie ESP32 z mostkami IR2103 (3 fazy).  
-Obsługiwane metody sterowania: **komutacja blokowa (6-step)**, **blokowa 12-step**, **blokowa 12-step z duty blending (BLOCK12BL)**, **sinusoidalna** oraz **FOC (Field Oriented Control)**.  
-Wbudowany system **PAS (Pedal Assist Sensor)** z detekcją kierunku, soft-startem, regulatorem PI prędkości docelowej i dwuprogową histerezą freewheel.  
-Konfiguracja przez **Serial 115200 baud** oraz **WiFi AP** (responsywny interfejs webowy).
-
----
-
-## Spis treści
-
-1. [Sprzęt](#sprzęt)
-2. [Schemat połączeń — pinout](#schemat-połączeń--pinout)
-3. [Układy pomiarowe](#układy-pomiarowe)
-4. [Architektura oprogramowania](#architektura-oprogramowania)
-5. [Komutacja blokowa — zasada działania](#komutacja-blokowa--zasada-działania)
-6. [Komutacja sinusoidalna — zasada działania](#komutacja-sinusoidalna--zasada-działania)
-7. [Timer sprzętowy i ISR](#timer-sprzętowy-i-isr)
-8. [Wyświetlacz S866 — protokół 2](#wyświetlacz-s866--protokół-2)
-9. [Pomiar prędkości](#pomiar-prędkości)
-10. [Obliczanie mocy](#obliczanie-mocy)
-11. [Hamowanie regeneracyjne](#hamowanie-regeneracyjne)
-12. [Przepustnica i poziomy wspomagania](#przepustnica-i-poziomy-wspomagania)
-13. [Rampa rozpędzania](#rampa-rozpędzania)
-14. [PAS — Pedal Assist Sensor](#pas--pedal-assist-sensor)
-15. [Sterowanie przez UART/Serial](#sterowanie-przez-uartserial)
-16. [Kalibracja prądów](#kalibracja-prądów)
-17. [Konfiguracja NVS](#konfiguracja-nvs)
-18. [Diagnostyka MOSFET — tryb testowy](#diagnostyka-mosfet--tryb-testowy)
-19. [FOC — Field Oriented Control](#foc--field-oriented-control)
-20. [WiFi — interfejs konfiguracyjny WWW](#wifi--interfejs-konfiguracyjny-www)
-21. [Filtracja wejść — przegląd](#filtracja-wejść--przegląd)
-22. [Rozbudowa projektu](#rozbudowa-projektu)
-23. [Troubleshooting](#troubleshooting)
-24. [Konfiguracja PlatformIO](#konfiguracja-platformio)
-
----
-
-## Sprzęt
-
-| Komponent         | Model/wartość              | Uwagi |
-|-------------------|----------------------------|-------|
-| Mikrokontroler    | ESP32-D0WDQ6 (WROOM-32)    | 240 MHz, dual-core |
-| Sterowniki mostu  | IR2103 × 3                 | Po jednym na każdą fazę A, B, C |
-| Tranzystory       | Faza high: IRF877 DPAK (P-ch?) / Faza low: IRF877 ADPFB (N-ch) | Sprawdzić typ z schematu |
-| Pomiar prądu      | INA180A2 × 3               | Gain = 50 V/V, shunt = 2 mΩ |
-| Shunty            | 2 mΩ (low-side)            | Jeden na każdą fazę |
-| Czujniki Halla    | 3 × czujnik cyfrowy        | Wbudowane w silnik |
-| Level shifter     | TXB0102DCU                 | 3.3V ↔ 5V, enable GPIO5 |
-| Wyświetlacz       | S866 (protokół 2)          | Serial2: GPIO17(TX)/GPIO16(RX), 9600 baud |
-| Napięcie baterii  | Dzielnik 1 MΩ / 33 kΩ      | Mierzone na GPIO36 (VP) |
-| Przepustnica      | Potencjometr/czujnik 0–3.3 V | GPIO33, ADC zakres 400–2600 |
-
----
-
-## Schemat połączeń — pinout
-
-Wszystkie definicje pinów znajdują się w `include/pinout.h`.
-
-### Sterowanie mostkami (IR2103)
-
-| Pin ESP32 | GPIO | Funkcja              | IR2103 |
-|-----------|------|----------------------|--------|
-| GPIO12    | 12   | Faza A — HIGH side   | HIN_A  |
-| GPIO13    | 13   | Faza A — LOW side    | LIN_A  |
-| GPIO25    | 25   | Faza B — HIGH side   | HIN_B  |
-| GPIO26    | 26   | Faza B — LOW side    | LIN_B  |
-| GPIO27    | 27   | Faza C — HIGH side   | HIN_C  |
-| GPIO14    | 14   | Faza C — LOW side    | LIN_C  |
-
-> **Ważne — logika IR2103:**  
-> - `HIN = HIGH` → tranzystor high-side **WŁĄCZONY**  
-> - `LIN = LOW`  → tranzystor low-side  **WŁĄCZONY** (wejście odwrócone!)  
-> - `LIN = HIGH` → tranzystor low-side  **WYŁĄCZONY**  
-> W kodzie: MCPWM gen_A steruje HIN, gen_B steruje LIN. W trybie BLOCK: gen_A=PWM, gen_B=forced.  
-> W trybie SINUS/FOC: oba generatory dostają ten sam duty → IR2103 tworzy komplementarne przełączanie z dead-time ~520 ns.
-
-### Wejścia analogowe (ADC)
-
-| GPIO | Funkcja               | ADC kanał |
-|------|-----------------------|-----------|
-| 36   | Napięcie baterii VBAT | ADC1_CH0  |
-| 39   | Prąd fazy A           | ADC1_CH3  |
-| 34   | Prąd fazy B           | ADC1_CH6  |
-| 35   | Prąd fazy C           | ADC1_CH7  |
-| 33   | Przepustnica          | ADC1_CH5  |
-| 32   | Temperatura FET       | ADC1_CH4  |
-
-> **Uwaga GPIO12 (MTDI):**  
-> GPIO12 jest pinem strap ESP32 (używany jako PIN_PWM_A_HIGH). Jeśli ma pull-up przy starcie, zmienia napięcie VDD_SDIO z 3.3 V na 1.8 V, co uniemożliwia programowanie flash. **Nie podłączać pull-up do GPIO12**; stosować pull-down lub pozostawić floating.
-
-### Czujniki Halla
-
-| GPIO | Funkcja       | Tryb |
-|------|---------------|------|
-| 4    | Hall A        | INPUT_PULLUP |
-| 18   | Hall B        | INPUT_PULLUP |
-| 19   | Hall C        | INPUT_PULLUP |
-
-### Wejścia cyfrowe
+# ⚡ BLDC Motor Driver for ESP32 - Real-Time Multi-Mode E-Bike Controller
+
+An embedded firmware project for driving a three-phase BLDC motor from an ESP32-based controller. It converts Hall sensors, throttle, pedal-assist, brake, current, battery-voltage, and S866 display inputs into deterministic motor-control output through a 20 kHz MCPWM interrupt path.
+
+The project is aimed at e-bike and small electric-vehicle control experiments, with a practical progression from six-step commutation to sinusoidal control and FOC, plus serial and local Wi-Fi diagnostics.
+
+[![C++](https://img.shields.io/badge/C%2B%2B-Embedded-00599C?logo=cplusplus&logoColor=white)](https://isocpp.org/)
+[![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-F5822A?logo=platformio&logoColor=white)](https://platformio.org/)
+[![Arduino](https://img.shields.io/badge/Framework-Arduino-00979D?logo=arduino&logoColor=white)](https://www.arduino.cc/)
+[![ESP32](https://img.shields.io/badge/Target-ESP32-E7352C?logo=espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32)
+[![Wi-Fi](https://img.shields.io/badge/Connectivity-Wi--Fi-2196F3?logo=wifi&logoColor=white)](https://www.wi-fi.org/)
+
+## 🧰 Used Technologies
+
+| Area | Technology | Evidence in the repository |
+| --- | --- | --- |
+| Firmware | C++ with the Arduino framework | `.cpp` sources, Arduino APIs, `framework = arduino` |
+| Build | PlatformIO | `platformio.ini`, `esp32dev` environment |
+| Target | ESP32 development board | `board = esp32dev`, ESP32 GPIO/ADC/MCPWM registers |
+| Motor PWM | ESP32 MCPWM, center-aligned `UP_DOWN` mode | `src/main.cpp`, `include/pinout.h` |
+| Motor control | Hall-synchronized BLOCK, SINUS, FOC, and multi-step commutation | `include/bldc_types.h`, `src/main.cpp` |
+| Persistence | ESP32 NVS through Arduino `Preferences` | `src/bldc_config.cpp` |
+| Connectivity | Built-in `WiFi`, `WebServer`, and `DNSServer` | `src/main.cpp` |
+| Display protocol | S866 protocol 2 over `Serial2` | `src/display_s866.cpp`, `include/display_s866.h` |
+| Diagnostics | Serial command interface and embedded HTML/JavaScript dashboard | `src/main.cpp` |
+
+The PlatformIO configuration does not pin an explicit `espressif32` platform version. The exact framework and toolchain versions therefore come from the PlatformIO package resolution on the development machine.
+
+## 🚀 Key Features
+
+### Motor control
+
+- Six-step trapezoidal commutation based on the three Hall sensors.
+- `BLOCK12` half-step commutation between Hall transitions.
+- `BLOCK24` runtime mode, presented in the UI and command interface as `BLOCK12BL`, with duty blending between commutation vectors.
+- Sinusoidal commutation using a 96-sample electrical-angle lookup table plus a guard entry.
+- Continuous Q16 angle tracking with Hall correction, sector-speed tracking, phase-offset tuning, and stall/startup handling.
+- FOC control with Clarke/Park transforms, d/q PI regulators, inverse transforms, and SVPWM generation.
+- FOC voltage mode for diagnostics and a relay-feedback PI auto-tuning command.
+- Software direction reversal for CW/CCW operation.
+
+### Real-time control path
+
+- MCPWM unit 0 with three operators, one for each motor phase.
+- Center-aligned PWM with a default frequency of 20 kHz and a configurable 8-32 kHz range.
+- Direct low-level MCPWM register writes from an IRAM-safe TEZ ISR, avoiding driver API spinlocks in the time-critical path.
+- Hall validation with invalid-state rejection, consecutive-sample confirmation, and minimum-period filtering.
+- Current ADC sampling at the PWM valley, fixed-point EMA filtering, and high-sample rejection for phase-current spikes.
+
+### Inputs, assistance, and braking
+
+- Throttle input filtering using a rolling sample buffer, median selection, and outlier rejection.
+- PAS sampling through an `esp_timer` callback, configurable debounce, cadence measurement, and direction detection from signal asymmetry.
+- PAS start delay, soft-start ramp, speed-target PI control, freewheel hysteresis, and slew-rate limiting.
+- S866 drive-mode selection for PAS + throttle, throttle-only, or PAS-only operation.
+- Active-low brake input plus a serial brake simulation command.
+- Regenerative braking using low-side PWM, with minimum-RPM and battery-voltage cutoffs and an 80% maximum regen duty.
+- Global speed limiting with a filtered power fade and configurable fallback values when the display is absent.
+
+### Configuration and diagnostics
+
+- Binary controller configuration stored in ESP32 NVS and validated with a magic value and configuration version.
+- S866 protocol 2 support with XOR checksum validation, frame resynchronization, connection confirmation, and telemetry replies.
+- 921600-baud main serial console and 9600-baud S866 `Serial2` link.
+- Local Wi-Fi access point with an embedded responsive dashboard, configuration JSON, telemetry JSON, command execution, and captive DNS redirection.
+- Diagnostics for Hall transitions, sinusoidal tracking, current readings, commutation events, FOC state, speed sensing, PAS, and individual MOSFET-side testing.
+
+## 🧱 Hardware and Pinout
+
+The firmware is written for an ESP32 development board connected to three IR2103 half-bridge gate drivers, one per motor phase. The IR2103 inputs use active-high HIN and active-low LIN logic; the code keeps this polarity explicit in the phase helper functions.
+
+### Power stage and measurements
+
+| Function | Hardware described by the code | ESP32 pins |
+| --- | --- | --- |
+| Phase A gate control | IR2103 HIN/LIN | GPIO12 / GPIO13 |
+| Phase B gate control | IR2103 HIN/LIN | GPIO25 / GPIO26 |
+| Phase C gate control | IR2103 HIN/LIN | GPIO27 / GPIO14 |
+| Phase-current feedback | INA180A2, gain 50 V/V, 2 mOhm shunts | GPIO39 / GPIO34 / GPIO35 |
+| Battery voltage | Resistor divider, values calibrated in code | GPIO36 |
+| Throttle | Analog input, calibrated raw range 400-2600 | GPIO33 |
+| FET temperature input | ADC input declared in the pin map | GPIO32 |
+
+The current-sense channels are ADC1 channels. The firmware reads them at the MCPWM TEZ point, filters them in the ISR, and reconstructs signed phase currents for SINUS/FOC calculations using the three-phase current relationship.
 
-| GPIO | Funkcja  | Aktywny stan |
-|------|----------|--------------|
-| 22   | PAS      | LOW (INPUT_PULLUP) |
-| 23   | Hamulec  | LOW (INPUT_PULLUP) |
+### Sensors and user interfaces
+
+| Function | Pin or interface | Notes |
+| --- | --- | --- |
+| Hall A / B / C | GPIO4 / GPIO18 / GPIO19 | `INPUT_PULLUP`, three-bit CBA Hall state |
+| Brake | GPIO23 | Active low, `INPUT_PULLUP` |
+| PAS | GPIO22 | Timer-sampled and digitally filtered |
+| External speed sensor | GPIO21 | Falling-edge input for geared/direct external sensing mode |
+| S866 RX / TX | GPIO16 / GPIO17 | `Serial2`, 9600 baud, 8N1 |
+| Level-shifter enable | GPIO5 | Enables the TXB0102DCU path used by the display interface |
+| Main console | Board USB-UART `Serial` | 921600 baud |
 
-### Pozostałe
+GPIO12 is an ESP32 strap pin and is also used for phase-A high-side control. The hardware must avoid an inappropriate pull-up on this pin during boot, otherwise flash programming can fail.
 
-| GPIO | Funkcja              |
-|------|----------------------|
-| 16   | UART RX (S866 wyświetlacz) |
-| 17   | UART TX (S866 wyświetlacz) |
-| 5    | UART Enable (TXB0102DCU) |
-| 21   | Wejście prędkości (czujnik ext. przy P07≤1) |
-| 0    | EXT1 (boot pin!)     |
-| 2    | EXT2                 |
-| 15   | EXT3                 |
+## 🏗️ Architecture
 
----
-
-## Układy pomiarowe
-
-### Napięcie baterii
-
-Dzielnik napięciowy z rezystorów:
-- R_top = 1 MΩ (między VBAT a pinem ADC)
-- R_bottom = 33 kΩ (między pinem ADC a GND)
-
-Wzór przeliczenia:
-
-```
-VBAT = V_ADC × (R_top + R_bottom) / R_bottom
-     = V_ADC × (1 000 000 + 33 000) / 33 000
-     ≈ V_ADC × 31.3
-```
-
-W kodzie użyto zmierzonych wartości rzeczywistych rezystorów:
-- `kVbatRTop = 1 130 000` Ω
-- `kVbatRBottom = 31 700` Ω
-
-### Pomiar prądu (INA180A2 + shunt 2 mΩ)
-
-Układ: prąd płynie przez shunt → INA180A2 wzmacnia napięcie × 50 → ESP32 ADC.
-
-```
-V_shunt = I × R_shunt = I × 0.002
-V_out   = V_shunt × Gain = I × 0.002 × 50 = I × 0.1
-I [A]   = V_out / 0.1 = V_ADC / 0.1
-```
-
-W kodzie:
-```cpp
-kCurrentScale = 1.0 / (0.002 × 50) = 10.0  [A/V]
-I = V_ADC_fazy × kCurrentScale
-```
-
-Zakres pomiarowy:
-- ADC ESP32 = 0–3.3 V
-- Maksymalny prąd = 3.3 / 0.1 = 33 A
-
-> **Autokalibracja offset:**  
-> Gdy silnik jest wyłączony lub duty = 0, filtr EMA (α = 0.02) uśrednia wartość ADC jako offset zera (dryf wzmacniacza, offsety ADC). Przy pomiarach ten offset jest odejmowany.
-
-### Temperatura silnika
-
-Surowa wartość ADC (0–4095) bez przeliczenia na °C. Wymaga dopasowania krzywej do użytego czujnika (termistor NTC/PTC lub IC).
-
----
-
-## Architektura oprogramowania
-
-### Pliki projektu
-
-```
-platformio.ini      — konfiguracja PlatformIO (platforma, prędkość, partycje)
-include/
-  pinout.h          — wszystkie definicje GPIO, stałe MCPWM (frequency, period, duty)
-  bldc_types.h      — typy danych, struktury, enumeracje
-  bldc_config.h     — konfiguracja NVS (controller_config_t, CONFIG_VERSION=25, 70 bajtów)
-  display_s866.h    — definicje protokołu wyświetlacza S866, struktury ramek
-src/
-  main.cpp          — cała logika aplikacji (komutacja MCPWM, regen, pomiar prędkości/mocy)
-  bldc_config.cpp   — implementacja NVS (load/save/defaults)
-  display_s866.cpp  — implementacja protokołu S866 (parsowanie RX, wysyłanie TX)
-```
-
-### Globalna struktura stanu
-
-`bldc_state_t g_bldc_state` — jedna struktura przechowująca cały stan systemu:
-- tryb pracy (`mode`)
-- wypełnienie PWM (`duty_cycle`)
-- surowa wartość przepustnicy (`throttle_raw`)
-- napięcie baterii (`battery_voltage`)
-- prądy fazowe A, B, C (`phase_current[3]`)
-- temperatura silnika i FET
-- stan Halla (`hall_state`)
-- prędkość obrotowa (`rpm`) i czas obrotu koła (`wheeltime_ms`)
-- okres między przejściami Halla (`hall_period_us`)
-- moc pobierana (`power_watts`) i oddawana (`regen_power_watts`)
-- docelowe duty z przepustnicy (`duty_target`) i czas rampy (`ramp_time_ms`)
-- flagi: `brake_active`, `pas_active`, `regen_enabled`, `regen_active`, `fault`
-
-### Przepływ wykonania
-
-```
-setup()
-  │
-  ├── initGPIO()           — konfiguracja pinów, bezpieczny stan MOSFETów
-  ├── initPWM()            — konfiguracja MCPWM (3 operatory × 2 generatory, prescaler, period)
-  ├── allMosfetsOff()      — wyłączenie wszystkich tranzystorów (gen_force → FORCE_OFF)
-  └── initCommutationTimer() — rejestracja ISR na przerwanie TEZ Timer 0 (20 kHz)
-
-loop() [~wolna pętla, ~kilka kHz]
-  ├── readAnalogInputs()   — ADC: VBAT, prądy, przepustnica, temp
-  ├── readHallSensors()    — stan 3 czujników Halla
-  ├── readDigitalInputs()  — hamulec (hw + symulacja), PAS
-  ├── obliczenie duty_target z przepustnicy (proporcjonalnie do assist level)
-  ├── rampa rozpędzania (duty_target → duty_cycle, max Δ z ramp_time_ms)
-  ├── aktualizacja zmiennych volatile dla ISR
-  ├── obliczanie mocy (P = Vbat × Imax)
-  ├── logika regen (hamulec + warunki → aktywacja)
-  ├── obsługa wyświetlacza S866 (wheeltime, TX, service)
-  ├── processSerialCommands() — obsługa komend UART
-  └── auto-status co 1s (jeśli włączony)
-
-onCommutationTimer() [ISR, 20 kHz = co 50 µs]
-  ├── odczyt Halli z GPIO.in (ZAWSZE — pomiar prędkości)
-  ├── pomiar czasu między przejściami Halla → hall_period_us
-  ├── hamulec aktywny + regen → regenCommutateISR()
-  ├── hamulec aktywny bez regen → allMosfetsOff() (coast)
-  ├── sprawdzenie g_motor_enabled
-  ├── dispatch trybu sterowania (g_mode_isr → BLOCK / BLOCK12 / BLOCK12BL / SINUS / FOC)
-  └── ustawienie 3 operatorów MCPWM (gen_force + compare) zgodnie z trybem
-```
-
-### Separacja loop/ISR
-
-Kluczowy element projektowy: **komutacja działa w ISR**, nie w `loop()`.  
-Dzięki temu wypisywanie diagnostyki przez Serial (które może trwać 10–50 ms) nie zakłóca pracy silnika.
-
-Zmienne współdzielone między `loop()` a `onCommutationTimer()` są `volatile`:
-- `g_hall_isr` — stan Halla (odczytywany też bezpośrednio w ISR z GPIO)
-- `g_duty_isr` — aktualne wypełnienie PWM
-- `g_motor_enabled` — czy silnik ma się kręcić
-- `g_brake_isr` — czy hamulec aktywny
-- `g_mode_isr` — aktualny tryb sterowania (DISABLED/BLOCK/SINUS/FOC/BLOCK12/BLOCK12BL)
-
----
-
-## Komutacja blokowa — zasada działania
-
-Silnik BLDC 3-fazowy jest sterowany przez 3 mostki H (każdy z jednym IR2103).  
-W każdej chwili **jedna faza dostaje PWM (high-side ON)**, **jedna faza jest zwarta do GND (low-side ON)**, **jedna faza pływa (oba tranzystory OFF)**.
-
-Sekwencja komutacji zależy od pozycji rotora odczytanej z czujników Halla.  
-Hall encoder daje 3-bitowy kod (wartości 1–6, 0 i 7 są błędem).
-
-### Tabela komutacji (Hall [C:B:A]):
-
-| Hall (CBA) | Faza A    | Faza B    | Faza C    | Opis     |
-|------------|-----------|-----------|-----------|----------|
-| 001 = 1    | PWM HIGH  | LOW (GND) | FLOAT     | A+ → B−  |
-| 011 = 3    | PWM HIGH  | FLOAT     | LOW (GND) | A+ → C−  |
-| 010 = 2    | FLOAT     | PWM HIGH  | LOW (GND) | B+ → C−  |
-| 110 = 6    | LOW (GND) | PWM HIGH  | FLOAT     | B+ → A−  |
-| 100 = 4    | LOW (GND) | FLOAT     | PWM HIGH  | C+ → A−  |
-| 101 = 5    | FLOAT     | LOW (GND) | PWM HIGH  | C+ → B−  |
-
-
-> **Uwaga do dopasowania tabeli:**  
-> Kolejność Hall→uzwojenie zależy od fizycznego montażu czujników w silniku.  
-> Jeśli silnik drga zamiast się kręcić — należy cyklicznie przesunąć wpisy w tabeli  
-> (np. zamiast 1→3→2→6→4→5, zmienić na 3→2→6→4→5→1).  
-> Jeśli kręci się w złym kierunku — użyć komendy `r` lub zamienić dowolne dwie fazy silnika.
-
-### Crossfade fazowy (wygładzanie przejść komutacji)
-
-W trybie BLOCK każda zmiana stanu Halla powoduje skokowe przełączenie fazy PWM (skok pola o 60° elektr.), co generuje słyszalny terkot. Aby go wyeliminować, zaimplementowano **crossfade fazowy**:
-
-- Przy przejściu komutacyjnym stara faza PWM **wygasza się liniowo** od `d` do `0`
-- Jednocześnie nowa faza PWM **rozjaśnia się liniowo** od `0` do `d`
-- Przejścia Low↔Off (ścieżka GND) przełączają się natychmiast (nie generują hałasu)
-- Crossfade trwa `BLOCK_CROSS_TICKS` tików ISR (domyślnie 8 × 50 µs = **400 µs**)
-
-```
-  Stare duty: ████████████████▓▓▓▓▒▒▒▒░░░░        (gaśnie)
-  Nowe duty:                  ░░░░▒▒▒▒▓▓▓▓████████ (narasta)
-              ──────────────────────────────────────→czas
-              │  crossfade (400µs)  │
-```
-
-Jeśli kolejne przejście Halla nastąpi przed końcem crossfade, nowe przejście automatycznie przerywa bieżące i rozpoczyna następny crossfade.
-
-| Stała | Wartość | Opis |
-|---|---|---|
-| `BLOCK_CROSS_TICKS` | 8 | Tiki ISR crossfade (8 × 50 µs = 400 µs) |
-
-> **Strojenie:** Przy wolnych obrotach można zwiększyć (12–16 = 600–800 µs) dla jeszcze cichszej pracy. Przy szybkich obrotach zmniejszyć (4–6 = 200–300 µs) — crossfade nie powinien trwać dłużej niż ~30% okresu Halla.
-
-### Tryby komutacji blokowej — porównanie
-
-| Tryb | Enum | Opis | Gest. w ISR |
-|------|------|------|-------------|
-| BLOCK (6-step) | `DRIVE_MODE_BLOCK` (1) | Klasyczna 6-krokowa z crossfade | Przejście co zmianę Halla |
-| BLOCK12 (12-step) | `DRIVE_MODE_BLOCK12` (4) | Pół-krok między stanami Halla (interpolacja pozycji) | 12 przejść na obrót elektr. |
-| BLOCK12BL (12-step + blending) | `DRIVE_MODE_BLOCK24` (5) | 12-step z płynnym crossfade duty między krokami | Najcichsza praca blokowa |
-
-**BLOCK12** dzieli każdy 60° sektor Halla na dwa pod-sektory po 30°. W połowie sektora ISR przełącza na dodatkowy krok interpolacyjny, zmniejszając pulsacje momentu.
-
-**BLOCK12BL** (enum: BLOCK24) rozszerza tryb 12-step o płynny blending duty — w obrębie każdego pod-sektora ISR interpoluje liniowo duty między aktualnym a następnym wektorem komutacji (współczynnik blend 0–255). Daje najgładszy moment obrotowy wśród trybów blokowych, zbliżony do sinusa, przy znacznie mniejszym koszcie obliczeniowym niż FOC.
-
-Komenda wyboru trybu: `m4` / `b12` (BLOCK12), `m5` / `b12bl` / `b24` (BLOCK12BL), lub `cfg:mode:4` / `cfg:mode:5`.
-
-### PWM — MCPWM center-aligned
-
-- Peryferium: **MCPWM** (Motor Control PWM), MCPWM_UNIT_0
-- Tryb licznika: **UP_DOWN** (center-aligned) — symetryczne impulsy
-- Częstotliwość: **20 kHz** (powyżej słyszalności)
-- Timer: 160 MHz / prescaler_group(1) / prescaler_timer(8) = **20 MHz**, period = **500**
-- Rozdzielczość: **0–500** (compare value = peak period)
-- `duty = 0` → silnik wyłączony
-- `duty = 500` → 100% (pełne napięcie)
-- Shadow compare update: **TEZ-only** (symetryczne impulsy, brak asymetrii TEP)
-- Dead time: **bypass** (IR2103 wewnętrzny ~520 ns)
-
-**Sterowanie w ISR** odbywa się przez bezpośredni zapis rejestrów MCPWM (LL level),
-bez wywołań driver API (które używają spinlocków i nie są ISR-safe):
-
-| Tryb | gen_A (HIN) | gen_B (LIN) | gen_force.val |
-|------|-------------|-------------|---------------|
-| PWM (BLOCK HS) | PWM action | forced HIGH (LS OFF) | `0x0200` |
-| GND (BLOCK LS ON) | forced LOW | forced LOW (LS ON) | `0x0140` |
-| OFF (float) | forced LOW | forced HIGH (LS OFF) | `0x0240` |
-| Complementary (SIN/FOC) | PWM action | PWM action | `0x0000` |
-| Regen (LS PWM) | forced LOW | PWM action (inverted) | `0x0040` |
-
----
-
-## Komutacja sinusoidalna — zasada działania
-
-Tryb `DRIVE_MODE_SINUS` generuje trójfazowe sinusoidalne napięcia PWM zamiast
-prostokątnych przełączeń blokowych, co daje:
-- Płynniejszą pracę silnika, zwłaszcza na niskich obrotach
-- Mniejsze pulsacje momentu obrotowego
-- Cichszą pracę (brak szarpania 6× na obrót elektryczny)
-
-Algorytm jest portem 1:1 ze sprawdzonego projektu STM32 (`bldc_driver_v2`).
-
-### Tablica sinusów (LUT)
-
-Tablica `g_sine_table[97]` zawiera 96 wpisów (= 360° elekt.) + 1 guard entry
-(wrap-around bez `% 96`). Wartości: `round(sin(i × 360°/96) × 1024)`,
-zakres −1024..+1024. Umieszczona w DRAM (`DRAM_ATTR`) — ESP32 nie pozwala na
-byte-access do IRAM (LoadStoreError).
-
-```
-indeks:   0 →     0  (0°,   sin = 0)
-indeks:  24 → +1024  (90°,  sin = +1)
-indeks:  48 →     0  (180°, sin = 0)
-indeks:  72 → −1024  (270°, sin = −1)
-indeks:  96 →     0  (guard = [0])
-```
-
-### Mapowanie Hall → sektor
-
-Tablica `g_hall_to_sector[8]` mapuje stan Halla (1–6) na indeks sektora 0–5.
-Kolejność sektorów odpowiada sekwencji komutacji blokowej: 1→3→2→6→4→5.
-
-| Hall | Sektor | Block commutation |
-|-----------|--------|-------------------|
-| 1 (001)   |    0   | A→B               |
-| 3 (011)   |    1   | A→C−              |
-| 2 (010)   |    2   | B→C−              |
-| 6 (110)   |    3   | B→A−              |
-| 4 (100)   |    4   | C→A−              |
-| 5 (101)   |    5   | C→B−              |
-
-### Ciągłe śledzenie kąta (angle tracking)
-
-W przeciwieństwie do prostego snap-to-Hall, kąt jest śledzony ciągle w Q16
-fixed-point (0..96<<16). Co tick ISR (50 µs):
-
-```
-angle += speed_q16
-```
-
-Prędkość `speed_q16` = (16 × 50) << 16 / hall_period_us = 52428800 / hall_period_us,
-obliczana w loop() (dzielenie 32-bit w ISR na ESP32 powoduje LoadStoreError).
-
-Na przejściu Halla kąt jest KORYGOWANY (nie nadpisywany) — o pełną różnicę między
-oczekiwanym a aktualnym (`SINE_PHASE_CORR_SHIFT = 0`). To daje precyzyjne śledzenie
-bez dryfu — kąt trafia dokładnie w środek sektora po każdym przejściu Halla.
-
-### Start sinusoidalny (bez block startup)
-
-Tryb SINUS startuje **natychmiast** — bez fazy komutacji blokowej. Po wydaniu
-komendy `S` (lub `m2`):
-1. Kąt jest ustawiany (snap) na środek aktualnego sektora Halla
-2. `g_sine_running = 1` — ISR od razu generuje sinusoidalne PWM
-3. Silnik rusza w trybie **crawl** (otwartopętlowa minimalna prędkość)
-4. Pierwsze przejście Halla daje realną prędkość i crawl wyłącza się
-
-### Tryb crawl (rozruch z miejsca)
-
-Gdy `g_sine_speed_q16 == 0` (brak danych o prędkości — np. start z miejsca lub po
-stall fallback), ISR używa minimalnej prędkości otwartopętlowej:
-
-| Stała | Wartość | Opis |
-|---|---|---|
-| `SINE_CRAWL_SPEED_Q16` | 315 | ≈ 1 obrót elektr./s (52428800/166666) |
-
-Pole magnetyczne wolno się obraca, rotor zaczyna podążać, i pierwsze przejście
-Halla daje realną prędkość — crawl wyłącza się automatycznie.
-
-### Coast threshold (próg coastingu)
-
-Center-aligned PWM z bazą PWM_MAX_DUTY/2 (=250) przy małej amplitudzie generuje ~50% switching na
-wszystkich 6 FETach = **aktywne hamowanie elektromagnetyczne** (w odróżnieniu od
-trybu BLOCK, gdzie mały duty = tiny PWM na 1 fazie, reszta float).
-
-Aby temu zapobiec, gdy `amplitude < SINE_MIN_AMPLITUDE` wszystkie FETy są wyłączane
-(coast — motor biegnie swobodnie):
-
-| Stała | Wartość | Opis |
-|---|---|---|
-| `SINE_MIN_AMPLITUDE` | 15 | Poniżej tego: coast zamiast sinus |
-
-### Stall freeze
-
-Jeśli brak przejść Halla > 200 ms → kąt nie jest avansowany (zamrożony). Zapobiega to
-ucieczce kąta przy zatrzymanym silniku, co powodowałoby oscylacje i prąd zwarcia.
-
-**Wyjątek: tryb crawl** — gdy `speed == 0`, stall freeze jest wyłączony. Crawl obraca
-pole z prędkością ~1 obr.elekt./s, co nie generuje niebezpiecznych prądów, a jest
-konieczne do ruszenia silnika z miejsca. Bez tego wyjątku crawl byłby permanentnie
-zablokowany (deadlock).
-
-### Safety fallback (zabezpieczenie przed utratą Halli)
-
-Gdy brak przejść Halla przez dłuższy czas (timeout dynamiczny: `max(400ms, 4×hall_period + 20ms)`):
-1. Prędkość jest zerowana (`g_sine_speed_q16 = 0`)
-2. Timestamp Halla jest resetowany (`g_sine_last_hall_ms = now`)
-3. ISR przechodzi w tryb crawl — wolno obraca pole, czekając na przejście Halla
-
-Reset timestampu (punkt 2) jest kluczowy — bez niego crawl byłby natychmiast
-zablokowany przez stall freeze (ponieważ stary timestamp wskazywałby >200ms).
-
-### Generacja PWM 3 faz (center-aligned complementary)
-
-Mapowanie faz (dopasowane do tabeli komutacji blokowej):
-- **Faza A**: `sin(θ)` — referencyjna (peak w sektorach 0,1)
-- **Faza B**: `sin(θ + 64)` (64/96 × 360° = 240°, peak w sektorach 2,3)
-- **Faza C**: `sin(θ + 32)` (32/96 × 360° = 120°, peak w sektorach 4,5)
-
-Dzięki temu sekwencja peaków A→B→C jest zgodna z kierunkiem obrotu blokowego.
-
-Dla każdej fazy:
-1. Interpolacja liniowa z tabeli: `sin_val = sine_interp_q16(angle + offset)`
-2. Modulacja: `m = (sin_val × amplitude) >> 10` → zakres -amp..+amp
-3. **SVPWM centering:** `duty = offset + m`, gdzie `offset = PWM_MAX_DUTY/2 - (max+min)/2`
-4. MCPWM gen_A i gen_B dostają TEN SAM duty (tryb complementary, `gen_force = 0x0000`)
-5. IR2103 z odwróconym LIN tworzy komplementarne przełączanie z dead-time ~520 ns
-
-### Strojenie offsetu fazy (Hall phase offset)
-
-Offset `g_sine_hall_phase_offset` koryguje niedopasowanie między pozycją czujników
-Halla a optymalnym kątem wyprzedzenia pola magnetycznego. 1 wpis = 3.75° elektr.
-
-**Ręczne strojenie:**
-- `so` — pokaż aktualny offset
-- `so+` / `so-` — zmień o ±2 wpisy (±7.5°)
-- `so:N` — ustaw na wartość N (-48..+48)
-
-**Automatyczne strojenie (komenda `sat`):**
-
-Algorytm przelatuje zakres offsetów (-24..+24, krok 2) przy stałym niskim duty (10%).
-Na każdym kroku mierzy średni prąd (400ms stabilizacja + 600ms pomiar).
-Optymalny offset = minimum prądu → najlepsza sprawność (najmniej strat cieplnych
-przy stałym momencie obrotowym).
-
-Przykład użycia:
-```
-S            ← włącz tryb SINUS
-15           ← ustaw duty 15% (żeby się kręcił)
-sat          ← start auto-tune (silnik przechodzi na 10%, sweep ~25s)
-             ← wynik: najlepszy offset ustawiony automatycznie
-so           ← sprawdź jaki offset został wybrany
-```
-
-Opcjonalnie można podać zakres: `sat:-8:8:1` (od -8 do +8, krok 1).
-Wysyłane ponownie `sat` podczas pracy anuluje strojenie i przywraca poprzedni offset.
-
-Opcja `sat` działa również w trybie **FOC** — offset fazy jest tak samo ważny dla poprawnego mapowania Hall→kąt w transformacie Parka.
-
-Wynik i bieżący offset są automatycznie **zapisywane do NVS** po zakończeniu auto-tune. Komendy `so+`, `so-`, `so:N` również zapisują do NVS.
-
-Całkowity czas: ~25 kroków × 1s = ~25 sekund (domyślne).
-
-### Stałe sinusoidalne
-
-| Stała | Wartość | Opis |
-|---|---|---|
-| `SINE_STALL_FREEZE_MS` | 200 ms | Brak Halla → zamrożenie kąta (z wyjątkiem crawl) |
-| `SINE_CRAWL_SPEED_Q16` | 315 | Minimalna prędkość crawl ≈ 1 obr.elekt./s |
-| `SINE_STALL_FALLBACK_MS` | 400 ms | Minimalny timeout safety fallback |
-| `SINE_START_MAX_HALL_US` | 30000 µs | Max okres Halla do wejścia w SINUS |
-| `SINE_PHASE_CORR_SHIFT` | 0 | Korekcja kąta: pełny błąd na przejście Halla |
-| `SINE_SAFE_MAX_DUTY` | 75% PWM_MAX (375) | Limit bezpieczeństwa amplitudy (SVPWM) |
-| `SINE_MIN_AMPLITUDE` | 8 | Poniżej tego: coast (zapobiega hamowaniu EM) |
-| `SINE_TABLE_SIZE` | 96 | Wpisów w tablicy sinusów (= 360° elektr.) |
-
-### Per-sector speed (kompensacja nierównych Halli)
-
-Czujniki Halla w silniku mogą być nierównomiernie rozmieszczone — np. 3 sektory
-mają okresy ~1000 µs, a 3 pozostałe ~1200 µs (rozrzut 30–40%). Przy użyciu
-globalnej prędkości kąt „szarpie" na przejściach między wąskimi i szerokimi sektorami.
-
-Rozwiązanie: tablica `g_sine_sector_speed[6]` pamięta **ostatnią zmierzoną prędkość**
-dla każdego sektora. Przy wejściu w nowy sektor PLL używa zapamiętanej prędkości
-tego sektora (zamiast globalnej), co eliminuje oscylacje kąta:
-
-```
-Sektor wychodzący: g_sine_sector_speed[old] = 3/4 × measured + 1/4 × old  (filtr)
-Sektor wchodzący:  speed = g_sine_sector_speed[new]  (użycie zapamiętanej)
-```
-
-Jeśli sektor jest odwiedzany po raz pierwszy (speed = 0), używana jest
-bieżąca zmierzona prędkość jako fallback.
-
-### PLL — korekcja prędkości
-
-Na każdym przejściu Halla, oprócz korekcji kąta, PLL koryguje też prędkość:
-
-```
-speed_err = (expected_angle - actual_angle)
-speed += speed_err >> 13   // wzmocnienie PLL (2× silniejsze niż >>14)
-```
-
-To domyka pętlę PLL — kąt jest korygowany natychmiast, a prędkość jest
-dostosowywana stopniowo, co eliminuje systematyczny dryf.
-
-### Aktywacja
-
-- Komenda `S` (natychmiastowa, bez Enter) lub `m2` + Enter
-- Silnik startuje bezpośrednio w trybie sinusoidalnym (bez fazy blokowej)
-- Z miejsca: tryb crawl rusza silnik, potem przejście na śledzenie Halla
-- Powrót do trybu blokowego: komenda `e`
-- Wyłączenie silnika: komenda `d`
-
----
-
-## Timer sprzętowy i ISR
-
-Komutacja silnika odbywa się w przerwaniu **TEZ (Timer Equals Zero)** peryferium MCPWM.
-TEZ = dolina center-aligned PWM — optymalny moment na pomiar prądu (wszystkie low-side ON).
-
-```cpp
-// Rejestracja ISR MCPWM z flagą IRAM (kod + dane w RAM, nie flash)
-mcpwm_isr_register(MCPWM_UNIT_0, onCommutationTimer, NULL,
-                    ESP_INTR_FLAG_IRAM, &g_mcpwm_isr_handle);
-// Włączenie przerwania TEZ dla Timer 0
-mcpwm_ll_intr_enable_timer_tez(&MCPWM0, 0, true);
-```
-
-**Częstotliwość ISR:** 20 kHz (identyczna z PWM — jedno przerwanie na cykl PWM).  
-**Wyzwalanie:** TEZ (Timer Equals Zero) = dolina center-aligned PWM.
-
-ISR jest oznaczona `IRAM_ATTR` i zarejestrowana z `ESP_INTR_FLAG_IRAM` —
-cały kod ISR i wywoływane funkcje muszą być w RAM (nie flash cache).
-Wszystkie helpery komutacji (`phaseX_PWM/Low/Off`, `mcpwm_phase_*`, `allMosfetsOff`,
-`hallToSector`, `sine_interp_q16`) mają atrybuty `static inline IRAM_ATTR`.
-
-W ISR odczyt Halli odbywa się bezpośrednio z rejestru hardware:
-```cpp
-uint8_t ha = (GPIO.in >> PIN_HALL_SENSOR_A) & 1;
-```
-To jest szybsze i bezpieczniejsze w ISR niż `digitalRead()`.
-
-Zapis PWM w ISR używa bezpośrednich zapisów rejestrów MCPWM (LL level):
-```cpp
-// Zapis compare value (~5 ns, bez spinlocków)
-mcpwm_ll_operator_set_compare_value(&MCPWM0, op, cmp, duty);
-// Zapis trybu generatora (force/PWM)
-MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_PWM;  // np. high-side PWM
-```
-
-**Dlaczego bezpośrednie rejestry zamiast driver API:**
-- `mcpwm_set_duty_type()` i inne funkcje driver używają `portENTER_CRITICAL()` (spinlock)
-- Spinlocki w ISR level 3 powodują crash (Guru Meditation: Cache disabled but cached memory region accessed)
-- Bezpośrednie zapisy LL są ~100× szybsze i ISR-safe
-
----
-
-## Wyświetlacz S866 — protokół 2
-
-Sterownik komunikuje się z wyświetlaczem S866 przez **Serial2** (UART2):
-- **TX:** GPIO17, **RX:** GPIO16, **9600 baud**, 8N1
-- Level shifter **TXB0102DCU** (3.3V ↔ 5V), włączany przez GPIO5 (UART_EN)
-- Wyświetlacz jest **zawsze aktywny** (nie wymaga komendy do uruchomienia)
-
-### Ramka RX (wyświetlacz → sterownik): 20 bajtów
-
-| Bajt | Pole | Opis |
-|------|------|------|
-| 0    | Header | Zawsze 0x0C |
-| 1-14 | Parametry | Dane konfiguracyjne i sterujące |
-| 15-18 | Rezerwa | |
-| 19   | Checksum | XOR bajtów 0-18 |
-
-Kluczowe parametry z RX:
-- **assist_level:** poziom wspomagania (raw: 0, 3, 6, 9, 12, 15 → wyświetlacz: 0-5)
-- **headlight:** światło ON/OFF
-- **cruise_control:** tempomat ON/OFF
-
-### Ramka TX (sterownik → wyświetlacz): 14 bajtów
-
-Wysyłane dane:
-- **error:** kod błędu (0 = OK)
-- **brake_active:** hamulec aktywny
-- **current_x10:** prąd ×10 [0.1 A]
-- **wheeltime_ms:** czas obrotu koła [ms] (wyświetlacz przelicza na km/h)
-
-### Konfiguracja P01-P20
-
-Wyświetlacz S866 ma parametry konfiguracyjne P01-P20. Niektóre są przesyłane w ramce RX, inne są lokalne na wyświetlaczu:
-
-| Parametr | Opis | Źródło |
-|----------|------|--------|
-| P01-P04  | Jasność, jednostki, napięcie, auto-off | Lokalne |
-| P05      | Poziomy wspomagania (3/5/9) | Ramka RX |
-| P06      | Rozmiar koła (×10, np. 260=26") | Ramka RX |
-| **P07**  | **Liczba impulsów Halla na obrót koła** | Ramka RX |
-| P08      | Limit prędkości [km/h] | Ramka RX |
-| P09      | Tryb startu (0=od zera, 1=po pedałowaniu) | Ramka RX |
-| P10      | Tryb jazdy | Ramka RX |
-| P11-P13  | PAS: czułość, start, magnesy | Ramka RX |
-| P14      | Limit prądu [A] | Ramka RX |
-| P15      | Podnapięcie (×10) [V] | Ramka RX |
-| P16-P20  | Komunikacja, tempomat, gaz, power assist, protokół | Lokalne/Ramka |
-
-> **P07 — kluczowy parametr:**
-> - P07 > 1: silnik direct-drive (np. P07=90 = 6 przejść Halla × 15 par biegunów)
-> - P07 ≤ 1: silnik przekładniowy — użyj czujnika SPEED (GPIO21)
-
-### Poziomy wspomagania
-
-Wyświetlacz wysyła `assist_level` jako wartości surowe: 0, 3, 6, 9, 12, 15.
-- Podział przez 3 → numer poziomu 0-5 na wyświetlaczu
-- Podział przez 15 → współczynnik max duty (0%, 20%, 40%, 60%, 80%, 100%)
-
----
-
-## Pomiar prędkości
-
-Dwa tryby pomiaru zależne od parametru P07 z wyświetlacza:
-
-### Tryb 1: Direct-drive (P07 > 1)
-
-Mierzone w ISR timera komutacji (20 kHz) — czas między przejściami stanów Halla:
-
-```
-wheeltime_ms = hall_period_us × P07 / 1000
-```
-
-Gdzie P07 = 6 × pole_pairs (np. 90 dla silnika 15-biegunowego). ISR mierzy `hall_period_us` **zawsze**, nawet gdy silnik nie jest napędzany (wykrywa toczenie koła).
-
-### Tryb 2: Silnik przekładniowy (P07 ≤ 1)
-
-Zewnętrzny czujnik prędkości na GPIO21 (INPUT_PULLUP, zbocze opadające):
-
-```
-wheeltime_ms = speed_period_us / 1000
-```
-
-Jeden magnes na kole = jeden impuls na obrót.
-
-### Timeout
-
-- Direct-drive: timeout 2 s od ostatniego przejścia Halla → RPM = 0
-- Czujnik SPEED: timeout 3 s od ostatniego impulsu → RPM = 0
-
-### Obliczanie RPM
-
-```
-RPM = 60000 / wheeltime_ms
+```text
+platformio.ini
+├── include/
+│   ├── pinout.h          Hardware pins and MCPWM timing constants
+│   ├── bldc_types.h      Drive modes, phase states, and runtime state
+│   ├── bldc_config.h     NVS configuration layout and public API
+│   └── display_s866.h    S866 protocol types and service API
+├── src/
+│   ├── main.cpp          Setup, control loop, MCPWM ISR, control modes,
+│   │                      sensors, serial commands, Wi-Fi API, diagnostics
+│   ├── bldc_config.cpp   Preferences/NVS load, validation, defaults, save
+│   └── display_s866.cpp  S866 frame parsing, checksum, and telemetry TX
+└── SINUS_POWER_FIX_PLAN.md
+                       Engineering notes for SINUS/FOC power investigations
 ```
 
----
+The firmware has four primary execution paths:
 
-## Obliczanie mocy
+1. `setup()` initializes NVS, GPIO, ADC1, PAS sampling, MCPWM, the safe all-MOSFET-off state, the 20 kHz commutation timer, S866, and the Wi-Fi dashboard.
+2. `loop()` reads and filters slower inputs, calculates throttle/PAS targets, applies ramps and limits, runs the FOC current loop when selected, services S866 and HTTP clients, processes serial commands, and emits diagnostics.
+3. `onCommutationTimer()` runs on the MCPWM TEZ event. It samples phase current and Hall inputs, validates Hall transitions, updates speed/angle state, then dispatches BLOCK, SINUS, FOC, or regenerative commutation through direct MCPWM register writes.
+4. Telemetry is sent to the S866 display, the serial console, and the local HTTP dashboard from the non-ISR path.
 
-Moc jest obliczana w `loop()` jako:
+## 🧩 Core Modules
 
-```
-P [W] = V_bat [V] × I_max [A]
-```
-
-Gdzie `I_max` = maksimum z prądów trzech faz (Ia, Ib, Ic).
-
-### Tryby pracy
-
-| Stan | `power_watts` | `regen_power_watts` |
-|------|---------------|---------------------|
-| Motoring (silnik napędzany) | P = Vbat × Imax | 0 |
-| Regen (hamowanie regeneracyjne) | 0 | P = Vbat × Imax |
-| Wyłączony / coast | 0 | 0 |
-
-Moc jest wyświetlana w statusie jako `P:XX.XW`, a regen jako `RGN:XX.XW`.
-
----
-
-## Hamowanie regeneracyjne
-
-### Zasada działania
-
-Hamowanie rekuperacyjne wykorzystuje silnik BLDC jako generator — energia kinetyczna jest zamieniana na prąd ładujący baterię. Implementacja bazuje na **low-side boost chopper**:
-
-1. **PWM ON** (LS ON): uzwojenie silnika jest zwarte przez GND → prąd narasta napędzany przez back-EMF, energia gromadzi się w indukcyjności uzwojenia
-2. **PWM OFF** (LS OFF): prąd indukcyjny nie może się zatrzymać → napięcie rośnie → prąd płynie przez body diodę high-side FET do V+ → **bateria jest ładowana**
-
-### Tabela komutacji regen
-
-Transformacja motoring → regen:
-- Faza źródłowa (dawniej HS_PWM) → **LS_PWM** (regen)
-- Faza sink (dawniej LS_ON) → **LS_ON** (bez zmian)
-- Faza float → **float** (bez zmian)
-
-| Hall [CBA] | Motoring | Regen |
-|---|---|---|
-| 1 (001) | A=HS_PWM, B=LS_ON | A=**LS_PWM**, B=LS_ON, C=float |
-| 3 (011) | A=HS_PWM, C=LS_ON | A=**LS_PWM**, B=float, C=LS_ON |
-| 2 (010) | B=HS_PWM, C=LS_ON | A=float, B=**LS_PWM**, C=LS_ON |
-| 6 (110) | B=HS_PWM, A=LS_ON | A=LS_ON, B=**LS_PWM**, C=float |
-| 4 (100) | C=HS_PWM, A=LS_ON | A=LS_ON, B=float, C=**LS_PWM** |
-| 5 (101) | C=HS_PWM, B=LS_ON | A=float, B=LS_ON, C=**LS_PWM** |
-
-### Sterowanie duty regen
-
-IR2103 LIN jest odwrócony — MCPWM gen_B w trybie regen używa odwróconych akcji
-(GEN_B_ACTION_MODE1: UP=HIGH, DOWN=LOW), co daje odwrócone duty na LIN:
-```cpp
-MCPWM0.operators[op].generator[1].val = GEN_B_ACTION_MODE1;  // gen_B inverted
-mcpwm_set_compare_fast(op, 1, regen_duty);                     // compare_B = regen_duty
-MCPWM0.operators[op].gen_force.val = MCPWM_FORCE_REGEN;        // gen_A=forceLOW, gen_B=PWM
-```
-
-| duty | Efekt |
-|------|-------|
-| 0 | Brak hamowania (coast) |
-| 50% | Umiarkowane hamowanie |
-| 80% | Mocne hamowanie (REGEN_MAX_DUTY limit) |
-| 100% | ⚠️ Zabronione! Brak fazy OFF = brak transferu do baterii |
-
-### Aktywacja
-
-Regen jest włączany komendą `R` (toggle). Gdy aktywny, hamowanie regeneracyjne następuje automatycznie przy naciśnięciu hamulca, pod warunkiem:
-- **Vbat < 42V** (VBAT_REGEN_CUTOFF) — ochrona przed przepięciem
-- **RPM > 50** (REGEN_MIN_RPM) — poniżej back-EMF za niskie
-
-Jeśli warunki nie są spełnione → coast (allMosfetsOff).
-
-### Zabezpieczenia
-
-- **Przepięcie:** monitor Vbat — regen wyłączany powyżej 42V
-- **Duty max 80%:** REGEN_MAX_DUTY — gwarantuje fazę OFF na transfer energii
-- **Min RPM:** regen nieefektywny przy niskich obrotach (tylko grzeje)
-- **Shoot-through:** w trybie regen WSZYSTKIE high-side FET OFF
-
-> **Uwaga:** INA180A2 jest jednokierunkowy. W trybie regen poprawnie mierzy prąd na fazie z LS_PWM (kierunek drain→source). Na fazie sink (prąd source→drain) widzi ~0V.
-
----
-
-## Przepustnica i poziomy wspomagania
-
-### Sprzęt
-
-- **Pin:** GPIO33 (ADC1_CH5)
-- **Martwa strefa:** wartości ADC < 400 → duty = 0
-- **Zakres roboczy:** 400–2600 ADC
-
-> Zakres 400–2600 został skalibrowany empirycznie dla konkretnej przepustnicy.  
-> Jeśli przepustnica ma inny zakres, zmień `THROTTLE_DEAD_ZONE`, `THROTTLE_MIN_RAW`, `THROTTLE_MAX_RAW` w `main.cpp`.
-
-### Filtr szumów ADC przepustnicy (burst + outlier rejection + EMA)
-
-GPIO33 (ADC1_CH5) jest podatny na szpilki EMI od PWM silnika. Pojedyncza szpilka
-poniżej progu dead-zone dawałaby `duty=0` i stall silnika. Zastosowano
-3-stopniowy pipeline filtracji:
-
-```
-  analogRead() × N
-       │
-  ┌────┴────┐
-  │ BURST   │  N próbek w szybkim burście (domyślnie 8)
-  └────┬────┘
-       │
-  ┌────┴─────────┐
-  │ SORTOWANIE   │  Insertion sort → mediana
-  └────┬─────────┘
-       │
-  ┌────┴──────────────┐
-  │ OUTLIER REJECTION │  Odrzucenie próbek > threshold od mediany
-  └────┬──────────────┘
-       │
-  ┌────┴────┐
-  │ ŚREDNIA │  Z pozostałych (valid) próbek
-  └────┬────┘
-       │
-  ┌────┴────┐
-  │  EMA    │  α = 0.15, wygładzenie czasowe
-  └────┬────┘
-       │
-    thr_ema → mapowanie na duty
-```
-
-**Etap 1 — Burst sampling:**  
-Odczyt N próbek ADC w szybkim burście (pętla `analogRead()` bez opóźnień).  
-Parametr `thr_samples` (NVS, domyślnie 8, zakres 2–16).
-
-**Etap 2 — Insertion sort + mediana:**  
-Próbki sortowane (O(N²), ale N≤16 — szybkie). Mediana = element środkowy tablicy.
-
-**Etap 3 — Outlier rejection (odrzucanie szpilek):**  
-Każda próbka oddalona od mediany o więcej niż `thr_outlier_thresh` (NVS, domyślnie 150,
-zakres 10–2000 jednostek ADC) jest odrzucana. Pozostają tylko próbki „w okolicy" mediany.
-
-**Etap 4 — Średnia z valid próbek:**  
-Średnia arytmetyczna próbek, które przeżyły filtr odchyleń. Jeśli żadna nie przeżyła
-(skrajny przypadek), zwraca medianę.
-
-**Etap 5 — EMA (Exponential Moving Average):**  
-```
-thr_ema += α × (burst_avg − thr_ema)
-```
-α = 0.15. Wygładza wynik w czasie — eliminuje jednorazowe odchyłki między burstami.
-
-| Parametr | Wartość | NVS komenda | Opis |
-|---|---|---|---|
-| `thr_samples` | 8 | `cfg:thrsamp:N` | Liczba próbek w burście (2–16) |
-| `thr_outlier_thresh` | 150 | `cfg:thrdelta:N` | Max odchylenie od mediany (10–2000) |
-| `kThrottleFilterAlpha` | 0.15 | — | Stała EMA (w kodzie) |
-
-> **Uwaga:** Przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają z **ADC1** — nie ma konfliktu z WiFi.  
-> Odczyty ADC przepustnicy i temperatury FET działają poprawnie niezależnie od stanu WiFi.
-
-### Mapowanie proporcjonalne (wspólny algorytm BLOCK / SINUS / FOC)
-
-Przepustnica działa **proporcjonalnie** do aktualnego poziomu wspomagania z wyświetlacza S866. Zmiana poziomu zmienia zakres wyjściowy gazu, a nie obcina go — pełen zakres przepustnicy zawsze daje gładkie sterowanie od 0 do maxDuty.
-
-Algorytm (dwie funkcje wyekstrahowane do ponownego użycia we wszystkich trybach):
-
-1. **`getAssistMaxDuty()`** — oblicza maksymalne duty z poziomu wspomagania:
-
-| Wyświetlacz | Assist level | maxDuty |
-|---|---|---|
-| Nie podłączony | — | 100% (standalone) |
-| Podłączony | 0 | 0% (silnik wyłączony) |
-| Podłączony | 1 (raw=3) | 20% |
-| Podłączony | 2 (raw=6) | 40% |
-| Podłączony | 3 (raw=9) | 60% |
-| Podłączony | 4 (raw=12) | 80% |
-| Podłączony | 5 (raw=15) | 100% |
-
-2. **`mapThrottleToDuty(raw, maxDuty)`** — mapuje pełen zakres ADC przepustnicy na 0–maxDuty:
-
-```
-duty_target = map(throttle_raw, 400, 2600, 0, maxDuty)
-```
-
-Przykład: przy assist level 3 (maxDuty=60%) pełen gaz daje 60%, połowa gazu daje 30%.  
-Przy starym podejściu (clamp): pełen gaz dałby 60%, ale połowa gazu — 50% (powyżej progu = obcięte), co dawało słabą rozdzielczość na niższych poziomach.
-
-Przepustnica jest odczytywana we wszystkich aktywnych trybach sterowania (`mode != DISABLED`).  
-Dzięki temu algorytm mapowania działa identycznie dla BLOCK, SINUS i FOC — bez modyfikacji.
-
-Komendy UART (`+`, `-`, liczba%) ustawiają `duty_target` i natychmiast synchronizują `g_duty_ramped` (bez rampy — feedback ręcznego sterowania powinien być natychmiastowy). Przepustnica nadpisuje tę wartość w każdej iteracji `loop()`.
-
----
-
-## Rampa rozpędzania
-
-Silnik nigdy nie otrzyma natychmiastowego skoku duty. Zaimplementowana rampa ogranicza szybkość zmiany `duty_cycle` w czasie — zarówno w górę jak i w dół.
-
-### Zasada działania
-
-```
-Przepustnica → duty_target (docelowe)
-                    │
-              ┌─────┴─────┐
-              │   RAMPA   │
-              └─────┬─────┘
-                    │
-              duty_cycle (rzeczywiste) → ISR → silnik
-```
-
-- **Wzrost (rozpędzanie):** duty_cycle narasta płynnie, ograniczone czasem rampy
-- **Spadek (zwalnianie):** duty_cycle maleje płynnie, tą samą rampą (symetrycznie)
-- **Hamulec aktywny:** rampa jest **zerowana** (`g_duty_ramped = 0`) — po puszczeniu hamulca silnik startuje od 0 z pełną rampą rozpędzania, bez nagłego skoku mocy
-- **Dodatkowy limit:** `duty_max_step_pct` (EEPROM, domyślnie 5%) — max % zmiany duty na jedno wywołanie loop()
-
-### Parametry
-
-| Parametr | Wartość | Opis |
-|---|---|---|
-| `ramp_time_ms` | 1200 ms (domyślnie) | Czas przejścia 0→100% duty (i 100%→0%) |
-| `duty_max_step_pct` | 5% (EEPROM) | Max zmiana duty na wywołanie [% PWM_MAX] (0=brak limitu) |
-| Krok rampy | obliczany z dt | `max_step = min(ramp_step, pct_step)` |
-| `ramp_time_ms = 0` | — | Rampa wyłączona (duty_max_step_pct dalej aktywny) |
-
-Rampa jest oparta na rzeczywistym czasie (`micros()`), więc działa poprawnie niezależnie od szybkości `loop()`.
-
-Rampa jest resetowana do 0 przy:
-- komendzie `d` (disable) — silnik wyłączony
-- hamulcu aktywnym — zapobiega szarpnięciu po puszczeniu hamulca
-
-Po puszczeniu hamulca, jeśli przepustnica jest wciśnięta, silnik rozpędza się płynnie od 0 z pełną rampą.
-
-### Status
-
-Duty w diagnostyce wyświetla się jako `D:aktualny/docelowy%`, np.:
-- `D:35/80%` — rampa w trakcie narastania (35% aktualnie, docelowo 80%)
-- `D:80/30%` — rampa w trakcie spadku (80% aktualnie, docelowo 30%)
-- `D:80/80%` — rampa osiągnęła cel
-- `D:0/0%` — silnik wyłączony
-
----
-
-## PAS — Pedal Assist Sensor
-
-System wspomagania pedałowania (PAS) wykrywa kierunek i aktywność pedałowania,
-a następnie steruje mocą silnika dążąc do prędkości docelowej zależnej od poziomu
-wspomagania ustawionego na wyświetlaczu.
-
-### Sprzęt
-
-- **Pin:** GPIO22 (INPUT_PULLUP)
-- **Czujnik:** Hall z asymetrycznym dyskiem magnesów (12 magnesów domyślnie, P13)
-- **Sygnał:** stan HIGH i LOW o różnym czasie trwania → detekcja kierunku
-
-### Filtr cyfrowy — timer próbkujący (zamiast przerwania)
-
-Wcześniejsza metoda: przerwanie GPIO na obu zboczach (`CHANGE`). Problem:
-szpilki EMI z komutacji silnika (µs do kilku ms) odpalały ISR i fałszowały
-pomiary HIGH/LOW time oraz odświeżały timestampy — zwłaszcza przy dużych
-prędkościach silnika, gdzie szum EMI jest najintensywniejszy.
-
-**Nowa metoda:** timer `esp_timer` próbkuje pin PAS co **500 µs** (2 kHz)
-i stosuje filtr cyfrowy z potwierdzeniem:
-
-```
-  Pin PAS (surowy):  ____████_██__████████████████████████___________████████████
-                          ↑ szpilki EMI           ↑ realna zmiana stanu
-  Próbki (co 500µs): LLLLHHLHLLLHHHHHHHHHHHHHHHHHHHHHHHHLLLLLLLLLLLLLHHHHHHHHHH
-  Stan filtrowany:   LLLLLLLLLLLLLLLLLLLLLL→H (po N zgodnych)       LLL→H
-```
-
-**Algorytm filtra:**
-1. Timer co 500 µs czyta pin PAS (`GPIO.in >> PIN_PAS`)
-2. Jeśli próbka == aktualny stan filtrowany → reset licznika (stan potwierdzony)
-3. Jeśli próbka != stan filtrowany → inkrementuj licznik
-4. Gdy licznik osiągnie **N** (`g_pas_filter_depth`) → akceptuj zmianę stanu
-5. Zmiana stanu wywołuje `processPasFilteredEdge()` — logikę detekcji kierunku
-
-**Głębokość filtra:**
-```
-N = pas_debounce_us / PAS_SAMPLE_INTERVAL_US
-```
-- Domyślnie: 3000 / 500 = **6 próbek = 3 ms** potwierdzenia
-- Szpilka EMI (< 1 ms) nie utrzyma się przez 6 × 500 µs → odfiltrowana
-- Burst szpilek (np. co 2–4 ms z komutacji): wystarczy **jedna** próbka zgodna
-  ze starym stanem aby zresetować licznik → burst nie przechodzi
-- Realny impuls PAS przy 150 RPM / 12 magnesów: min half-period ≈ 17 ms →
-  filtr 3 ms nie wpływa na realne pomiary
-
-**Dlaczego lepsze od debounce na przerwaniu:**
+| Module | Responsibility |
+| --- | --- |
+| [`src/main.cpp`](src/main.cpp) | Complete runtime orchestration: initialization, sensor acquisition, throttle/PAS logic, Hall processing, block/sinus/FOC/regen commutation, current limiting, serial commands, Wi-Fi server, dashboard data, and diagnostics. |
+| [`include/bldc_types.h`](include/bldc_types.h) | `drive_mode_t`, phase-state definitions, Hall state constants, and the shared `bldc_state_t` runtime model. |
+| [`include/pinout.h`](include/pinout.h) | ESP32 GPIO assignment, MCPWM resolution/period, default PWM frequency, duty range, and dead-time constants. |
+| [`include/bldc_config.h`](include/bldc_config.h) | Packed `controller_config_t`, `CONFIG_MAGIC`, `CONFIG_VERSION`, and NVS API declarations. |
+| [`src/bldc_config.cpp`](src/bldc_config.cpp) | Loads the binary configuration from the `bldc/cfg` NVS entry, applies defaults when validation fails, and persists updates. |
+| [`include/display_s866.h`](include/display_s866.h) | S866 frame sizes, protocol fields, display configuration model, and service interface. |
+| [`src/display_s866.cpp`](src/display_s866.cpp) | Polling UART service, XOR checksum validation, sliding-window frame resynchronization, connection timeout handling, and 14-byte responses. |
+| [`SINUS_POWER_FIX_PLAN.md`](SINUS_POWER_FIX_PLAN.md) | Current engineering notes and test hypotheses for SINUS/FOC power behavior; it is not a production validation report. |
 
-| Cecha | Przerwanie + debounce | Timer próbkujący |
-|---|---|---|
-| Szpilka EMI 0.5 ms | Odfiltrowana (ok) | Odfiltrowana (ok) |
-| Burst szpilek co 4 ms | Przechodzą (> debounce 3 ms) | Odfiltrowane (reset licznika) |
-| Pomiary HIGH/LOW time | Fałszowane przez szpilki | Czyste (tylko potwierdzone krawędzie) |
-| Detekcja kierunku przy dużej prędkości | Zaśmiecona EMI | Stabilna |
-| Zaginiony impuls | Szpilka zjada timestamp | Nie występuje |
+## 🔄 Data Flow / API Overview
 
-| Parametr | Wartość | NVS komenda | Opis |
-|---|---|---|---|
-| `PAS_SAMPLE_INTERVAL_US` | 500 µs | — | Okres próbkowania (stała w kodzie) |
-| `pas_debounce_us` | 3000 µs | `pasdbnc:N` | Czas potwierdzenia stanu (500–10000) |
-| `g_pas_filter_depth` | 6 | — | Obliczane: debounce_us / 500 |
+### Control and telemetry flow
 
-### Detekcja kierunku (`processPasFilteredEdge`)
+| Step | Component | Responsibility |
+| --- | --- | --- |
+| 1 | `config_init()` | Load and validate the 70-byte NVS configuration, or create defaults. |
+| 2 | `loop()` input path | Read battery voltage, phase current snapshots, throttle, Hall state, brake, PAS, and display data. |
+| 3 | Control calculation | Combine throttle/PAS demand, apply ramps, speed/current limits, regen conditions, and calculate FOC d/q voltage targets when applicable. |
+| 4 | `onCommutationTimer()` | Execute the deterministic 20 kHz TEZ path and update the three MCPWM operators for the active control mode. |
+| 5 | Output interfaces | Send S866 telemetry, serial diagnostics, and JSON telemetry to the local web dashboard. |
 
-Po przejściu filtra cyfrowego, przefiltrowane krawędzie są przetwarzane:
+### HTTP API
 
-- **RISING edge** → koniec okresu LOW, zapis `low_time`
-- **FALLING edge** → koniec okresu HIGH, zapis `high_time`, obliczenie kierunku
+The ESP32 starts an open local access point named `BLDC_Config` and serves HTTP on `192.168.4.1:80`. The HTML dashboard is compiled into the firmware.
 
-Detekcja kierunku z histerezą:
-1. Oblicz asymetrię: `diff = |HIGH - LOW|`
-2. Jeśli `diff > 5%` okresu → kierunek jednoznaczny
-3. **Histereza:** licznik `confidence` (±5) — wymaga kilku zgodnych krawędzi przed zmianą `g_pas_forward`
-4. Jeśli `diff ≤ 5%` → magnesy symetryczne, kierunek nie zmieniany
-5. `pas_dir_invert` (NVS) — odwraca konwencję HIGH>LOW=forward
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/` | Embedded control and diagnostics dashboard. |
+| `GET` | `/api/config` | Current NVS-backed configuration, assist override, and queued command field. |
+| `GET` | `/api/telemetry` | Current mode, speed, power, duty, Hall/PAS state, currents, FOC values, display data, and fault state. |
+| `GET`, `POST` | `/api/cmd` | Execute a serial-style command. The command is supplied as the `cmd` argument or form body. |
+| `POST` | `/api/queue` | Store a command string in the in-memory queued-command field. The current code exposes the field but does not contain a consumer that executes it later. |
+| Any other path | Redirect | Captive-portal requests are redirected to `/`. |
 
-Debounce półokresów: krawędzie krótsze niż 5 ms (`PAS_MIN_HALFPERIOD_US`) są odrzucane.
+## 🛠️ Getting Started
 
-Długi timeout (> 2 s bez krawędzi): reset pomiarów HIGH/LOW — zapobiega mieszaniu
-starych i nowych pomiarów po przerwie w pedałowaniu.
+### Requirements
 
-### Algorytm sterowania (`calculatePasDuty`)
+- An ESP32 board compatible with the PlatformIO `esp32dev` board definition.
+- PlatformIO Core or the PlatformIO IDE extension for VS Code.
+- A USB connection capable of uploading firmware and opening a serial monitor.
+- A correctly wired three-phase power stage, IR2103 gate drivers, Hall sensors, current-sense circuits, throttle/brake/PAS inputs, and suitable power protection.
+- An S866 display is expected by the default configuration (`display_required = 1`). Standalone operation can be enabled through the firmware command interface and fallback settings.
 
-```
-Wejścia:
-  isPedalingForward — flaga z ISR (kierunek + histereza)
-  Lx                — poziom wspomagania (raw 0–15 z wyświetlacza)
-  v_curr            — prędkość koła [km/h] (MA z 8 próbek)
-  v_max             — P08 limit prędkości [km/h]
-
-Stany:
-  IDLE  → brak impulsów lub reverse → duty = 0
-  WAIT  → forward, ale < pas_start_delay_ms → duty = 0
-  ACTIVE → forward >= pas_start_delay_ms → sterowanie mocą
-```
-
-**Sekwencja w stanie ACTIVE:**
-
-1. **Soft-start:** moc narasta liniowo 0→100% w czasie `pas_ramp_ms` (domyślnie 1500 ms)
-2. **V_target:** oblicz prędkość docelową z poziomu wspomagania:
-   ```
-   V_target = 6 + Lx × (v_max − 6) / 15
-   ```
-   | Poziom (wyśw.) | Raw Lx | V_target (v_max=25) |
-   |---|---|---|
-   | L0 | 0 | — (silnik OFF) |
-   | L1 | 3 | 9.8 km/h |
-   | L2 | 6 | 13.6 km/h |
-   | L3 | 9 | 17.4 km/h |
-   | L4 | 12 | 21.2 km/h |
-   | L5 | 15 | 25.0 km/h |
-
-3. **PI regulator prędkości docelowej** (zamiast liniowej rampy):
-   - `error = V_target − speed_kmh` (>0 = poniżej targetu)
-   - `P = Kp × error` (człon proporcjonalny)
-   - `I += Ki × error × dt` (człon całkowy z anti-windup: clamp do [0, 1])
-   - `speed_factor = clamp(P + I, 0, 1)` — współczynnik mocy
-   - Parametry: `pas_speed_kp` (×0.01, dom. 30=0.30), `pas_speed_ki` (×0.01/s, dom. 5=0.05)
-   - PI reset na: timeout PAS, reverse, assist=0
-
-4. **Dwuprogowa histereza freewheel:**
-   - Wejście w freewheel: `speed_kmh ≥ V_target + hyst_off` → duty = 0 (allMosfetsOff = wysoka impedancja)
-   - Wyjście z freewheel: `speed_kmh < V_target − hyst_on` → PI włączony
-   - Parametry: `pas_hyst_off` (dom. 2 km/h), `pas_hyst_on` (dom. 2 km/h)
-   - Zapobiega oscylacjom włącz/wyłącz wokół limitu prędkości
-
-5. **Grace period** (`run_grace_s`, dom. 3s): przez N sekund po wejściu w stan RUN
-   PI nie limituje prędkości — pełna moc na rozruch.
-
-6. **Slew rate limiter:** duty zmienia się max ±30 PWM na wywołanie (~6% z 500).
-   Przy ~2 kHz pętli = max ~60%/s. Zapobiega skokom duty.
-
-7. **Globalny limit P08:** stosowany osobno przez `applyGlobalSpeedLimit()` (dotyczy też manetki).
-
-### Filtracja prędkości (Moving Average)
-
-Surowy odczyt `wheel_speed_kmh` jest niestabilny (1 impuls/obrót → skoki wheeltime).
-PAS używa bufora kołowego 8 próbek ze średnią kroczącą:
-
-```
-speed_smooth = avg(speed_buf[0..7])
-```
-
-Zapobiega to oscylacjom duty w strefie ramp-down.
-
-### Forward holdoff (300 ms)
-
-Gdy ISR zgłosi reverse, PAS nie deaktywuje się natychmiast. Czeka 300 ms
-(`PAS_FWD_HOLDOFF_MS`) od ostatniego widzianego forward. Pojedyncze zaszumione
-odczyty kierunku nie przerywają wspomagania.
-
-Przy deaktywacji (timeout lub reverse) duty schodzi do zera z ograniczeniem
-slew rate — łagodne wygaszenie zamiast twardego odcięcia.
-
-### Wygładzone V_target (smooth transition)
-
-Gdy użytkownik zmienia poziom wspomagania w trakcie jazdy (np. L5→L3),
-V_target nie skacze natychmiast z 25 na 17.4 km/h. Zamiast tego przechodzi
-płynnie z prędkością ~10 km/h/s (stała `VTARGET_SLEW = 0.005 km/h` na wywołanie).
-
-Bez tego wygładzenia nagły spadek V_target powodował natychmiastowe
-zerowanie duty (bo speed > new_v_target), a następnie ponowne rozpędzanie
-po spadku prędkości — odczuwalne jako „uderzenie”. Z wygładzeniem duty maleje
-stopniowo, a prędkość koła płynnie dostosowuje się do nowej wartości docelowej.
-
-### Kombinacja PAS + Manetka (P10)
-
-Parametr P10 z wyświetlacza S866 określa tryb jazdy:
-
-| P10 | Tryb | Duty |
-|-----|------|------|
-| 0   | PAS + gaz | `max(throttle_duty, pas_duty)` |
-| 1   | Tylko gaz | `throttle_duty` |
-| 2   | Tylko PAS | `pas_duty` |
-
-Manetka działa w pełnym zakresie 0–PWM_MAX_DUTY (niezależnie od assist level).
-PAS jest ograniczony przez V_target zależny od poziomu wspomagania.
-
-### Zatrzymanie czujnika na magnesie (fix)
-
-Problęm: gdy magnes zatrzyma się tuż przy czujniku Halla, generowane są krótkie szpilki (~17 ms) co kilkanaście sekund. `since` resetuje się do ~17 ms po każdej szpilce, więc timeout (`pas_stop_delay_ms = 1000 ms`) nigdy nie zachodzi — silnik jest nadal napędzany mimo braku pedałowania.
-
-Rozwiązanie: dwa warunki stopu zamiast jednego:
-```
-timed_out    = (since > stop_delay_us)
-period_too_long = (period_us > stop_delay_us)   // NOWE
-stop = timed_out || period_too_long
-```
-Jeśli ostatni zmierzony **okres** jest dłuższy niż stop_delay — to nie jest realne pedałowanie, nawet jeśli ISR widział impulsy.
-
-> **Uwaga:** Przy wolnym pedałowaniu (np. 5 RPM, 1 magnes, period=12s) `stop_delay_ms` musi być ustawiony odpowiednio duże: `passtop:13000`.
-
-### Parametry NVS (konfigurowane komendami Serial)
-
-| Parametr | Domyślnie | Komenda | Opis |
-|---|---|---|---|
-| `pas_dir_invert` | 0 | `pasdir` | Odwróć konwencję kierunku (toggle) |
-| `pas_start_delay_ms` | 2000 | `passtart:N` | Czas ciągłego pedałowania forward do aktywacji [ms] |
-| `pas_stop_delay_ms` | 1000 | `passtop:N` | Timeout braku impulsów PAS → wyłącz wspomaganie [ms] |
-| `pas_ramp_ms` | 1500 | `pasramp:N` | Soft-start: czas narastania mocy 0→100% [ms] |
-| `pas_debounce_us` | 3000 | `pasdbnc:N` | Czas potwierdzenia stanu PAS [µs]. N=debounce/500 próbek filtra |
-| `pas_min_halfperiod_ms` | 5 | `pashalf:N` | Min półokres PAS [ms] (debounce krawędzi). 1–200 |
-| `pas_dir_asymmetry_pct` | 5 | `pasasym:N` | Próg asymetrii do detekcji kierunku [%]. 1–50 |
-| `pas_slew_rate` | 30 | `passlew:N` | Max zmiana duty PAS na krok. 1–100 (~6% PWM) |
-| `pas_fwd_holdoff_ms` | 300 | `pashold:N` | Holdoff reverse PAS [ms]. 50–2000 |
-| `pas_speed_kp` | 30 | `cfg:paskp:N` | PI Kp limitera prędkości (×0.01). 0–255 → 0.00–2.55 |
-| `pas_speed_ki` | 5 | `cfg:paski:N` | PI Ki limitera prędkości (×0.01/s). 0–255 → 0.00–2.55 |
-| `pas_hyst_off` | 2 | `cfg:pashystoff:N` | Histereza OFF [km/h]: wyłącz assist gdy speed ≥ V_target + N. 0–20 |
-| `pas_hyst_on` | 2 | `cfg:pashyston:N` | Histereza ON [km/h]: włącz assist gdy speed < V_target − N. 0–20 |
-
-### Diagnostyka
-
-**Status (auto-status):**
-- `PAS:ON 85% vt:14.9 sl:0.85` — aktywny, 85% duty, V_target=14.9 km/h, speed limit factor=0.85
-- `PAS:WAIT 850ms/2000ms fw:1 H:45000 L:32000` — w start delay, 850/2000 ms, forward=1, czasy H/L
-- `PAS:REV H:28000 L:35000` — kierunek reverse, czasy półokresów
-
-**Status (auto-status)** — linia `[PAS]` wyświetlana zawsze:
-```
-  [PAS] st:ON edges:3657 since:2ms H:124ms L:83ms asym:20% conf:5 fwd:1 rpm:23 fwd_ms:2350/2000 ped:1 inv:0 d:61% vt:22.8 sl:1.00
-```
-
-| Pole | Opis |
-|------|------|
-| `st:` | Stan: `STOP`/`WAIT`/`ON`/`REV` |
-| `edges:` | Licznik krawędzi ISR (róśnie przy pedałowaniu) |
-| `since:` | ms od ostatniego impulsu |
-| `H:/L:` | Czasy HIGH/LOW w ms |
-| `asym:` | Asymetria % (musi być >5% dla detekcji kierunku) |
-| `conf:` | Pewność kierunku -5..+5 |
-| `fwd:` | Aktualny kierunek (0=wstecz, 1=wprzód) |
-| `rpm:` | Wyliczona kadencja [RPM] |
-| `fwd_ms:/` | Czas pedałowania forward / wymagany start_delay |
-| `ped:` | Czy logika uznała pedałowanie za aktywne |
-| `inv:` | Czy kierunek odwrócony (`pasdir`) |
-| `d:/vt:/sl:` | (tylko gdy ON) duty%, V_target, speed-limit factor |
-
-**Komenda `pasdbg`:**
-```
-========== PAS DEBUG ==========
-HIGH time:  45123 us
-LOW time:   32456 us
-Period:     77579 us
-Duty H/L:   58% / 42%
-Asymetria:  16% (próg: 5%)
-g_pas_forward:    1 (confidence: 4)
-edge_count:       1234
-last_pulse:       15234 us ago
-pas_pedaling:     1
-fwd_since_ms:     12345
-active_since_ms:  10345
-pas_dir_invert:   0
-pas_start_delay:  2000 ms
-pas_stop_delay:   1000 ms
-pas_ramp:         1500 ms
-P13 magnets:      12
-================================
-```
-
-### Stałe
-
-| Stała | Wartość | Opis |
-|---|---|---|
-| `PAS_SAMPLE_INTERVAL_US` | 500 µs | Okres próbkowania timera PAS |
-| `PAS_MIN_HALFPERIOD_US` | 5000 µs | Min półokres PAS (debounce krawędzi) |
-| `PAS_DIR_MIN_ASYMMETRY` | 5% | Próg asymetrii do detekcji kierunku |
-| `PAS_SPEED_MA_SIZE` | 8 | Próbek w buforze Moving Average prędkości |
-| `PAS_SLEW_RATE_MAX` | 30 | Max zmiana duty na wywołanie (~3% PWM) |
-| `PAS_FWD_HOLDOFF_MS` | 300 ms | Czas podtrzymania forward po szumie reverse |
-
----
-
-## Sterowanie przez UART/Serial
-
-**Prędkość:** 115200 baud  
-**Port:** USB-UART (GPIO1 TX, GPIO3 RX) lub zewnętrzny UART przez GPIO17 (EN)
-
-### Tabela komend
-
-| Komenda         | Opis |
-|-----------------|------|
-| `e`             | Włącz silnik — tryb BLOCK |
-| `S`             | Włącz silnik — tryb SINUS |
-| `m2` Enter      | Włącz silnik — tryb SINUS (alternatywna) |
-| `m4` Enter      | Włącz silnik — tryb BLOCK12 (12-step) |
-| `m5` Enter      | Włącz silnik — tryb BLOCK12BL (12-step + duty blending) |
-| `d`             | Wyłącz silnik, duty = 0 |
-| `+`             | Zwiększ duty o 5% |
-| `-`             | Zmniejsz duty o 5% |
-| `0`–`100` Enter | Ustaw duty w % (np. `25` + Enter = 25%) |
-| `R`             | Regeneracja ON/OFF (hamowanie rekuperacyjne) |
-| `b`             | Symulacja hamulca ON/OFF (toggle) |
-| `P`             | Pokaż parametry wyświetlacza P01-P20 |
-| `s`             | Wyświetl status (jednorazowo) |
-| `a`             | Toggle auto-status co 1 s |
-| `h`             | Wyświetl pomoc |
-| `t` Enter       | Pomoc trybu testowego MOSFET |
-| `tAH` Enter     | Test faza A HIGH-side |
-| `tAL` Enter     | Test faza A LOW-side |
-| `tBH` Enter     | Test faza B HIGH-side |
-| `tBL` Enter     | Test faza B LOW-side |
-| `tCH` Enter     | Test faza C HIGH-side |
-| `tCL` Enter     | Test faza C LOW-side |
-| `tp:N` Enter    | Ustaw duty testowe na N% (1-50) |
-| `t0` Enter      | Wyłącz test MOSFET (wszystkie OFF) |
-| `so`           | Pokaż aktualny sine phase offset |
-| `so+` / `so-`  | Offset ±2 wpisy (±7.5°) |
-| `so:N`         | Ustaw offset na N (-48..+48) |
-| `sat`          | Auto-tune offsetu fazy (sweep ~25s) |
-| `sat:M:N`      | Auto-tune zakres M..N |
-| `sat:M:N:S`    | Auto-tune zakres M..N krok S |
-| `man`          | Manual duty ON/OFF (manetka ignorowana) |
-| `gdbg`         | Debug SINUS/BLOCK ON/OFF (co 200ms) |
-| `cdbg`         | Debug zdarzeniowy ON/OFF (ring buffer: przejścia Halla, kąt, duty) |
-| **FOC** | |
-| `F` / `m3`     | Włącz tryb FOC |
-| `foc`          | Pokaż status FOC (Vd/Vq, Id/Iq, PI, EMA) |
-| `fdbg`         | Debug FOC ON/OFF (co 200ms) |
-| `fkp:N.N`      | Ustaw Kp obu osi d/q (0.0–100.0) |
-| `fki:N.N`      | Ustaw Ki obu osi d/q (0.0–1000.0) |
-| `fkpd:N.N`     | Ustaw Kp tylko osi d (0.0–100.0) |
-| `fkid:N.N`     | Ustaw Ki tylko osi d (0.0–1000.0) |
-| `fvolt`        | FOC voltage mode ON/OFF (Vq=duty, bez PI) |
-| `fpitune`      | Auto-tuning PI metodą relay (Åström-Hägglund, ~5s) |
-| **PAS** | |
-| `pasdir`       | Odwróć konwencję kierunku PAS (toggle, zapis NVS) |
-| `passtart:N`   | Ustaw opóźnienie startu PAS 0-10000 ms (zapis NVS) |
-| `passtop:N`    | Ustaw timeout PAS 100-10000 ms (zapis NVS) |
-| `pasramp:N`    | Ustaw czas soft-start PAS 0-10000 ms (zapis NVS) |
-| `pasdbnc:N`    | Debounce PAS 500-10000 µs (zapis NVS) |
-| `pashalf:N`    | Min półokres PAS 1-200 ms (zapis NVS) |
-| `pasasym:N`    | Próg asymetrii kierunku 1-50% (zapis NVS) |
-| `passlew:N`    | Slew rate PAS 1-100 (zapis NVS) |
-| `pashold:N`    | Forward holdoff reverse 50-2000 ms (zapis NVS) |
-| `pasdbg`       | Wyświetl pełną diagnostykę PAS (jednorazowo) |
-| **Konfiguracja NVS** | |
-| `cfg`          | Pokaż konfigurację NVS + runtime |
-| `cfg:mode:N` Enter | Tryb boot: 0=OFF, 1=BLOCK, 2=SINUS, 3=FOC, 4=BLOCK12, 5=BLOCK12BL (zapis NVS) |
-| `cfg:ramp:N` Enter | Czas rampy 0-10000 ms (zapis NVS + natychmiast runtime) |
-| `cfg:regen:N` Enter | Regeneracja boot: 0=OFF, 1=ON (zapis NVS + natychmiast runtime) |
-| `cfg:rev:N` Enter | Kierunek obrotów: 0=CW, 1=CCW (zapis NVS + natychmiast runtime) |
-| `cfg:step:N` Enter | Max zmiana duty na krok: 0-100% (0=brak limitu, zapis NVS) |
-| `cfg:ilim:N` | Limit prądu [A]: 0-50 (0=brak), zapis NVS |
-| `cfg:sboost:N` | Boost duty startu [%]: 0-200, zapis NVS |
-| `cfg:sboostrpm:N` | RPM zanikania boost: 10-500, zapis NVS |
-| `cfg:aminspd:N` | Min prędkość assist [km/h]: 1-50, zapis NVS |
-| `cfg:alignms:N` | Czas align rotora [ms]: 10-1000, zapis NVS |
-| `cfg:alignduty:N` | Duty align [%]: 5-100, zapis NVS |
-| `cfg:grace:N` | Grace period [s]: 0-30, zapis NVS |
-| `cfg:paskp:N` | PI Kp PAS (×0.01): 0-255, zapis NVS |
-| `cfg:paski:N` | PI Ki PAS (×0.01/s): 0-255, zapis NVS |
-| `cfg:pashystoff:N` | Histereza OFF [km/h]: 0-20, zapis NVS |
-| `cfg:pashyston:N` | Histereza ON [km/h]: 0-20, zapis NVS |
-| `cfg:defaults` | Załaduj wartości domyślne do runtime (bez zapisu EEPROM) |
-| `cfg:save` | Zapisz aktualne wartości runtime do EEPROM |
-| `cfg:reload` | Wczytaj wartości z EEPROM i zastosuj do runtime (w tym tryb silnika) |
-| `pwmfreq:N` | Częstotliwość PWM [Hz]: 8000-32000, zapis NVS (wymaga restartu) |
-| `dutymin:N` | Min duty [%]: 0-50, zapis NVS |
-| `dp:p06:N` | Fallback P06 (koło ×10 cali): 100-400, zapis NVS |
-| `dp:p07:N` | Fallback P07 (magnesy prędkości): 1-100, zapis NVS |
-| `dp:p08:N` | Fallback P08 (limit km/h): 0-100, zapis NVS |
-| `dp:p10:N` | Fallback P10 (tryb): 0/1/2, zapis NVS |
-| `dp:p13:N` | Fallback P13 (magnesy PAS): 1-100, zapis NVS |
-
-### Format statusu (jedna linia)
-
-```
-BLK D:35/80% V:36.1 Ia:1.23 Ib:0.98 Ic:1.15 H:101 T:312 Thr:45%(1870) RPM:120 WT:500 P:44.6W DISP:OK L3
-```
-
-| Pole    | Znaczenie |
-|---------|-----------|
-| `BLK`   | Tryb: OFF/BLK/SIN/FOC |
-| `D:35/80%` | Duty cycle: aktualny (po rampie) / docelowy (z przepustnicy) |
-| `V:36.1`| Napięcie baterii [V] |
-| `Ia/Ib/Ic` | Prądy fazowe A, B, C [A] |
-| `H:101` | Stan Halla [C:B:A] binarnie |
-| `T:312` | Surowa wartość ADC temperatury |
-| `Thr:45%(1870)` | Przepustnica: % i RAW ADC |
-| `RPM:120` | Obroty koła na minutę |
-| `WT:500` | Czas obrotu koła [ms] |
-| `P:44.6W` | Aktualna moc [W] (pobierana lub oddawana) |
-| `RGN:12.5W` | Moc regeneracji [W] (gdy regen aktywny) |
-| `RGN:rdy` | Regen włączony, czeka na hamulec |
-| `DISP:OK L3` | Wyświetlacz S866 podłączony, poziom wspomagania 3 |
-| `DISP:--` | Wyświetlacz nie podłączony |
-| `BRK`   | Hamulec aktywny |
-| `PAS:ON 85% vt:14.9 sl:0.85` | PAS aktywny: duty%, V_target, speed limit factor |
-| `PAS:WAIT 850ms/2000ms fw:1 H:45000 L:32000` | PAS w start delay: upłynęło/wymagane, forward, czasy H/L |
-| `PAS:REV H:28000 L:35000` | PAS — pedałowanie do tyłu (czasy półokresów) |
-| `FAULT` | Błąd czujników Halla |
-
-Linia `[PAS]` wyświetlana jest zawsze (niezależnie od stanu PAS) — patrz sekcja [PAS — diagnostyka](#pas--pedal-assist-sensor).
-
-Linia `[DBG]` wyświetlana jest w trybach SINUS i FOC:
-```
-  [DBG] ang:62 spd:37025 hdir:1 sec:3 h:100 hs:4 hp:1500us err:-1 snp:5 cor:26138 fb:1 d:556 vq:58 iq:0.27 tgt:0.50
-```
-
----
-
-## Kalibracja prądów
-
-Autokalibracja offsetu prądu działa podczas gdy silnik jest wyłączony lub duty = 0.  
-Używa filtra EMA (Exponential Moving Average):
-
-```cpp
-offset = (1 - α) × offset + α × V_ADC
-```
-
-- `α = 0.02` — powolny filtr, czas ustalania ≈ 50 iteracji loop
-- Po uruchomieniu firmware należy odczekać kilka sekund bez prądu, żeby offset się ustabilizował
-
-Aktualny offset nie jest wyświetlany w statusie. Aby go sprawdzić, można tymczasowo dodać `Serial.printf` w `readAnalogInputs()`.
-
----
-
-## WiFi — interfejs konfiguracyjny WWW
-
-Sterownik udostępnia responsywny interfejs webowy przez WiFi Access Point. Aktywacja przez parametr P17 wyświetlacza S866 (repurposed — nie implementuje tempomatu).
-
-### Włączanie / wyłączanie
-
-| P17 | Stan | Opis |
-|-----|------|------|
-| **1** | WiFi ON, silnik OFF | Uruchamia AP + HTTP, wyłącza wszystkie tranzystory |
-| **0** | WiFi OFF, silnik dostępny | Zatrzymuje AP, wykonuje opcjonalną komendę z kolejki |
-
-Przejście P17: 1→0 jest jedynym momentem kiedy kolejka trybu (`B`, `S`, `F`) jest wykonywana.
-
-### Dane połączenia
-
-| Parametr | Wartość |
-|----------|---------|
-| SSID | `BLDC_Config` |
-| Hasło | `bldc1234` |
-| IP | `192.168.4.1` |
-| Port | 80 |
-
-### REST API
-
-| Endpoint | Metoda | Opis |
-|----------|--------|------|
-| `/` | GET | Strona HTML (cały interfejs) |
-| `/api/config` | GET | JSON z konfiguracją NVS + stanem runtime |
-| `/api/cmd` | POST | Wykonaj komendę Serial natychmiast (pole `cmd`) |
-| `/api/queue` | POST | Ustaw komendę do wykonania po WiFi OFF (pole `cmd`) |
-
-> **Ograniczenie `/api/cmd`:** komendy startujące silnik (`B`, `S`, `F`, `e`, `m2`, `m3`) są odrzucane z HTTP 403 gdy WiFi aktywne. Użyj `/api/queue` — komenda wykona się po P17→0.
-
-### ADC a WiFi
-
-Przepustnica (GPIO33) i temperatura FET (GPIO32) korzystają z **ADC1**, który **nie koliduje z WiFi**.
-
-Jedyne piny ADC2 nie są używane do pomiarów analogowych — konflikt ADC2/WiFi nie dotyczy tej konfiguracji.
-
----
-
-## Konfiguracja NVS
-
-Sterownik zapisuje konfigurację w pamięci nieulotnej ESP32 (NVS — Non-Volatile Storage).
-Konfiguracja przetrwa restart i wyłączenie zasilania.
-
-### Struktura `controller_config_t` (70 bajtów)
-
-| Pole | Typ | Domyślnie | Opis |
-|---|---|---|---|
-| `magic` | uint32_t | 0x424C4401 | Sentinel walidacyjny ("BLD\x01") |
-| `version` | uint16_t | 25 | Wersja struktury (CONFIG_VERSION) |
-| `drive_mode` | uint8_t | 1 (BLOCK) | Domyślny tryb po starcie (0=OFF, 1=BLOCK, 2=SINUS, 3=FOC, 4=BLOCK12, 5=BLOCK12BL) |
-| `ramp_time_ms` | uint16_t | 1200 | Czas rampy rozpędzania 0→100% [ms] |
-| `regen_enabled` | uint8_t | 0 | Regeneracja ON/OFF (0/1) |
-| `pas_dir_invert` | uint8_t | 0 | Odwróć konwencję kierunku PAS (0/1) |
-| `pas_start_delay_ms` | uint16_t | 2000 | Opóźnienie startu PAS [ms] |
-| `pas_stop_delay_ms` | uint16_t | 1000 | Timeout PAS — brak impulsów [ms] |
-| `pas_ramp_ms` | uint16_t | 1500 | Soft-start PAS: czas narastania 0→100% [ms] |
-| `duty_max_step_pct` | uint8_t | 5 | Max zmiana duty na wywołanie [% PWM_MAX] |
-| `motor_reverse` | uint8_t | 0 | Kierunek obrotów (0=CW, 1=CCW) |
-| `sine_hall_offset` | int8_t | 0 | Offset fazy Hall→sinus [-48..+48], wynik `sat`/`so:N` |
-| `foc_kp_q` | float | 0.5 | FOC PI Kp osi q [PWM/A] |
-| `foc_ki_q` | float | 5.0 | FOC PI Ki osi q [PWM/(A·s)] |
-| `foc_kp_d` | float | 0.5 | FOC PI Kp osi d [PWM/A] |
-| `foc_ki_d` | float | 5.0 | FOC PI Ki osi d [PWM/(A·s)] |
-| `foc_voltage_mode` | uint8_t | 0 | FOC tryb napięciowy (0=PI, 1=Vmode) — diagnostyka |
-| `pas_debounce_us` | uint16_t | 3000 | Czas potwierdzenia stanu PAS [µs] (filtr = N×500µs) |
-| `display_required` | uint8_t | 1 | Blokada silnika bez wyświetlacza S866 (0/1) |
-| `thr_samples` | uint8_t | 8 | Liczba próbek ADC przepustnicy w burście (2–16) |
-| `thr_outlier_thresh` | uint16_t | 150 | Max odchylenie próbki od mediany ADC (10–2000) |
-| `current_limit_a` | uint8_t | 15 | Limit prądu fazowego [A] (0=brak, nadpisywany przez P14 z display) |
-| `pas_min_halfperiod_ms` | uint8_t | 5 | Min półokres PAS [ms] (debounce krawędzi). 1–200 |
-| `pas_dir_asymmetry_pct` | uint8_t | 5 | Próg asymetrii do detekcji kierunku [%]. 1–50 |
-| `pas_slew_rate` | uint8_t | 30 | Max zmiana duty PAS na krok. 1–100 (~6% PWM) |
-| `pas_fwd_holdoff_ms` | uint16_t | 300 | Holdoff reverse PAS [ms]. 50–2000 |
-| `pwm_freq_hz` | uint16_t | 20000 | Częstotliwość PWM [Hz]. 8000–32000 |
-| `duty_min_pct` | uint8_t | 10 | Min duty [%]. Poniżej → 0. 0–50 |
-| `startup_boost_pct` | uint8_t | 50 | Boost duty na starcie [%]. 0–200 |
-| `startup_boost_rpm` | uint16_t | 80 | RPM przy którym boost zanika. 10–500 |
-| `fb_wheel_size_x10` | uint16_t | 260 | Fallback P06: rozmiar koła ×10 [cale] (260=26") |
-| `fb_speed_magnets` | uint8_t | 1 | Fallback P07: magnesy czujnika prędkości |
-| `fb_speed_limit` | uint8_t | 25 | Fallback P08: limit prędkości [km/h]. 0=brak |
-| `fb_drive_mode` | uint8_t | 0 | Fallback P10: 0=PAS+gaz, 1=gaz, 2=PAS |
-| `fb_pas_magnets` | uint8_t | 12 | Fallback P13: magnesy PAS. 1–100 |
-| `assist_min_speed_kmh` | uint8_t | 6 | Min prędkość przy najniższym assist [km/h]. 1–50 |
-| `startup_align_ms` | uint16_t | 150 | Czas wyrównania rotora [ms]. 10–1000 |
-| `startup_align_duty_pct` | uint8_t | 100 | Duty wyrównania [%]. 5–100 |
-| `run_grace_s` | uint8_t | 3 | Grace period po wejściu w RUN [s]. 0–30 |
-| `pas_speed_kp` | uint8_t | 30 | PI Kp limitera prędkości PAS (×0.01). 0–255 → 0.00–2.55 |
-| `pas_speed_ki` | uint8_t | 5 | PI Ki limitera prędkości PAS (×0.01/s). 0–255 → 0.00–2.55 |
-| `pas_hyst_off` | uint8_t | 2 | Histereza OFF PAS [km/h]: wyłącz assist ≥ V_target+N. 0–20 |
-| `pas_hyst_on` | uint8_t | 2 | Histereza ON PAS [km/h]: włącz assist < V_target−N. 0–20 |
-
-### Walidacja
-
-Przy starcie firmware sprawdza `magic` i `version` w NVS:
-- **Zgodne** → konfiguracja załadowana
-- **Niezgodne** (nowa wersja firmware, pusty NVS, uszkodzone dane) → reset do domyślnych + zapis
-
-### Komendy
-
-| Komenda | Opis |
-|---|---|
-| `cfg` | Wyświetla aktualną konfigurację NVS + parametry runtime |
-| `cfg:mode:N` | Zmienia tryb boot (0=OFF, 1=BLOCK, 2=SINUS, 3=FOC, 4=BLOCK12, 5=BLOCK12BL), zapisuje NVS |
-| `cfg:ramp:N` | Zmienia czas rampy 0-10000 ms, **natychmiast aktualizuje runtime**, zapisuje NVS |
-| `cfg:regen:N` | Zmienia regen (0/1), **natychmiast aktualizuje runtime**, zapisuje NVS |
-| `cfg:rev:N` | Kierunek obrotów: 0=CW, 1=CCW, zapisuje NVS |
-| `cfg:step:N` | Max zmiana duty 0-100% na krok, zapisuje NVS |
-| `cfg:dispreq:N` | Wymagany wyświetlacz: 0=NIE (standalone), 1=TAK, zapisuje NVS |
-| `cfg:thrsamp:N` | Próbki burst przepustnicy: 2-16, zapisuje NVS |
-| `cfg:thrdelta:N` | Max odchylenie od mediany ADC: 10-2000, zapisuje NVS |
-| `cfg:ilim:N` | Limit prądu fazowego [A]: 0-50 (0=brak), zapisuje NVS |
-| `cfg:sboost:N` | Boost duty na starcie [%]: 0-200, zapisuje NVS |
-| `cfg:sboostrpm:N` | RPM zanikania boost: 10-500, zapisuje NVS |
-| `cfg:aminspd:N` | Min prędkość przy najniższym assist [km/h]: 1-50, zapisuje NVS |
-| `cfg:alignms:N` | Czas wyrównania rotora [ms]: 10-1000, zapisuje NVS |
-| `cfg:alignduty:N` | Duty wyrównania [%]: 5-100, zapisuje NVS |
-| `cfg:grace:N` | Grace period po starcie [s]: 0-30, zapisuje NVS |
-| `cfg:paskp:N` | PI Kp limitera prędkości PAS (×0.01): 0-255, zapisuje NVS |
-| `cfg:paski:N` | PI Ki limitera prędkości PAS (×0.01/s): 0-255, zapisuje NVS |
-| `cfg:pashystoff:N` | Histereza OFF [km/h]: wyłącz assist powyżej V_target+N. 0-20, zapisuje NVS |
-| `cfg:pashyston:N` | Histereza ON [km/h]: włącz assist poniżej V_target−N. 0-20, zapisuje NVS |
-| `cfg:defaults` | Ładuje wartości domyślne do runtime i config struct **(bez zapisu NVS)** |
-| `cfg:save` | Synchronizuje runtime → NVS (zapisuje aktualny stan) |
-| `cfg:reload` | Wczytuje NVS → runtime + przełącza tryb silnika jeśli zmieniony |
-| `pasdir` | Odwraca konwencję kierunku PAS (toggle), zapisuje NVS |
-| `passtart:N` | Opóźnienie startu PAS 0-10000 ms, zapisuje NVS |
-| `passtop:N` | Timeout PAS 100-10000 ms, zapisuje NVS |
-| `pasramp:N` | Soft-start PAS 0-10000 ms, zapisuje NVS |
-| `pasdbnc:N` | Czas potwierdzenia stanu PAS 500-10000 µs (filtr = N/500 próbek), zapisuje NVS |
-| `pashalf:N` | Min półokres PAS [ms]: 1-200, zapisuje NVS |
-| `pasasym:N` | Próg asymetrii kierunku [%]: 1-50, zapisuje NVS |
-| `passlew:N` | Slew rate duty PAS: 1-100, zapisuje NVS |
-| `pashold:N` | Forward holdoff reverse PAS [ms]: 50-2000, zapisuje NVS |
-| `pwmfreq:N` | Częstotliwość PWM [Hz]: 8000-32000, zapisuje NVS (wymaga restartu) |
-| `dutymin:N` | Min duty [%]: 0-50, zapisuje NVS |
-| `dp:p06:N` | Fallback P06 rozmiar koła ×10 [cale]: 100-400 (260=26"), zapisuje NVS |
-| `dp:p07:N` | Fallback P07 magnesy prędkości: 1-100, zapisuje NVS |
-| `dp:p08:N` | Fallback P08 limit km/h: 0-100 (0=brak), zapisuje NVS |
-| `dp:p10:N` | Fallback P10 tryb: 0=PAS+gaz, 1=gaz, 2=PAS, zapisuje NVS |
-| `dp:p13:N` | Fallback P13 magnesy PAS: 1-100, zapisuje NVS |
-
-### Przykład wyjścia `cfg`
-
-```
-========== KONFIGURACJA NVS ==========
-drive_mode:    3 (FOC)
-               Tryb pracy silnika po starcie: 1=BLOCK, 2=SINUS, 3=FOC
-ramp_time_ms:  1200 ms
-               Czas narastania duty 0->100%. 0=natychmiastowy. Dziala w obu kierunkach.
-regen_enabled: 0 (OFF)
-               Hamowanie regeneracyjne (odzyskiwanie energii do baterii).
-pas_dir_inv:   0 (NORM)
-               Inwersja kierunku PAS. Uzyj gdy silnik napedza wstecz.
-pas_start_ms:  2000 ms
-               Czas ciaglego pedalowania wymagany do aktywacji silnika.
-pas_stop_ms:   1000 ms
-               Czas bez impulsow PAS po ktorym silnik wylacza wspomaganie.
-pas_ramp_ms:   1500 ms
-               Soft-start PAS: czas narastania mocy 0->100% po aktywacji.
-pas_dbnc_us:   3000 us (filter: 6 probek x 500 us)
-               Czas potwierdzenia stanu PAS. Probkowanie co 500us, N zgodnych = zmiana stanu.
-disp_req:      1 (TAK)
-               Blokada silnika gdy wyswietlacz S866 nie jest polaczony.
-thr_samples:   8
-               Liczba probek ADC w jednym odczycie gazu (burst). Wiecej=gladszy, wolniejszy.
-thr_outlier:   150
-               Max odchylenie probki od mediany (ADC). Probki dalsze odrzucane jako szum.
-duty_step:     5 %
-               Max zmiana duty na krok petli. 0=bez limitu. Ogranicza szarpniecia mocy.
-motor_rev:     0 (CW)
-               Kierunek obrotow silnika. CW=normalny, CCW=odwrocony.
-sine_offset:   -6 (-22.5 deg)
-               Przesuniecie fazowe Hall->sinus. Dobierane komenda 'sat' (auto-tune).
-foc_kp_q:      0.450
-               FOC: wzmocnienie proporcjonalne PI osi Q (moment obrotowy).
-foc_ki_q:      12.345
-               FOC: wzmocnienie calkujace PI osi Q (moment obrotowy).
-foc_kp_d:      0.450
-               FOC: wzmocnienie proporcjonalne PI osi D (strumien magnetyczny).
-foc_ki_d:      12.345
-               FOC: wzmocnienie calkujace PI osi D (strumien magnetyczny).
-foc_vmode:     0 (OFF)
-               FOC tryb napieciowy: sterowanie napieciem bez PI. Do diagnostyki.
-magic:         0x424C4401 OK
-version:       12
-======================================
---- Runtime (bieżące) ---
-mode:          FOC
-ramp_time_ms:  1200 ms
-regen:         OFF
-direction:     CW
-sine_offset:   -6 (-22.5 deg)
-foc_kp_q:      0.450
-foc_ki_q:      12.345
-foc_kp_d:      0.450
-foc_ki_d:      12.345
-```
+No external database, cloud service, package manager, or environment variables are required by the repository configuration.
 
-> **Uwaga:** Komendy `cfg:ramp:N` i `cfg:regen:N` zmieniają zarówno NVS jak i bieżący
-> stan runtime — efekt jest natychmiastowy. Komenda `cfg:mode:N` zmienia tylko tryb
-> boot — bieżący tryb sterowania nie jest zmieniany (wymaga restartu lub komendy `S`/`e`).
+### Build
 
----
+From the repository root:
 
-## Diagnostyka MOSFET — tryb testowy
-
-### Cel
-
-Procedura diagnostyczna umożliwiająca przetestowanie **pojedynczych tranzystorów MOSFET** w mostkach IR2103. Przydatna gdy podejrzewamy uszkodzenie (zwarcie, przerwa) jednego lub więcej tranzystorów.
-
-### Zasada działania
-
-1. Silnik jest wyłączany (`DRIVE_MODE_DISABLED`)
-2. ISR komutacji **nie nadpisuje rejestrów MCPWM** (flaga `g_mosfet_test_active`)
-3. Wszystkie tranzystory ustawiane w stan bezpieczny (OFF)
-4. Na **jednym** wybranym tranzystorze ustawiany jest PWM (domyślnie **10%**, konfigurowalne 1-50%)
-5. Pozostałe 5 tranzystorów pozostaje wyłączonych
-
-### Komendy (Serial, wymagają Enter)
-
-| Komenda | Tranzystor | Pin ESP32 | IR2103 |
-|---------|-----------|-----------|--------|
-| `tAH`   | Faza A HIGH-side | GPIO12 | HIN_A |
-| `tAL`   | Faza A LOW-side  | GPIO13 | LIN_A |
-| `tBH`   | Faza B HIGH-side | GPIO25 | HIN_B |
-| `tBL`   | Faza B LOW-side  | GPIO26 | LIN_B |
-| `tCH`   | Faza C HIGH-side | GPIO27 | HIN_C |
-| `tCL`   | Faza C LOW-side  | GPIO14 | LIN_C |
-| `tp:N`  | Ustaw duty testowe na N% (1-50) | — | — |
-| `t0`    | Wyłącz test (wszystkie OFF) | — | — |
-| `t`     | Pokaż pomoc testową | — | — |
-
-### Zmiana duty testowego
-
-Domyślne duty testowe to **10%**. Można je zmienić komendą `tp:N` (N = 1-50%):
-
-```
-tp:5    → 5% PWM (ostrożne testowanie)
-tp:20   → 20% PWM (wyraźniejszy prąd)
-tp:50   → 50% PWM (maksimum, używaj ostrożnie!)
+```bash
+pio run -e esp32dev
 ```
-
-Zmiana duty jest natychmiastowa — jeśli test jest aktywny, PWM na bieżącym tranzystorze jest od razu aktualizowane (nie trzeba go ponownie wybierać).
-
-### Logika PWM w trybie testowym
-
-W trybie testowym używane są te same helpery MCPWM co w normalnej pracy:
-```
-HIGH-side ON: mcpwm_phase_pwm(op, test_duty)
-  → gen_A=PWM, compare=test_duty, gen_B=forced HIGH (LS OFF)
-
-LOW-side ON:  (gen_force = MCPWM_FORCE_GND na wybranym operatorze)
-  → gen_A=forced LOW (HS OFF), gen_B=forced LOW (LS ON)
-```
-
-### Procedura testowa
-
-1. Wyślij `d` — wyłącz silnik
-2. Wyślij `t` + Enter — pokaż pomoc testową
-3. (opcjonalnie) `tp:5` + Enter — ustaw niskie duty na początek
-4. Wyślij `tAH` + Enter — włącz PWM na high-side fazy A
-5. Wyślij `s` — odczytaj prąd fazy A (`Ia`)
-6. (opcjonalnie) `tp:20` + Enter — zwiększ duty bez zmiany tranzystora
-7. Powtórz dla każdego tranzystora (`tAL`, `tBH`, `tBL`, `tCH`, `tCL`)
-8. Wyślij `t0` + Enter — zakończ test (lub `d`)
-
-### Interpretacja wyników
-
-| Obserwacja | Diagnoza |
-|-----------|----------|
-| Prąd = 0 mimo włączonego testu | Tranzystor otwarty (uszkodzony) lub brak kontaktu |
-| Prąd zbyt wysoki (~max) | Tranzystor zwarty (drain-source) |
-| Prąd proporcjonalny do duty | Tranzystor sprawny |
-| Inne tranzystory wykazują prąd | Zwarcie między fazami lub uszkodzony IR2103 |
-
-> **⚠️ UWAGA BEZPIECZEŃSTWA:**
-> - Nigdy nie włączaj HIGH i LOW tej samej fazy jednocześnie (shoot-through = zwarcie V+ do GND!)
-> - Procedura testowa zabezpiecza przed tym automatycznie — zawsze włączany jest **tylko jeden** tranzystor
-> - Używaj niskiego napięcia zasilania do testów jeśli to możliwe
-> - Duty ograniczone do 50% max — zabezpieczenie przed przypadkowym podaniem pełnej mocy
-> - Monitoruj temperaturę FET podczas testów (komenda `s` pokazuje odczyt czujnika)
-
----
 
-## FOC — Field Oriented Control
+The project uses the single environment declared in [`platformio.ini`](platformio.ini):
 
-Tryb `DRIVE_MODE_FOC` implementuje sterowanie wektorowe (FOC) w ramie obrotowej dq.
-Silnik jest sterowany jako wektor napięciowy o składowych Vd (pole) i Vq (moment),
-co daje potencjał do precyzyjnej regulacji momentu obrotowego.
+- Platform: `espressif32`
+- Board: `esp32dev`
+- Framework: `arduino`
+- Partition layout: `default.csv`
+- Build flags: `CORE_DEBUG_LEVEL=3` and `CONFIG_ARDUHAL_LOG_COLORS=1`
 
-### Architektura
+### Upload and monitor
 
+```bash
+pio run -e esp32dev -t upload
+pio device monitor -b 921600
 ```
-loop() (~2 kHz)                          ISR (20 kHz, MCPWM TEZ)
-───────────────                          ───────────
-
-ADC → EMA filtr                          Read Vd_i, Vq_i (volatile int32)
-   ↓                                        ↓
-Clarke (Ia,Ib,Ic → Iα,Iβ)              Inverse Park (Vd,Vq → Vα,Vβ)
-   ↓                                        ↓
-Park (Iα,Iβ → Id,Iq)                  Inverse Clarke (Vα,Vβ → Va,Vb,Vc)
-   ↓                                        ↓
-PI(Id) + PI(Iq)                          SVPWM min-max centering
-   ↓                                        ↓
-Vd = ff_d + korekta_d                    MCPWM register write (3 operatory)
-Vq = ff_q + korekta_q
-   ↓
-Zapisz Vd_i, Vq_i (volatile int32)
-```
-
-**KRYTYCZNE:** ISR timera (level 3 interrupt) na ESP32 **nie zapisuje kontekstu FPU**.
-Użycie `float` w ISR korumpuje rejestry koprocesora → crash `LoadProhibited`.
-Dlatego cała arytmetyka ISR używa `int32_t` (Q10 fixed-point).
 
-### Feedforward + PI
+The main console uses 921600 baud. The S866 display uses an independent `Serial2` connection at 9600 baud.
 
-FOC używa architektury **feedforward + korekta PI**:
-
-```
-Vq = feedforward(duty) + PI_korekta(±100 max)
-     └─ natychmiastowe      └─ mała korekta prądowa
-         napięcie z duty          (gdy ADC złapie prąd)
-```
+On first boot, the firmware initializes NVS defaults when the `bldc/cfg` blob is missing or does not match `CONFIG_MAGIC`, `CONFIG_VERSION`, or the expected 70-byte layout. The default PWM frequency is 20 kHz, the default ramp is 1200 ms, and the default phase-current limit is 15 A unless the connected S866 P14 value overrides it.
 
-- **Feedforward:** `Vq_ff = duty_cycle` (po rampie). Silnik otrzymuje napięcie
-  natychmiast, identycznie jak w trybie SINUS. Rampa rozpędzania obowiązuje.
-- **PI korekta:** `±FOC_PI_CORR_LIMIT` (domyślnie ±100 PWM) wokół feedforward.
-  Regulator koryguje Vq w górę/dół na podstawie błędu prądowego Id/Iq.
-- **Vd feedforward = 0** (cel: Id = 0, MTPA — max torque per amp)
+### First serial checks
 
-Bez feedforward PI integrowało od zera → silnik rozpędzał się bardzo wolno
-(Ki=5, err=1.5A → ~7.5 PWM/s → 20s do 153 PWM). Z feedforward reakcja jest
-natychmiastowa.
+With the board powered and the motor power stage secured for bench testing, useful commands include:
 
-### Kąt i inverse Park
+| Command | Purpose |
+| --- | --- |
+| `h` | Print the command help. |
+| `s` | Print a one-shot runtime status snapshot. |
+| `B` | Select BLOCK commutation. |
+| `B12` | Select `BLOCK12`. |
+| `B12BL` | Select `BLOCK12BL`. |
+| `S` | Select SINUS commutation. |
+| `F` | Select FOC. |
+| `d` | Disable the motor and force all MOSFETs off. |
+| `a` | Toggle periodic auto-status output. |
+| `R` | Toggle regenerative braking. |
+| `gdbg`, `fdbg`, `idbg`, `hdbg`, `cdbg` | Toggle focused diagnostics. |
+| `t`, `tAH`, `tAL`, `tBH`, `tBL`, `tCH`, `tCL` | Enter or inspect individual MOSFET-side diagnostics. |
 
-Kąt θ jest współdzielony z trybem SINUS (Hall tracking + interpolacja Q16).
-Inverse Park w ISR używa konwencji znaków dopasowanej do mapowania faz
-A=0°, B=240°, C=120°:
+The command parser also exposes configuration, PAS, speed-calibration, FOC-tuning, phase-offset, assist, and PWM-frequency commands. See the command parsing section in [`src/main.cpp`](src/main.cpp) for the authoritative implementation.
 
-```
-Vα = (Vd·cos + Vq·sin) >> 10
-Vβ = (Vd·sin - Vq·cos) >> 10
-```
+## 🔐 Security Features / Security Considerations
 
-Forward Park w loop() ma odpowiadające znaki:
-```
-Id =  Iα·cos + Iβ·sin
-Iq =  Iα·sin - Iβ·cos
-```
+### Implemented safeguards
 
-### Pomiar prądów i filtr EMA
-
-Czujniki INA180A2 są **jednokierunkowe** (klipują prąd ujemny do ~0V).
-`analogRead()` nie jest zsynchronizowany z PWM → ~50% odczytów trafia
-w czas gdy low-side jest OFF (prąd = 0).
-
-Aby uzyskać stabilny feedback dla PI:
-
-1. **EMA filtr** (α = 0.05, τ ≈ 10ms):
-   ```
-   g_foc_ia_ema += α × (ia_raw - g_foc_ia_ema)
-   ```
-   Uśrednia sporadyczne odczyty do ciągłego sygnału.
-
-2. **Rekonstrukcja Kirchhoffa:** Faza z najmniejszym odczytem = -(suma dwóch pozostałych).
-   Pozwala odtworzyć prąd ujemny z jednokierunkowych czujników.
-
-### Tryb napięciowy (`fvolt`)
-
-Komenda `fvolt` przełącza FOC w **tryb napięciowy** (open-loop):
-- `Vq = duty` (bezpośrednio), `Vd = 0`
-- Brak PI — identyczne zachowanie jak SINUS ale w ramie dq
-- Pozwala porównać jakość pracy z trybem SINUS i wykluczyć PI jako źródło problemów
-- Debug: `[FOC-V]` vs `[FOC-PI]`
-
-### Stałe FOC
-
-| Stała | Wartość | Opis |
-|---|---|---|
-| `FOC_KP_DEFAULT` | 0.5 | Domyślne Kp regulatorów PI d/q [PWM/A] |
-| `FOC_KI_DEFAULT` | 5.0 | Domyślne Ki regulatorów PI d/q [PWM/(A·s)] |
-| `FOC_INTEGRAL_LIMIT` | SINE_SAFE_MAX_DUTY (375) | Absolutny max integrala |
-| `FOC_PI_CORR_LIMIT` | 100 | Max korekta PI wokół feedforward [±PWM] |
-| `FOC_IQ_MAX` | 10.0 | Maksymalny prąd Iq target [A] |
-| `FOC_LOOP_DT` | 0.0005 s | Przybliżony dt pętli prądowej (~2kHz) |
-| `FOC_CURRENT_EMA_ALPHA` | 0.05 | EMA α dla filtrowania prądów |
-
-### Komendy Serial
-
-| Komenda | Opis |
-|---------|------|
-| `F` / `m3` | Włącz tryb FOC |
-| `foc` | Status FOC: Kp, Ki, Limit, Vd/Vq, Id/Iq, EMA, tryb |
-| `fdbg` | Debug ON/OFF (co 200ms): Vd, Vq, Id, Iq, tgt, lim, ff, EMA prądy |
-| `fkp:N.N` | Ustaw Kp obu osi d/q (0.0–100.0) |
-| `fki:N.N` | Ustaw Ki obu osi d/q (0.0–1000.0) |
-| `fkpd:N.N` | Ustaw Kp tylko osi d (0.0–100.0) |
-| `fkid:N.N` | Ustaw Ki tylko osi d (0.0–1000.0) |
-| `fvolt` | Tryb napięciowy ON/OFF (Vq=duty, bez PI) |
-| `fpitune` | Auto-tuning PI metodą relay feedback (~5s) |
-
-### Regulator PI — co to jest Kp i Ki
-
-Regulator **PI (Proportional-Integral)** steruje prądem w osiach d i q silnika BLDC.
-Wyjście regulatora = **feedforward** (Vq = duty, natychmiastowe napięcie) **+ korekta PI** (±100 PWM max).
-
-| Parametr | Pełna nazwa | Rola | Efekt za małej wartości | Efekt za dużej wartości | Domyślnie |
-|----------|-------------|------|-------------------------|-------------------------|-----------|
-| **Kp** | Wzmocnienie proporcjonalne | Natychmiastowa reakcja na błąd prądu (Iq_target − Iq_meas) | Wolna reakcja, błąd ustalony | Oscylacje, niestabilność | 0.5 |
-| **Ki** | Wzmocnienie całkujące | Kumuluje błąd w czasie, eliminuje błąd ustalony | Wolne dochodzenie do celu | Przeregulowanie (overshoot), oscylacje | 5.0 |
-
-**Jednostki:** Kp [PWM/A], Ki [PWM/(A·s)].  
-**Anti-windup:** Całka ograniczona do ±pi_limit (= min(FOC_PI_CORR_LIMIT, feedforward)).
-
-### Auto-tuning PI (`fpitune`)
-
-Komenda `fpitune` implementuje automatyczne strojenie parametrów PI **metodą relay feedback
-(Åström-Hägglund, 1984)**. Jest to standardowa metoda strojenia PID w przemyśle.
-
-**Algorytm:**
-1. Zamiast regulatora PI, wyjście jest przełączane (relay): Vq = feedforward ± 30 PWM
-2. Gdy błąd Iq > 0 → wyjście = feedforward + relay_amp
-3. Gdy błąd Iq < 0 → wyjście = feedforward − relay_amp
-4. Mierzone są oscylacje prądu Iq (amplituda `a` i okres `Tu`)
-5. Z oscylacji obliczany jest **ultimate gain** Ku = 4·d / (π·a)
-6. Parametry PI wg **reguł Zieglera-Nicholsa**: Kp = 0.45·Ku, Ki = 0.54·Ku/Tu
-
-**Wymagania:**
-- Tryb FOC aktywny (komenda `F`)
-- Silnik pracuje (duty > 0)
-- Voltage mode wyłączony (`fvolt` = OFF)
-
-**Użycie:**
-```
-F              ← włącz FOC
-50             ← ustaw duty 50%
-fpitune        ← start auto-tune (~5s)
-               ← czekaj na wynik...
-fkp:X.XXX      ← zastosuj sugerowane Kp
-fki:X.XXX      ← zastosuj sugerowane Ki
-```
+- Invalid Hall states are rejected, and valid transitions require consecutive confirmation plus a minimum time interval.
+- The brake input forces the motor demand down and can be simulated for diagnostics through serial.
+- Phase-current limiting combines a proportional duty reduction with a hard over-current lockout after repeated readings above the configured threshold.
+- Regenerative braking is disabled above the 42 V battery threshold, below the minimum effective RPM, and above the configured 80% regen duty ceiling.
+- The startup path explicitly drives all MOSFETs off before enabling the commutation timer.
+- S866 frames use XOR checksum validation, a 50 ms inter-byte timeout, sliding-window resynchronization, and a connection timeout.
+- NVS configuration is checked with a magic value, version, and exact packed-structure size before use.
 
-**Uwaga:** Podczas testu silnik może lekko oscylować — to normalne zachowanie metody relay.
-Test trwa 5 sekund i kończy się automatycznie, wypisując sugerowane wartości Kp/Ki.
+### Important limitations
 
-### Format debug (`fdbg`)
+- The Wi-Fi AP and HTTP API have no authentication, authorization, TLS, or request-rate limiting. `/api/cmd` can execute serial-style motor and configuration commands.
+- The AP credentials are hardcoded in `src/main.cpp` as `BLDC_Config` / `bldc1234`. This is suitable only for a controlled bench network; credentials and access control must be redesigned before production use.
+- The FET temperature pin is declared in the pin map, but the current analog-input path does not actively sample it. There is no implemented thermal shutdown.
+- S866 P15 undervoltage data is parsed and exposed, but the firmware does not implement a corresponding undervoltage cutoff.
+- NVS validation uses magic, version, and size; it does not provide a CRC or authenticated integrity check.
+- The project does not contain a watchdog-based recovery strategy for a stalled control task.
+- Power-stage protection remains a hardware responsibility. Gate-driver supply, bootstrap design, MOSFET ratings, current-sense placement, transient suppression, and oscilloscope validation are not replaceable by firmware limits.
 
-```
-[FOC-PI] Vd=  0.0 Vq=153.0 | Id= 0.01 Iq= 0.03 | tgt= 1.5 lim=100 ff=153 | ia= 0.12 ib= 0.08 ic= 0.05
-         │        │           │         │           │         │    │      └─ EMA prądy faz [A]
-         │        │           │         │           │         │    └─ feedforward [PWM]
-         │        │           │         │           │         └─ PI limit [±PWM]
-         │        │           │         │           └─ Iq target z przepustnicy [A]
-         │        │           │         └─ Zmierzony Iq [A] (Park)
-         │        │           └─ Zmierzony Id [A]
-         │        └─ Napięcie q (torque) = ff + korekta [PWM]
-         └─ Napięcie d (field) = 0 + korekta [PWM]
-```
+Do not connect an unverified power stage to a motor or battery solely because the firmware builds. Start with a current-limited supply, a mechanically secured motor, and independent validation of gate signals, phase nodes, current readings, and regenerative-voltage behavior.
 
-### Procedura strojenia
+## 📌 Project Status & Future Improvements
 
-**1. Sprawdź tryb napięciowy (powinien brzmieć jak SINUS):**
-```
-F              ← włącz FOC
-fvolt          ← tryb napięciowy (bez PI)
-fdbg           ← debug ON
-```
-Jeśli brzmi jak SINUS — ISR działa poprawnie.
+**Status: working embedded-control prototype / portfolio project.** The repository contains a substantial hardware-oriented implementation, including real-time MCPWM commutation, multiple control modes, persistent configuration, display protocol handling, and diagnostics. It should not be described as production-ready: the repository has no automated test suite, CI pipeline, release packaging, or production security model.
 
-**2. Przełącz na PI i dostrajaj:**
-```
-fvolt          ← wyłącz voltage mode (wróć na PI)
-fkp:0          ← wyłącz Kp
-fki:1.0        ← niskie Ki (korekta wolno narasta)
-```
+The following improvements are directly motivated by the current code and documentation:
 
-**3. Zwiększaj Ki stopniowo:**
-```
-fki:2.0        ← cicho? →
-fki:5.0        ← hałas? → cofnij do 2.0
-```
+- Add host-side unit tests for Hall-to-phase tables, commutation transitions, speed calculations, NVS validation, current limiting, and FOC transforms.
+- Add hardware-in-the-loop or bench regression procedures for startup, Hall faults, brake response, current limiting, and regen cutoff behavior.
+- Implement a real thermal measurement and cutoff path, plus an enforced undervoltage policy.
+- Add authenticated configuration access and remove the hardcoded Wi-Fi password from production builds.
+- Add a watchdog and explicit fault-latching/recovery behavior for control-task failures.
+- Pin the PlatformIO platform/framework versions for reproducible builds.
+- Split the large runtime implementation in `src/main.cpp` into independently testable control, I/O, protocol, and web modules.
+- Resolve the repository-wide licensing question before redistribution. There is no `LICENSE` file, while [`src/display_s866.cpp`](src/display_s866.cpp) documents adaptation from EBiCS_Firmware under GPL v3.
+- Reconcile the firmware version printed at boot (`1.0.0`, build marker `ADC_SYNC_BLKSTART`) with the version history and release metadata.
 
-**4. Dodaj Kp (reakcja na zmiany):**
-```
-fkp:0.1        ← obserwuj
-fkp:0.5        ← oscylacja? → cofnij
-```
+## 📚 Engineering Notes
 
-### Na co patrzeć w debug
-
-| Symptom | Przyczyna | Rozwiązanie |
-|---------|-----------|-------------|
-| `Vq` skacze ±20% | Oscylacja PI (Ki za duże) | `fki:1.0` |
-| `Vq` stałe = ff | PI nasycony (OK, quasi-open-loop) | — |
-| `ia/ib/ic` ≈ 0.00 | ADC nie łapie prądów | Obniż Ki (działa open-loop) |
-| `Id` duże (>0.5A) | Zły kąt fazy | `so+`/`so-` strojenie |
-| `Iq` bliskie `tgt` | Zamknięta pętla działa! | Zwiększ Ki/Kp |
-| Silnik wibruje stojąc | Kąt daleko od Halla | `so+` kilka razy |
-
-### Ograniczenia sprzętowe
-
-Pełne FOC (zamknięta pętla prądowa) wymaga:
-- **Dwukierunkowego czujnika prądu** (np. INA240 z Vref=1.65V) — INA180A2 klipuje prąd ujemny
-- **ADC zsynchronizowanego z PWM** (sample w centrum impulsu) — `analogRead()` trafia losowo
-- **Szybkiego ADC** (<5µs/kanał) — ESP32 `analogRead()` ≈ 100µs
-
-Z obecnym sprzętem FOC działa jako **"sinus z feedforward + lekkie korekty PI"**.
-Optymalne ustawienie: niskie Ki (1–3), Kp ≈ 0–0.5, co daje zachowanie zbliżone do SINUS
-ale z ramą dq.
-
-### Aktywacja
-
-- Komenda `F` (natychmiastowa, bez Enter) lub `m3` + Enter
-- Silnik startuje identycznie jak w trybie SINUS (snap do sektora, crawl, rampa)
-- Do FOC-V: `fvolt` po włączeniu FOC
-- Powrót: `S` (SINUS), `e` (BLOCK), `d` (wyłącz)
-
-### Problem: Silnik drga/stuka zamiast się kręcić
-- Tabela komutacji Hall→fazy nie pasuje do silnika
-- Rozwiązanie: przesuń cyklicznie wpisy `case` w `blockCommutate()` i `onCommutationTimer()`
-
-### Problem: Brak uploadu na PCB
-- GPIO12 z pull-up zmienia napięcie VDD_SDIO → flash nie odpowiada
-- Rozwiązanie: dać pull-down na GPIO12, nie pull-up
-- Alternatywa: zmniejszyć `upload_speed` do 115200 w `platformio.ini`
-
-### Problem: Silnik się kręci mimo przepustnicy w pozycji 0
-- Martwa strefa `THROTTLE_DEAD_ZONE` za niska
-- Aktualnie: 400. Sprawdź wartość RAW w statusie (`Thr:xx%(RAW)`) i dostosuj
-
-### Problem: Prądy pokazują 0 mimo obciążenia
-- Offset nie skalibrowany (zbyt mało czasu z wyłączonym silnikiem)
-- Błąd w kalibracji dzielnika `kVbatRTop/kVbatRBottom` dla VBAT
-- Sprawdź napięcie na wyjściu INA180A2 multimetrem
-
----
-
-## Rozbudowa projektu
-
-### Zaimplementowane
-
-| # | Funkcjonalność | Opis |
-|---|----------------|------|
-| 1 | **MCPWM center-aligned PWM** | 3 operatory × 2 generatory, UP_DOWN counter, bezpośrednie rejestry LL w ISR |
-| 2 | **ISR w przerwaniu TEZ MCPWM** | ISR wyzwalana w dolinie PWM (optymalny pomiar prądu, 20 kHz) |
-| 3 | **Komutacja sinusoidalna** | Komenda `S` / `m2` — tryb sinusoidalny z interpolacją kąta Hall, SVPWM |
-| 4 | **FOC (Field Oriented Control)** | Komenda `F` / `m3` — feedforward + PI, Park/Clarke, SVPWM, tryb napięciowy i PI |
-| 5 | **PAS — Pedal Assist Sensor** | Timer sampling 2 kHz, filtr cyfrowy, detekcja kierunku, soft-start, maszyna stanów |
-| 6 | **WiFi — interfejs WWW** | AP mode, responsive UI, REST API, kolejka komend trybu |
-| 7 | **Konfiguracja NVS (EEPROM)** | 42 parametry, CONFIG_VERSION=25, 70 bajtów, Serial `cfg` + Web UI |
-| 8 | **Filtracja przepustnicy** | Ring buffer + median + odrzucanie outlierów (odporność na EMI) |
-| 9 | **Filtracja PAS** | Timer sampling 500 µs, N kolejnych zgodnych próbek (odporność na EMI) |
-| 10 | **Wyświetlacz S866** | Protokół 2, prędkość, moc, poziomy wspomagania, flaga `display_required` |
-| 11 | **Crossfade blokowy** | Płynne przejścia duty między fazami przy komutacji (eliminacja terkotu) |
-| 12 | **PLL per-sector speed** | Kompensacja nierównych Halli — per-sektor prędkość, pełna korekcja kąta |
-| 13 | **Debug zdarzeniowy** | Ring buffer 64 zdarzeń, komenda `cdbg`, logi przejść Halla z kątem i duty |
-| 14 | **BLOCK12 / BLOCK12BL** | Komutacja 12-step (pół-krok) i 12-step z duty blending — cichsza praca blokowa |
-| 15 | **PI limiter prędkości PAS** | Regulator PI (Kp+Ki) zamiast liniowej rampy, anti-windup, konfigurowalne wzmocnienia |
-| 16 | **Histereza freewheel PAS** | Dwuprogowa: OFF powyżej V_target+hyst_off, ON poniżej V_target−hyst_on |
-| 17 | **Grace period startu** | Przez `run_grace_s` sekund po wejściu w RUN — pełna moc bez limitu prędkości |
-| 18 | **Filtr EMA prędkości koła** | Wygładzenie wheeltime dla silników hub (P07≥10) — eliminacja oscylacji |
-| 19 | **Fallback parametry display** | P06/P07/P08/P10/P13 z NVS gdy brak wyświetlacza S866 (tryb standalone) |
-| 20 | **Startup boost + align** | Konfigurowalne boost duty i czas wyrównania rotora przy rozruchu |
-
-### Planowane rozszerzenia
-
-#### 1. Zabezpieczenia (rozszerzone)
-- Overcurrent: porównać `phase_current[i]` z progiem → `allMosfetsOff()` + `fault = true`
-- Overtemperature: po skalibrowanym czujniku
-- Undervoltage: sprawdzać `battery_voltage` < próg
-- TVS dioda na szynie DC jako hardwarowy clamp (regen overvoltage)
-
-#### 2. Regulacja siły regen
-- Mapowanie siły hamowania z prędkości (szybciej → więcej hamowania)
-- Pętla prądowa: INA180A2 → limit prądu regen z P14
-- Konfiguracja duty regen z wyświetlacza lub komend Serial
-
-#### 3. Konfiguracja UART — rozszerzenie
-- Zmiana `THROTTLE_DEAD_ZONE`, `THROTTLE_MAX_RAW` bez rekompilacji
-
-#### 4. CAN bus / RS485
-- Gotowy pin UART_EN (GPIO17) sugeruje planowany RS485 lub CAN
-- Zaimplementować protokół ramki np. `$CMD,VALUE\n`
-
----
-
-## Konfiguracja PlatformIO
-
-Plik `platformio.ini`:
-```ini
-[env:esp32dev]
-platform = espressif32
-board = esp32dev
-framework = arduino
-monitor_speed = 115200
-upload_speed = 921600         ; zmniejszyć do 115200 przy problemach z PCB
-build_flags =
-    -D CORE_DEBUG_LEVEL=3
-    -D CONFIG_ARDUHAL_LOG_COLORS=1
-board_build.partitions = default.csv
-```
+[`SINUS_POWER_FIX_PLAN.md`](SINUS_POWER_FIX_PLAN.md) records investigation notes for SINUS/FOC power behavior and should be read as an engineering work log rather than a guarantee of a validated fix. The current source contains synchronized phase-current acquisition in the MCPWM ISR, but FOC and high-power SINUS operation still require validation on the actual motor, gate-driver circuit, and power stage.
 
----
+## 🎓 Portfolio Project
 
-*Dokumentacja wygenerowana: 2026-04-14*  
-*Wersja firmware: 2.0.0 (MCPWM center-aligned + BLOCK + SINUS + FOC + PAS + WiFi + NVS)*  
-*CONFIG_VERSION: 16 | controller_config_t: 64 bajty*
+> Portfolio Project - This firmware demonstrates embedded C++ development for ESP32, real-time motor-control scheduling, ISR-safe peripheral access, sensor filtering, persistent configuration, device protocols, and practical safety-oriented diagnostics.

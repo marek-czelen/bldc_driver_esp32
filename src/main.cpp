@@ -480,6 +480,14 @@ static inline int8_t IRAM_ATTR hallToSector(uint8_t hall) {
 #define SINE_STALL_FREEZE_MS    200             // ms bez Halla â†’ zamroĹĽenie kÄ…ta
 #define SINE_CRAWL_SPEED_Q16    315             // minimalna prÄ™dkoĹ›Ä‡ startowa â‰ 1 obr.elekt./s (52428800/166666)
 #define SINE_STALL_FALLBACK_MS  400             // minimalny timeout fallback (histereza, anty-szarpanie)
+#define STARTUP_TORQUE_LOCK_TIMEOUT_US 50000    // brak Halla >50ms w STARTING -> torque-lock dla SIN/FOC
+#define STARTUP_TORQUE_LOCK_MAX_US     120000   // max czas torque-lock; potem fallback 6-step unstick
+#define STARTUP_TORQUE_LOCK_ADV_ENTRIES 24      // +90 el.deg (24/96 * 360)
+#define STARTUP_TORQUE_LOCK_MIN_DUTY_PCT 45     // min duty podczas torque-lock [% PWM_MAX_DUTY]
+#define STARTUP_TORQUE_LOCK_DITHER_ENTRIES 2    // dither kąta ±2 wpisy (~±7.5 el.deg)
+#define STARTUP_TORQUE_LOCK_DITHER_MS   25      // okres przełączeń dither [ms]
+#define STARTUP_SHOCK_PULSE_ON_MS       35      // metoda udarowa: czas impulsu momentu [ms]
+#define STARTUP_SHOCK_PULSE_OFF_MS      20      // metoda udarowa: czas odpuszczenia (coast) [ms]
 #define STARTUP_UNSTICK_TIMEOUT_US 120000       // brak Halla >120ms w STARTING -> wymuszony rozruch open-loop
 #define STARTUP_UNSTICK_STEP_US    12000        // krok open-loop co 12ms (~83 eHz)
 #define STARTUP_UNSTICK_MIN_DUTY_PCT 35         // min duty podczas unstick [% PWM_MAX_DUTY]
@@ -3813,6 +3821,76 @@ static uint16_t IRAM_ATTR adc1_read_isr(uint8_t channel) {
     return SENS.sar_meas_start1.meas1_data_sar;
 }
 
+/**
+ * @brief Standstill torque-lock dla STARTING (SINUS/FOC): statyczny wektor +90Â° od Halla.
+ *
+ * Cel: wygenerować maksymalny moment utyku przy 0 RPM zanim przejdziemy do agresywnego
+ * open-loop 6-step. Dodany mały dither kąta pomaga „odkleić" rotor przy coggingu.
+ */
+static inline void IRAM_ATTR applyStartupTorqueLockISR(uint8_t hall, uint16_t duty, uint32_t now_us) {
+    int8_t sector = hallToSector(hall);
+    if (sector < 0) {
+        allMosfetsOff();
+        return;
+    }
+
+    int32_t entry = (int32_t)sector * SINE_SECTOR_ENTRIES
+                  + SINE_SECTOR_CENTER
+                  + g_sine_hall_phase_offset
+                  + STARTUP_TORQUE_LOCK_ADV_ENTRIES;
+
+    if (((now_us / 1000U) / STARTUP_TORQUE_LOCK_DITHER_MS) & 1U) {
+        entry += STARTUP_TORQUE_LOCK_DITHER_ENTRIES;
+    } else {
+        entry -= STARTUP_TORQUE_LOCK_DITHER_ENTRIES;
+    }
+    while (entry < 0) entry += SINE_TABLE_SIZE;
+    while (entry >= SINE_TABLE_SIZE) entry -= SINE_TABLE_SIZE;
+
+    uint16_t amp = duty;
+    uint16_t min_lock_duty = (uint16_t)((uint32_t)PWM_MAX_DUTY * STARTUP_TORQUE_LOCK_MIN_DUTY_PCT / 100U);
+    if (amp < min_lock_duty) amp = min_lock_duty;
+    if (amp > SINE_SAFE_MAX_DUTY) amp = SINE_SAFE_MAX_DUTY;
+
+    uint32_t angle_a = ((uint32_t)entry) << 16;
+    uint32_t angle_b = angle_a + ((uint32_t)SINE_PHASE_B_OFFSET << 16);
+    uint32_t angle_c = angle_a + ((uint32_t)SINE_PHASE_C_OFFSET << 16);
+    if (angle_b >= SINE_TABLE_Q16_FULL) angle_b -= SINE_TABLE_Q16_FULL;
+    if (angle_c >= SINE_TABLE_Q16_FULL) angle_c -= SINE_TABLE_Q16_FULL;
+
+    int32_t sin_a = sine_interp_q16(angle_a);
+    int32_t sin_b = sine_interp_q16(angle_b);
+    int32_t sin_c = sine_interp_q16(angle_c);
+
+    int32_t ma = (sin_a * (int32_t)amp) >> 10;
+    int32_t mb = (sin_b * (int32_t)amp) >> 10;
+    int32_t mc = (sin_c * (int32_t)amp) >> 10;
+
+    int32_t mn = ma;
+    if (mb < mn) mn = mb;
+    if (mc < mn) mn = mc;
+    int32_t mx = ma;
+    if (mb > mx) mx = mb;
+    if (mc > mx) mx = mc;
+    int32_t offset = (PWM_MAX_DUTY / 2) - ((mx + mn) >> 1);
+
+    int32_t da = offset + ma;
+    int32_t db = offset + mb;
+    int32_t dc = offset + mc;
+    if (da < 0) da = 0; if (da > (int32_t)PWM_MAX_DUTY) da = PWM_MAX_DUTY;
+    if (db < 0) db = 0; if (db > (int32_t)PWM_MAX_DUTY) db = PWM_MAX_DUTY;
+    if (dc < 0) dc = 0; if (dc > (int32_t)PWM_MAX_DUTY) dc = PWM_MAX_DUTY;
+
+    g_dbg_last_da = (int16_t)da;
+    g_dbg_last_db = (int16_t)db;
+    g_dbg_last_dc = (int16_t)dc;
+    g_dbg_commut_path = 4;  // startup path (align/torque-lock/unstick)
+
+    mcpwm_phase_complementary(0, (uint32_t)da);
+    mcpwm_phase_complementary(1, (uint32_t)db);
+    mcpwm_phase_complementary(2, (uint32_t)dc);
+}
+
 void IRAM_ATTR onCommutationTimer(void *arg) {
     // Skasuj flagÄ™ przerwania TEZ Timer 0
     mcpwm_ll_intr_clear_timer_tez_status(&MCPWM0, 1 << 0);
@@ -4236,12 +4314,44 @@ void IRAM_ATTR onCommutationTimer(void *arg) {
         uint32_t hall_age_us = (g_hall_last_change_us > 0)
             ? (now_us - g_hall_last_change_us)
             : (now_us - g_startup_align_start_us);
+        uint32_t now_ms = now_us / 1000U;
+        uint32_t shock_period_ms = (uint32_t)STARTUP_SHOCK_PULSE_ON_MS + (uint32_t)STARTUP_SHOCK_PULSE_OFF_MS;
+        bool shock_on = true;
+        if (shock_period_ms > 0U) {
+            shock_on = ((now_ms % shock_period_ms) < (uint32_t)STARTUP_SHOCK_PULSE_ON_MS);
+        }
+
+        bool is_sin_foc = (g_mode_isr == DRIVE_MODE_SINUS || g_mode_isr == DRIVE_MODE_FOC);
+        if (is_sin_foc &&
+            hall_age_us > STARTUP_TORQUE_LOCK_TIMEOUT_US &&
+            hall_age_us <= (STARTUP_TORQUE_LOCK_TIMEOUT_US + STARTUP_TORQUE_LOCK_MAX_US)) {
+            if (!shock_on) {
+                g_dbg_commut_path = 4;
+                g_dbg_last_da = 0;
+                g_dbg_last_db = 0;
+                g_dbg_last_dc = 0;
+                allMosfetsOff();
+                return;
+            }
+            applyStartupTorqueLockISR(hall, d, now_us);
+            return;
+        }
+
         if (hall_age_us > STARTUP_UNSTICK_TIMEOUT_US) {
             if (!g_startup_unstick_active) {
                 g_startup_unstick_active = true;
                 g_startup_unstick_last_step_us = now_us;
                 uint8_t bh = g_reverse_isr ? g_hall_reverse_map[hall] : hall;
                 g_startup_unstick_bh = (bh >= 1 && bh <= 6) ? bh : 1;
+            }
+
+            if (!shock_on) {
+                g_dbg_commut_path = 4;
+                g_dbg_last_da = 0;
+                g_dbg_last_db = 0;
+                g_dbg_last_dc = 0;
+                allMosfetsOff();
+                return;
             }
 
             uint16_t unstick_duty = d;
